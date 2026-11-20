@@ -21,6 +21,7 @@
 
 import type { Env } from "./env";
 import { app } from "./api";
+import { resolveRuntimeEnv } from "./db";
 import { runReconcile } from "./scheduler";
 
 export default {
@@ -31,7 +32,16 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
-      return app.fetch(request, env, ctx);
+      let runtimeEnv = env;
+      if (url.pathname.startsWith("/api/v1/")) {
+        try {
+          runtimeEnv = await resolveRuntimeEnv(env);
+        } catch (err) {
+          // Fall through so Hono's onError returns the standard JSON error shape.
+          console.error("runtime env init failed", err);
+        }
+      }
+      return app.fetch(request, runtimeEnv, ctx);
     }
     if (env.ASSETS) {
       return env.ASSETS.fetch(request);

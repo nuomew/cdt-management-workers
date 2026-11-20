@@ -5,6 +5,8 @@
 // The schema itself lives in migrations/0001_schema.sql (consolidated from
 // db.py SCHEMA plus its _migrate() ALTER additions).
 
+import type { Env } from "./env";
+import { generateEncryptionKey, generateSessionSecret } from "./security";
 import { DEFAULT_SETTINGS } from "./settings";
 
 export type SqlParam = string | number | null | ArrayBuffer | Uint8Array;
@@ -167,9 +169,19 @@ const SCHEMA_STATEMENTS: readonly string[] = [
 
 const TABLE_CHECK_SQL = `SELECT count(*) AS cnt FROM sqlite_master WHERE type='table' AND name IN (${REQUIRED_TABLES.map((t) => `'${t}'`).join(",")})`;
 
+const AUTO_ENCRYPTION_KEY_ROW = "_internal_encryption_key";
+const AUTO_SESSION_SECRET_ROW = "_internal_session_secret";
+
 // Cache schema readiness per D1Database binding instance inside an isolate so
 // steady-state requests incur zero extra SQL round-trips.
 const schemaReadyCache = new WeakMap<D1Database, Promise<void>>();
+
+interface AutoSecrets {
+  encryptionKey: string;
+  sessionSecret: string;
+}
+
+const autoSecretsCache = new WeakMap<D1Database, Promise<AutoSecrets>>();
 
 /**
  * Ensure all application tables and default settings rows exist in D1.
@@ -208,6 +220,80 @@ export function ensureSchema(db: D1Database | undefined): Promise<void> {
 
   schemaReadyCache.set(db, initPromise);
   return initPromise;
+}
+
+function loadOrCreateAutoSecrets(db: D1Database): Promise<AutoSecrets> {
+  const existing = autoSecretsCache.get(db);
+  if (existing) return existing;
+
+  const promise = (async () => {
+    // Use INSERT ... ON CONFLICT DO NOTHING followed by SELECT so concurrent
+    // cold starts across isolates always converge on the exact same key pair.
+    await db.batch([
+      db
+        .prepare(
+          "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING",
+        )
+        .bind(AUTO_ENCRYPTION_KEY_ROW, generateEncryptionKey()),
+      db
+        .prepare(
+          "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING",
+        )
+        .bind(AUTO_SESSION_SECRET_ROW, generateSessionSecret()),
+    ]);
+    const rows = await query<{ key: string; value: string }>(
+      db,
+      "SELECT key, value FROM settings WHERE key IN (?, ?)",
+      [AUTO_ENCRYPTION_KEY_ROW, AUTO_SESSION_SECRET_ROW],
+    );
+    let encryptionKey = "";
+    let sessionSecret = "";
+    for (const row of rows) {
+      if (row.key === AUTO_ENCRYPTION_KEY_ROW) encryptionKey = row.value;
+      else if (row.key === AUTO_SESSION_SECRET_ROW) sessionSecret = row.value;
+    }
+    if (!encryptionKey || !sessionSecret) {
+      throw new Error("Failed to initialize runtime secrets in D1");
+    }
+    return { encryptionKey, sessionSecret };
+  })().catch((err) => {
+    autoSecretsCache.delete(db);
+    throw err;
+  });
+
+  autoSecretsCache.set(db, promise);
+  return promise;
+}
+
+/**
+ * Ensure the D1 schema exists and resolve ENCRYPTION_KEY / SESSION_SECRET.
+ * Explicit Worker Secrets always take precedence; when unset, runtime-random
+ * keys are persisted once in D1 internal rows (filtered out of settings APIs).
+ */
+export async function resolveRuntimeEnv(env: Env): Promise<Env> {
+  await ensureSchema(env.DB);
+  const hasEnc = Boolean(env.ENCRYPTION_KEY?.trim());
+  const hasSess = Boolean(env.SESSION_SECRET?.trim());
+  if (hasEnc && hasSess) return env;
+
+  const fallback = await loadOrCreateAutoSecrets(env.DB);
+  const overrides: Partial<Pick<Env, "ENCRYPTION_KEY" | "SESSION_SECRET">> = {};
+  if (!hasEnc) overrides.ENCRYPTION_KEY = fallback.encryptionKey;
+  if (!hasSess) overrides.SESSION_SECRET = fallback.sessionSecret;
+
+  // Proxy preserves all non-enumerable Cloudflare bindings without mutating env.
+  return new Proxy(env, {
+    get(target, prop) {
+      if (prop === "ENCRYPTION_KEY" && overrides.ENCRYPTION_KEY !== undefined) {
+        return overrides.ENCRYPTION_KEY;
+      }
+      if (prop === "SESSION_SECRET" && overrides.SESSION_SECRET !== undefined) {
+        return overrides.SESSION_SECRET;
+      }
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 function toPlainObject<T>(row: unknown): T {

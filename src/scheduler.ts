@@ -38,7 +38,7 @@
  */
 
 import type { Env } from "./env";
-import { ensureSchema } from "./db";
+import { resolveRuntimeEnv } from "./db";
 import * as repo from "./repo";
 import * as dns from "./dns";
 import * as billing from "./billing";
@@ -88,15 +88,15 @@ async function maybeDailyReport(env: Env): Promise<void> {
 }
 
 export async function runReconcile(env: Env): Promise<void> {
-  await ensureSchema(env.DB);
+  const runtimeEnv = await resolveRuntimeEnv(env);
   try {
-    await reconcileAll(env);
+    await reconcileAll(runtimeEnv);
   } catch (e) {
     console.error("reconcile round failed", e);
   }
 
   try {
-    await maybeDailyReport(env);
+    await maybeDailyReport(runtimeEnv);
   } catch (e) {
     console.error("daily report check failed", e);
   }
@@ -104,7 +104,7 @@ export async function runReconcile(env: Env): Promise<void> {
   // DNS: only issues real requests when a target is running but its
   // resolution disagrees; steady state costs nothing.
   try {
-    await dns.reconcile(env, await repo.getSettings(env));
+    await dns.reconcile(runtimeEnv, await repo.getSettings(runtimeEnv));
   } catch (e) {
     console.error("DNS reconcile failed", e);
   }
@@ -112,7 +112,7 @@ export async function runReconcile(env: Env): Promise<void> {
   // Billing is slow data; refreshDue() applies its own ~30 min TTL and
   // only calls out when a snapshot is actually due.
   try {
-    await billing.refreshDue(env);
+    await billing.refreshDue(runtimeEnv);
   } catch (e) {
     console.error("billing refresh failed", e);
   }
@@ -121,11 +121,11 @@ export async function runReconcile(env: Env): Promise<void> {
   // flags are presence-only, so `flagAge` reads the `created_at` of the
   // last prune and clear+set refreshes it.
   try {
-    const age = await repo.flagAge(env, LAST_PRUNE_FLAG);
+    const age = await repo.flagAge(runtimeEnv, LAST_PRUNE_FLAG);
     if (age < 0 || age > PRUNE_INTERVAL_SECONDS) {
-      await repo.pruneEvents(env, resolveSettings(env).eventRetainDays);
-      await repo.clearFlag(env, LAST_PRUNE_FLAG);
-      await repo.setFlag(env, LAST_PRUNE_FLAG);
+      await repo.pruneEvents(runtimeEnv, resolveSettings(runtimeEnv).eventRetainDays);
+      await repo.clearFlag(runtimeEnv, LAST_PRUNE_FLAG);
+      await repo.setFlag(runtimeEnv, LAST_PRUNE_FLAG);
     }
   } catch (e) {
     console.error("prune events failed", e);

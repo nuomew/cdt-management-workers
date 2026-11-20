@@ -71,7 +71,10 @@ export function isHhmm(value: string): boolean {
 export type SettingsMap = Record<string, string>;
 
 export async function getSettings(env: Env): Promise<SettingsMap> {
-  const rows = await query<Row>(env.DB, "SELECT key, value FROM settings");
+  const rows = await query<Row>(
+    env.DB,
+    "SELECT key, value FROM settings WHERE substr(key, 1, 10) <> '_internal_'",
+  );
   const data: SettingsMap = {};
   for (const row of rows) {
     data[asStr(row["key"])] = asStr(row["value"]);
@@ -93,6 +96,7 @@ export async function getSetting(
   key: string,
   fallback = "",
 ): Promise<string> {
+  if (key.startsWith("_internal_")) return fallback;
   const row = await queryOne<Row>(
     env.DB,
     "SELECT value FROM settings WHERE key=?",
@@ -116,6 +120,7 @@ export async function setSettings(
 ): Promise<void> {
   const statements = [];
   for (const [key, value] of Object.entries(values)) {
+    if (key.startsWith("_internal_")) continue;
     const stored = SENSITIVE_SETTINGS.has(key)
       ? await encrypt(value, env.ENCRYPTION_KEY)
       : value;

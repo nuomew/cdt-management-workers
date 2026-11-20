@@ -85,6 +85,16 @@ function randomBytes(length: number): Uint8Array {
   return bytes;
 }
 
+/** Generate a 32-byte random AES-256-GCM key encoded as standard base64. */
+export function generateEncryptionKey(): string {
+  return bytesToBase64(randomBytes(32));
+}
+
+/** Generate a 32-byte random session signing secret encoded as lowercase hex. */
+export function generateSessionSecret(): string {
+  return Array.from(randomBytes(32), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 // ---------------------------------------------------------------------------
 // Passwords: pbkdf2_sha256$<rounds>$<b64salt>$<b64hash> (exact Python format)
 // ---------------------------------------------------------------------------
