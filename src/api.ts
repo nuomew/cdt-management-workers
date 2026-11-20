@@ -46,6 +46,7 @@ import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { Context } from "hono";
 
 import type { Env } from "./env";
+import { ensureSchema } from "./db";
 import * as repo from "./repo";
 import * as security from "./security";
 import * as dns from "./dns";
@@ -850,6 +851,11 @@ app.notFound((c) => c.json({ ok: false, code: "not_found", message: "接口不�
 // -- System ---------------------------------------------------------------
 
 app.get("/api/health", (c) => c.json({ status: "ok", version: VERSION }));
+
+app.use("/api/v1/*", async (c, next) => {
+  await ensureSchema(c.env.DB);
+  await next();
+});
 
 app.get("/api/v1/system/init-status", async (c) => {
   return c.json({

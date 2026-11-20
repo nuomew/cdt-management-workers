@@ -38,6 +38,7 @@
  */
 
 import type { Env } from "./env";
+import { ensureSchema } from "./db";
 import * as repo from "./repo";
 import * as dns from "./dns";
 import * as billing from "./billing";
@@ -87,6 +88,7 @@ async function maybeDailyReport(env: Env): Promise<void> {
 }
 
 export async function runReconcile(env: Env): Promise<void> {
+  await ensureSchema(env.DB);
   try {
     await reconcileAll(env);
   } catch (e) {
