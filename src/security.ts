@@ -148,15 +148,16 @@ export async function verifyPassword(
 const encryptionKeyCache = new Map<string, Promise<CryptoKey>>();
 
 function getEncryptionKey(encryptionKeyB64: string | undefined): Promise<CryptoKey> {
-  if (!encryptionKeyB64) {
+  const normalized = encryptionKeyB64?.trim();
+  if (!normalized) {
     throw new Error(
       "ENCRYPTION_KEY is not configured: set it (base64, 32 bytes) via `wrangler secret put ENCRYPTION_KEY` before storing AccessKey secrets",
     );
   }
-  const cached = encryptionKeyCache.get(encryptionKeyB64);
+  const cached = encryptionKeyCache.get(normalized);
   if (cached) return cached;
   const promise = (async () => {
-    const raw = base64ToBytes(encryptionKeyB64);
+    const raw = base64ToBytes(normalized);
     if (raw.length !== 32) {
       throw new Error("ENCRYPTION_KEY must decode to exactly 32 bytes");
     }
@@ -165,8 +166,35 @@ function getEncryptionKey(encryptionKeyB64: string | undefined): Promise<CryptoK
       "decrypt",
     ]);
   })();
-  encryptionKeyCache.set(encryptionKeyB64, promise);
+  encryptionKeyCache.set(normalized, promise);
   return promise;
+}
+
+/**
+ * Validate required cryptographic secrets without exposing their values.
+ * Returns a user-facing configuration error message, or null when valid.
+ */
+export function validateCryptoSecrets(
+  encryptionKeyB64: string | undefined,
+  sessionSecret: string | undefined,
+): string | null {
+  const missing: string[] = [];
+  const encKey = encryptionKeyB64?.trim() ?? "";
+  const sessSecret = sessionSecret?.trim() ?? "";
+  if (!encKey) missing.push("ENCRYPTION_KEY");
+  if (!sessSecret) missing.push("SESSION_SECRET");
+  if (missing.length > 0) {
+    return `缺少必填 Secret：${missing.join("、")}。请在 Cloudflare Worker 的 Settings → Variables and Secrets 中添加后重试`;
+  }
+  try {
+    const raw = base64ToBytes(encKey);
+    if (raw.length !== 32) {
+      return `ENCRYPTION_KEY 长度无效（解码后为 ${raw.length} 字节，必须为 base64 编码的 32 字节随机密钥）`;
+    }
+  } catch {
+    return "ENCRYPTION_KEY 格式无效（必须为 base64 编码的 32 字节随机密钥）";
+  }
+  return null;
 }
 
 export async function encrypt(
@@ -239,21 +267,22 @@ export function mask(secret: string): string {
 const hmacKeyCache = new Map<string, Promise<CryptoKey>>();
 
 function getHmacKey(sessionSecret: string | undefined): Promise<CryptoKey> {
-  if (!sessionSecret) {
+  const normalized = sessionSecret?.trim();
+  if (!normalized) {
     throw new Error(
       "SESSION_SECRET is not configured: set it via `wrangler secret put SESSION_SECRET`",
     );
   }
-  const cached = hmacKeyCache.get(sessionSecret);
+  const cached = hmacKeyCache.get(normalized);
   if (cached) return cached;
   const promise = crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(sessionSecret),
+    new TextEncoder().encode(normalized),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign", "verify"],
   );
-  hmacKeyCache.set(sessionSecret, promise);
+  hmacKeyCache.set(normalized, promise);
   return promise;
 }
 
@@ -270,7 +299,8 @@ export async function issueSession(
   epoch: number,
   sessionSecret: string | undefined,
 ): Promise<string> {
-  if (!sessionSecret) throw new Error("SESSION_SECRET is not configured");
+  const normalized = sessionSecret?.trim();
+  if (!normalized) throw new Error("SESSION_SECRET is not configured");
   const payload: SessionPayload = {
     u: username,
     exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
@@ -280,7 +310,7 @@ export async function issueSession(
   };
   const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
   const body = bytesToBase64Url(payloadBytes);
-  return `${body}.${await sign(payloadBytes, sessionSecret)}`;
+  return `${body}.${await sign(payloadBytes, normalized)}`;
 }
 
 /** Verify a token and return its payload, or null if invalid/expired/stale. */
@@ -290,7 +320,8 @@ export async function parseSession(
   sessionSecret: string | undefined,
 ): Promise<SessionPayload | null> {
   if (!token || !token.includes(".")) return null;
-  if (!sessionSecret) return null;
+  const normalized = sessionSecret?.trim();
+  if (!normalized) return null;
   const dot = token.lastIndexOf(".");
   const body = token.slice(0, dot);
   const signature = token.slice(dot + 1);
@@ -300,7 +331,7 @@ export async function parseSession(
   } catch {
     return null;
   }
-  const expectedSig = await sign(payloadBytes, sessionSecret);
+  const expectedSig = await sign(payloadBytes, normalized);
   if (
     !timingSafeEqual(
       new TextEncoder().encode(expectedSig),

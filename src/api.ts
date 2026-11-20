@@ -875,6 +875,13 @@ app.post("/api/v1/setup", async (c) => {
   const password = strOf(payload["password"]);
   if (username.length < 3) throw invalid("用户名至少 3 个字符");
   if (password.length < 10) throw invalid("密码至少 10 个字符");
+  const secretErr = security.validateCryptoSecrets(
+    c.env.ENCRYPTION_KEY,
+    c.env.SESSION_SECRET,
+  );
+  if (secretErr) {
+    throw httpErr(503, "missing_secret", secretErr);
+  }
   await repo.setSettings(c.env, {
     admin_username: username,
     admin_password: await security.hashPassword(password),
@@ -893,6 +900,13 @@ app.post("/api/v1/auth/login", async (c) => {
   const client = clientIp(c);
   if (rateLimited(client)) {
     throw httpErr(429, "rate_limited", "尝试过于频繁，请 5 分钟后再试");
+  }
+  if (!c.env.SESSION_SECRET?.trim()) {
+    throw httpErr(
+      503,
+      "missing_secret",
+      "缺少必填 Secret：SESSION_SECRET。请在 Cloudflare Worker 的 Settings → Variables and Secrets 中添加后重试",
+    );
   }
   const payload = await jsonBody(c);
   const username = strOf(payload["username"]).trim();
