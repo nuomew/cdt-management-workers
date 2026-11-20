@@ -302,3 +302,77 @@ export function emptyServer(): Server {
     },
   }
 }
+
+/** 阿里云 ECS 自动发现结果（添加/编辑服务器时用于选择实例 ID） */
+export type DiscoveredInstance = {
+  instance_id: string
+  instance_name: string
+  region_id: string
+  status: string
+  stopped_mode: string
+  instance_type: string
+  cpu: number
+  memory: number
+  os_name: string
+  public_ip: string
+  private_ip: string
+  bandwidth: number
+  charge_type: string
+  creation_time: string
+  expired_time: string
+}
+
+/** 实例完整详情（基本信息 + 网络 + 操作锁） */
+export type InstanceDetail = {
+  instance_id: string
+  instance_name: string
+  description: string
+  status: string
+  stopped_mode: string
+  instance_type: string
+  os_name: string
+  os_type: string
+  region_id: string
+  zone_id: string
+  public_ips: string[]
+  private_ips: string[]
+  vpc_id: string
+  vswitch_id: string
+  security_group_ids: string[]
+  internet_charge_type: string
+  internet_max_bandwidth_in: number
+  internet_max_bandwidth_out: number
+  creation_time: string
+  expired_time: string
+  image_id: string
+  cpu: number
+  memory: number
+  instance_charge_type: string
+  network_type: string
+  operation_locks: string[]
+}
+
+/** 实例挂载的云盘信息 */
+export type InstanceDisk = {
+  disk_id: string
+  disk_name: string
+  type: string
+  size: number
+  category: string
+  status: string
+  creation_time: string
+}
+
+/** 阿里云 ECS 可选镜像 */
+export type EcsImage = {
+  image_id: string
+  os_name: string
+  os_type: string
+  architecture: string
+  image_version: string
+  size: number
+  owner_alias: string
+  description: string
+}
+
+export type ReinstallPhase = 'stopping' | 'reinstalling' | 'starting' | 'completed' | 'error'

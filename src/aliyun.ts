@@ -130,7 +130,7 @@ const AUTH_ERROR_HINTS = [
 const THROTTLE_HINTS = ["throttling", "requestlimitexceeded", "serviceunavailable"];
 
 const SECRET_PARAM_RE =
-  /\b(Signature|AccessKeyId|AccessKeySecret|SecurityToken|SignatureNonce)=([^&\s'"]+)/gi;
+  /\b(Signature|AccessKeyId|AccessKeySecret|SecurityToken|SignatureNonce|Password)=([^&\s'"]+)/gi;
 
 function redact(text: string): string {
   return text
@@ -620,6 +620,675 @@ export async function stopInstance(
     }
     throw new AliyunError(`停止实例失败：${briefError(exc)}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// ECS discovery & management (ported from nuomew/aly-CDTCF)
+// ---------------------------------------------------------------------------
+
+/** Scan-order region lists kept aligned with web/src/regions.ts. */
+const CHINA_SCAN_REGIONS: readonly string[] = [
+  "cn-hongkong",
+  "ap-southeast-1",
+  "ap-northeast-1",
+  "cn-hangzhou",
+  "cn-shanghai",
+  "cn-beijing",
+  "cn-shenzhen",
+  "cn-guangzhou",
+  "cn-chengdu",
+  "cn-qingdao",
+  "cn-zhangjiakou",
+  "cn-huhehaote",
+  "cn-wulanchabu",
+  "cn-heyuan",
+  "ap-southeast-2",
+  "ap-southeast-3",
+  "ap-southeast-5",
+  "ap-southeast-6",
+  "ap-southeast-7",
+  "ap-northeast-2",
+  "ap-south-1",
+  "us-west-1",
+  "us-east-1",
+  "eu-west-1",
+  "eu-central-1",
+  "me-east-1",
+];
+
+const INTL_SCAN_REGIONS: readonly string[] = [
+  "cn-hongkong",
+  "ap-southeast-1",
+  "ap-northeast-1",
+  "ap-southeast-2",
+  "ap-southeast-3",
+  "ap-southeast-5",
+  "ap-southeast-6",
+  "ap-southeast-7",
+  "ap-southeast-8",
+  "ap-northeast-2",
+  "ap-south-1",
+  "us-west-1",
+  "us-east-1",
+  "na-south-1",
+  "sa-east-1",
+  "eu-west-1",
+  "eu-central-1",
+  "me-east-1",
+  "me-central-1",
+];
+
+export interface DiscoveredInstance {
+  instance_id: string;
+  instance_name: string;
+  region_id: string;
+  status: string;
+  stopped_mode: string;
+  instance_type: string;
+  cpu: number;
+  memory: number;
+  os_name: string;
+  public_ip: string;
+  private_ip: string;
+  bandwidth: number;
+  charge_type: string;
+  creation_time: string;
+  expired_time: string;
+}
+
+export interface InstanceDetail {
+  instance_id: string;
+  instance_name: string;
+  description: string;
+  status: string;
+  stopped_mode: string;
+  instance_type: string;
+  os_name: string;
+  os_type: string;
+  region_id: string;
+  zone_id: string;
+  public_ips: string[];
+  private_ips: string[];
+  vpc_id: string;
+  vswitch_id: string;
+  security_group_ids: string[];
+  internet_charge_type: string;
+  internet_max_bandwidth_in: number;
+  internet_max_bandwidth_out: number;
+  creation_time: string;
+  expired_time: string;
+  image_id: string;
+  cpu: number;
+  memory: number;
+  instance_charge_type: string;
+  network_type: string;
+  operation_locks: string[];
+}
+
+export interface InstanceDisk {
+  disk_id: string;
+  disk_name: string;
+  type: string;
+  size: number;
+  category: string;
+  status: string;
+  creation_time: string;
+}
+
+export interface EcsImage {
+  image_id: string;
+  os_name: string;
+  os_type: string;
+  architecture: string;
+  image_version: string;
+  size: number;
+  owner_alias: string;
+  description: string;
+}
+
+export interface VncInfo {
+  vnc_url: string;
+  console_url: string;
+}
+
+function asArray<T>(value: unknown): T[] {
+  if (Array.isArray(value)) return value as T[];
+  if (value !== null && value !== undefined) return [value as T];
+  return [];
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function asStrVal(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  return String(value);
+}
+
+function asNumVal(value: unknown): number {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function extractPublicIps(raw: Record<string, unknown>): string[] {
+  const ips: string[] = [];
+  const eip = asStrVal(asRecord(raw["EipAddress"])["IpAddress"]).trim();
+  if (eip) ips.push(eip);
+  const pubList = asArray<unknown>(asRecord(raw["PublicIpAddress"])["IpAddress"]);
+  for (const item of pubList) {
+    const ip = asStrVal(item).trim();
+    if (ip && !ips.includes(ip)) ips.push(ip);
+  }
+  return ips;
+}
+
+function extractPrivateIps(raw: Record<string, unknown>): string[] {
+  const vpcList = asArray<unknown>(
+    asRecord(asRecord(raw["VpcAttributes"])["PrivateIpAddress"])["IpAddress"],
+  );
+  const innerList = asArray<unknown>(asRecord(raw["InnerIpAddress"])["IpAddress"]);
+  const source = vpcList.length > 0 ? vpcList : innerList;
+  return source.map((v) => asStrVal(v).trim()).filter(Boolean);
+}
+
+function extractOperationLocks(raw: Record<string, unknown>): string[] {
+  const locks = asArray<unknown>(asRecord(raw["OperationLocks"])["LockReason"]);
+  return locks
+    .map((item) => {
+      if (typeof item === "string") return item;
+      return asStrVal(asRecord(item)["LockReason"]);
+    })
+    .filter(Boolean);
+}
+
+function parseDiscoveredInstance(
+  raw: Record<string, unknown>,
+  fallbackRegion: string,
+): DiscoveredInstance {
+  const publicIps = extractPublicIps(raw);
+  const privateIps = extractPrivateIps(raw);
+  const eipBandwidth = asNumVal(asRecord(raw["EipAddress"])["Bandwidth"]);
+  const bandwidth = eipBandwidth > 0 ? eipBandwidth : asNumVal(raw["InternetMaxBandwidthOut"]);
+  return {
+    instance_id: asStrVal(raw["InstanceId"]).trim(),
+    instance_name: asStrVal(raw["InstanceName"]).trim(),
+    region_id: asStrVal(raw["RegionId"]).trim() || fallbackRegion,
+    status: asStrVal(raw["Status"]).trim() || "Unknown",
+    stopped_mode: asStrVal(raw["StoppedMode"]).trim(),
+    instance_type: asStrVal(raw["InstanceType"]).trim(),
+    cpu: asNumVal(raw["Cpu"]),
+    memory: asNumVal(raw["Memory"]),
+    os_name: asStrVal(raw["OSName"]).trim() || asStrVal(raw["OSNameEn"]).trim(),
+    public_ip: publicIps[0] ?? "",
+    private_ip: privateIps[0] ?? "",
+    bandwidth,
+    charge_type: asStrVal(raw["InstanceChargeType"]).trim(),
+    creation_time: asStrVal(raw["CreationTime"]).trim(),
+    expired_time: asStrVal(raw["ExpiredTime"]).trim(),
+  };
+}
+
+function parseInstanceDetail(
+  raw: Record<string, unknown>,
+  fallbackRegion: string,
+): InstanceDetail {
+  const eipObj = asRecord(raw["EipAddress"]);
+  const vpcObj = asRecord(raw["VpcAttributes"]);
+  const eipBandwidth = asNumVal(eipObj["Bandwidth"]);
+  const bandwidthOut = eipBandwidth > 0 ? eipBandwidth : asNumVal(raw["InternetMaxBandwidthOut"]);
+  const internetChargeType =
+    asStrVal(raw["InternetChargeType"]).trim() ||
+    asStrVal(eipObj["InternetChargeType"]).trim();
+  const osName = asStrVal(raw["OSName"]).trim() || asStrVal(raw["OSNameEn"]).trim();
+  const osType =
+    asStrVal(raw["OSType"]).trim().toLowerCase() ||
+    (osName.toLowerCase().includes("windows") ? "windows" : "linux");
+  return {
+    instance_id: asStrVal(raw["InstanceId"]).trim(),
+    instance_name: asStrVal(raw["InstanceName"]).trim(),
+    description: asStrVal(raw["Description"]).trim(),
+    status: asStrVal(raw["Status"]).trim() || "Unknown",
+    stopped_mode: asStrVal(raw["StoppedMode"]).trim(),
+    instance_type: asStrVal(raw["InstanceType"]).trim(),
+    os_name: osName,
+    os_type: osType,
+    region_id: asStrVal(raw["RegionId"]).trim() || fallbackRegion,
+    zone_id: asStrVal(raw["ZoneId"]).trim(),
+    public_ips: extractPublicIps(raw),
+    private_ips: extractPrivateIps(raw),
+    vpc_id: asStrVal(vpcObj["VpcId"]).trim(),
+    vswitch_id: asStrVal(vpcObj["VSwitchId"]).trim(),
+    security_group_ids: asArray<unknown>(
+      asRecord(raw["SecurityGroupIds"])["SecurityGroupId"],
+    )
+      .map((s) => asStrVal(s).trim())
+      .filter(Boolean),
+    internet_charge_type: internetChargeType,
+    internet_max_bandwidth_in: asNumVal(raw["InternetMaxBandwidthIn"]),
+    internet_max_bandwidth_out: bandwidthOut,
+    creation_time: asStrVal(raw["CreationTime"]).trim(),
+    expired_time: asStrVal(raw["ExpiredTime"]).trim(),
+    image_id: asStrVal(raw["ImageId"]).trim(),
+    cpu: asNumVal(raw["Cpu"]),
+    memory: asNumVal(raw["Memory"]),
+    instance_charge_type: asStrVal(raw["InstanceChargeType"]).trim(),
+    network_type: asStrVal(raw["InstanceNetworkType"]).trim(),
+    operation_locks: extractOperationLocks(raw),
+  };
+}
+
+/** List all ECS instances in a single region using the given credentials. */
+export async function listInstancesInRegion(
+  env: Env,
+  creds: { access_key_id: string; access_key_secret: string; site?: string },
+  regionId: string,
+): Promise<DiscoveredInstance[]> {
+  if (isDryRun(env)) {
+    return [
+      {
+        instance_id: `i-mock-${regionId.replace(/[^a-z0-9]/gi, "")}01`,
+        instance_name: `demo-${regionId}`,
+        region_id: regionId,
+        status: "Running",
+        stopped_mode: "",
+        instance_type: "ecs.e-c1m1.large",
+        cpu: 2,
+        memory: 2048,
+        os_name: "Debian 12.6 64位",
+        public_ip: "47.243.10.20",
+        private_ip: "172.16.0.10",
+        bandwidth: 200,
+        charge_type: "PostPaid",
+        creation_time: "2026-01-01T00:00Z",
+        expired_time: "",
+      },
+    ];
+  }
+  const account: AliyunAccount = {
+    access_key_id: creds.access_key_id,
+    access_key_secret: creds.access_key_secret,
+    region_id: regionId,
+    site: creds.site || "china",
+    instance_id: "",
+  };
+  const data = await rpcCall<Record<string, unknown>>(ecsDomain(regionId), account, {
+    Action: "DescribeInstances",
+    Version: ECS_VERSION,
+    RegionId: regionId,
+    PageNumber: "1",
+    PageSize: "50",
+  });
+  const rawList = asArray<unknown>(asRecord(data["Instances"])["Instance"]);
+  return rawList
+    .map((item) => parseDiscoveredInstance(asRecord(item), regionId))
+    .filter((inst) => Boolean(inst.instance_id));
+}
+
+function isAuthError(exc: unknown): boolean {
+  const text = `${errorCode(exc)} ${exc instanceof Error ? exc.message : String(exc)}`.toLowerCase();
+  return AUTH_ERROR_HINTS.some((h) => text.includes(h));
+}
+
+/**
+ * Discover ECS instances for a single region or across all regions of a site.
+ * Runs regions in bounded batches of 8 to stay well below Workers subrequest limits.
+ */
+export async function discoverInstances(
+  env: Env,
+  creds: { access_key_id: string; access_key_secret: string; site?: string },
+  opts: { regionId?: string; scanAll?: boolean },
+): Promise<{ items: DiscoveredInstance[]; scanned_regions: number }> {
+  const site = creds.site === "international" ? "international" : "china";
+  if (!opts.scanAll) {
+    const region = (opts.regionId || "cn-hongkong").trim();
+    try {
+      const items = await listInstancesInRegion(env, creds, region);
+      return { items, scanned_regions: 1 };
+    } catch (exc) {
+      throw new AliyunError(`查询实例列表失败：${briefError(exc)}`);
+    }
+  }
+
+  const regions = site === "international" ? INTL_SCAN_REGIONS : CHINA_SCAN_REGIONS;
+  if (isDryRun(env)) {
+    const first = regions[0] ?? "cn-hongkong";
+    return {
+      items: await listInstancesInRegion(env, creds, first),
+      scanned_regions: regions.length,
+    };
+  }
+
+  const results: DiscoveredInstance[] = [];
+  let authFailure: unknown = null;
+  let lastFailure: unknown = null;
+  let succeeded = 0;
+
+  // Probe the first batch; fail fast if credentials themselves are invalid.
+  const batchSize = 8;
+  for (let i = 0; i < regions.length; i += batchSize) {
+    const slice = regions.slice(i, i + batchSize);
+    const settled = await Promise.allSettled(
+      slice.map((region) => listInstancesInRegion(env, creds, region)),
+    );
+    for (const item of settled) {
+      if (item.status === "fulfilled") {
+        succeeded++;
+        results.push(...item.value);
+      } else {
+        lastFailure = item.reason;
+        if (isAuthError(item.reason)) authFailure = item.reason;
+      }
+    }
+    if (succeeded === 0 && authFailure) {
+      throw new AliyunError(`查询实例列表失败：${briefError(authFailure)}`);
+    }
+  }
+
+  if (succeeded === 0 && lastFailure) {
+    throw new AliyunError(`查询实例列表失败：${briefError(lastFailure)}`);
+  }
+  return { items: results, scanned_regions: regions.length };
+}
+
+/**
+ * Fetch detailed instance attributes. Prefers DescribeInstances (richer fields
+ * including OSName, Cpu, Memory, EipAddress) and falls back to
+ * DescribeInstanceAttribute when needed.
+ */
+export async function getInstanceDetail(
+  env: Env,
+  account: AliyunAccount,
+): Promise<InstanceDetail> {
+  if (isDryRun(env)) {
+    const state = mockState(env, account);
+    mockAdvance(state);
+    return {
+      instance_id: account.instance_id,
+      instance_name: `mock-${account.instance_id}`,
+      description: "Dry-run simulated ECS instance",
+      status: state.status,
+      stopped_mode: state.stopped_mode,
+      instance_type: "ecs.e-c1m1.large",
+      os_name: "Debian 12.6 64位",
+      os_type: "linux",
+      region_id: account.region_id,
+      zone_id: `${account.region_id}-a`,
+      public_ips: state.public_ip ? [state.public_ip] : [],
+      private_ips: ["172.16.0.10"],
+      vpc_id: "vpc-mock001",
+      vswitch_id: "vsw-mock001",
+      security_group_ids: ["sg-mock001"],
+      internet_charge_type: "PayByTraffic",
+      internet_max_bandwidth_in: 200,
+      internet_max_bandwidth_out: 200,
+      creation_time: "2026-01-01T00:00Z",
+      expired_time: "",
+      image_id: "debian_12_6_x64_20G_alibase_20240819.vhd",
+      cpu: 2,
+      memory: 2048,
+      instance_charge_type: "PostPaid",
+      network_type: "vpc",
+      operation_locks: [],
+    };
+  }
+  let raw: Record<string, unknown> | null = null;
+  try {
+    const data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+      Action: "DescribeInstances",
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      InstanceIds: JSON.stringify([account.instance_id]),
+    });
+    const list = asArray<unknown>(asRecord(data["Instances"])["Instance"]);
+    if (list.length > 0) raw = asRecord(list[0]);
+  } catch {
+    // Fall back to DescribeInstanceAttribute below.
+  }
+  if (!raw) {
+    try {
+      raw = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+        Action: "DescribeInstanceAttribute",
+        Version: ECS_VERSION,
+        RegionId: account.region_id,
+        InstanceId: account.instance_id,
+      });
+    } catch (exc) {
+      throw new AliyunError(`获取实例详情失败：${briefError(exc)}`);
+    }
+  }
+  return parseInstanceDetail(raw, account.region_id);
+}
+
+/** List system and data disks attached to an instance. */
+export async function listInstanceDisks(
+  env: Env,
+  account: AliyunAccount,
+): Promise<InstanceDisk[]> {
+  if (isDryRun(env)) {
+    return [
+      {
+        disk_id: "d-mock-system01",
+        disk_name: "system-disk",
+        type: "system",
+        size: 40,
+        category: "cloud_essd",
+        status: "In_use",
+        creation_time: "2026-01-01T00:00Z",
+      },
+    ];
+  }
+  let data: Record<string, unknown>;
+  try {
+    data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+      Action: "DescribeDisks",
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      InstanceId: account.instance_id,
+      PageSize: "50",
+    });
+  } catch (exc) {
+    throw new AliyunError(`查询磁盘信息失败：${briefError(exc)}`);
+  }
+  const rawList = asArray<unknown>(asRecord(data["Disks"])["Disk"]);
+  return rawList.map((item) => {
+    const d = asRecord(item);
+    return {
+      disk_id: asStrVal(d["DiskId"]).trim(),
+      disk_name: asStrVal(d["DiskName"]).trim(),
+      type: asStrVal(d["Type"]).trim(),
+      size: asNumVal(d["Size"]),
+      category: asStrVal(d["Category"]).trim(),
+      status: asStrVal(d["Status"]).trim(),
+      creation_time: asStrVal(d["CreationTime"]).trim(),
+    };
+  });
+}
+
+/** Reboot a running ECS instance (uses RebootInstance with official ForceStop param). */
+export async function rebootInstance(
+  env: Env,
+  account: AliyunAccount,
+  forceStop = false,
+): Promise<void> {
+  if (isDryRun(env)) {
+    const state = mockState(env, account);
+    state.status = "Running";
+    state.stopped_mode = "";
+    return;
+  }
+  try {
+    await rpcCall(ecsDomain(account.region_id), account, {
+      Action: "RebootInstance",
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      InstanceId: account.instance_id,
+      ForceStop: forceStop ? "true" : "false",
+    });
+  } catch (exc) {
+    throw new AliyunError(`重启实例失败：${briefError(exc)}`);
+  }
+}
+
+/** Fetch a temporary Aliyun VNC URL for embedded browser console access. */
+export async function getInstanceVncUrl(
+  env: Env,
+  account: AliyunAccount,
+): Promise<VncInfo> {
+  const consoleUrl = `https://ecs.console.aliyun.com/vnc/${encodeURIComponent(account.instance_id)}?regionId=${encodeURIComponent(account.region_id)}`;
+  if (isDryRun(env)) {
+    return {
+      vnc_url: `wss://mock.vnc.local/${account.instance_id}`,
+      console_url: consoleUrl,
+    };
+  }
+  let data: Record<string, unknown>;
+  try {
+    data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+      Action: "DescribeInstanceVncUrl",
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      InstanceId: account.instance_id,
+    });
+  } catch (exc) {
+    throw new AliyunError(`获取 VNC 连接地址失败：${briefError(exc)}`);
+  }
+  const vncUrl = asStrVal(data["VncUrl"]).trim();
+  if (!vncUrl) {
+    throw new AliyunError("获取 VNC 连接地址失败：阿里云未返回 VncUrl");
+  }
+  return { vnc_url: vncUrl, console_url: consoleUrl };
+}
+
+/** List available ECS images in the instance's region for OS reinstallation. */
+export async function listImages(
+  env: Env,
+  account: AliyunAccount,
+  opts: { ownerAlias?: string; osType?: string } = {},
+): Promise<EcsImage[]> {
+  const ownerAlias = opts.ownerAlias || "system";
+  const osType = opts.osType || "";
+  if (isDryRun(env)) {
+    return [
+      {
+        image_id: "debian_12_6_x64_20G_alibase_20240819.vhd",
+        os_name: "Debian 12.6 64位",
+        os_type: "linux",
+        architecture: "x86_64",
+        image_version: "12.6",
+        size: 20,
+        owner_alias: ownerAlias,
+        description: "Debian 12",
+      },
+      {
+        image_id: "ubuntu_24_04_x64_20G_alibase_20240812.vhd",
+        os_name: "Ubuntu 24.04 64位",
+        os_type: "linux",
+        architecture: "x86_64",
+        image_version: "24.04",
+        size: 20,
+        owner_alias: ownerAlias,
+        description: "Ubuntu 24.04 LTS",
+      },
+    ].filter((img) => !osType || img.os_type === osType.toLowerCase());
+  }
+  const params: Record<string, string> = {
+    Action: "DescribeImages",
+    Version: ECS_VERSION,
+    RegionId: account.region_id,
+    Status: "Available",
+    PageNumber: "1",
+    PageSize: "100",
+  };
+  if (ownerAlias) params["ImageOwnerAlias"] = ownerAlias;
+  if (osType) params["OSType"] = osType;
+  let data: Record<string, unknown>;
+  try {
+    data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, params);
+  } catch (exc) {
+    throw new AliyunError(`查询镜像列表失败：${briefError(exc)}`);
+  }
+  const rawList = asArray<unknown>(asRecord(data["Images"])["Image"]);
+  return rawList.map((item) => {
+    const img = asRecord(item);
+    return {
+      image_id: asStrVal(img["ImageId"]).trim(),
+      os_name: asStrVal(img["OSName"]).trim() || asStrVal(img["OSNameEn"]).trim() || asStrVal(img["ImageName"]).trim(),
+      os_type: asStrVal(img["OSType"]).trim().toLowerCase(),
+      architecture: asStrVal(img["Architecture"]).trim(),
+      image_version: asStrVal(img["ImageVersion"]).trim(),
+      size: asNumVal(img["Size"]),
+      owner_alias: asStrVal(img["ImageOwnerAlias"]).trim(),
+      description: asStrVal(img["Description"]).trim(),
+    };
+  });
+}
+
+/** List SSH key pairs in the region (used as optional login credential when reinstalling). */
+export async function listKeyPairs(
+  env: Env,
+  account: AliyunAccount,
+): Promise<string[]> {
+  if (isDryRun(env)) return ["mock-keypair"];
+  try {
+    const data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+      Action: "DescribeKeyPairs",
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      PageNumber: "1",
+      PageSize: "50",
+    });
+    const rawList = asArray<unknown>(asRecord(data["KeyPairs"])["KeyPair"]);
+    return rawList
+      .map((item) => asStrVal(asRecord(item)["KeyPairName"]).trim())
+      .filter(Boolean);
+  } catch {
+    // Missing keypair read permission should not block manual keypair input.
+    return [];
+  }
+}
+
+/**
+ * Replace the system disk (reinstall OS) on a Stopped ECS instance.
+ * Callers must never log or persist `opts.password`.
+ */
+export async function replaceSystemDisk(
+  env: Env,
+  account: AliyunAccount,
+  opts: {
+    imageId: string;
+    password?: string;
+    keyPairName?: string;
+    systemDiskSize?: number;
+  },
+): Promise<{ disk_id: string }> {
+  if (isDryRun(env)) {
+    const state = mockState(env, account);
+    state.status = "Stopped";
+    return { disk_id: "d-mock-replaced01" };
+  }
+  const params: Record<string, string> = {
+    Action: "ReplaceSystemDisk",
+    Version: ECS_VERSION,
+    RegionId: account.region_id,
+    InstanceId: account.instance_id,
+    ImageId: opts.imageId,
+  };
+  if (opts.password) params["Password"] = opts.password;
+  if (opts.keyPairName) params["KeyPairName"] = opts.keyPairName;
+  if (opts.systemDiskSize && opts.systemDiskSize > 0) {
+    params["SystemDisk.Size"] = String(Math.trunc(opts.systemDiskSize));
+  }
+  let data: Record<string, unknown>;
+  try {
+    data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, params);
+  } catch (exc) {
+    throw new AliyunError(`重装系统失败：${briefError(exc)}`);
+  }
+  return { disk_id: asStrVal(data["DiskId"]).trim() };
 }
 
 // ---------------------------------------------------------------------------

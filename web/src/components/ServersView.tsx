@@ -1,19 +1,23 @@
 import { useState } from 'react'
 import {
   AlertTriangle,
+  Disc3,
   GripVertical,
   Globe2,
   HeartPulse,
+  Info,
   LayoutGrid,
   List,
   LoaderCircle,
   MapPin,
+  Monitor,
   Pencil,
   Plus,
   Power,
   PowerOff,
   RefreshCw,
   Repeat,
+  RotateCw,
   Server as ServerIcon,
   Trash2,
 } from 'lucide-react'
@@ -32,6 +36,10 @@ type Props = {
   onDelete: (server: Server) => void
   onRefresh: (server: Server) => void
   onAction: (server: Server, action: 'start' | 'stop') => void
+  onReboot: (server: Server) => void
+  onDetail: (server: Server) => void
+  onVnc: (server: Server) => void
+  onReinstall: (server: Server) => void
   onAddToKeepalive: (server: Server) => void
   onBilling: (server: Server) => void
   onReorder: (orderedIds: number[]) => void
@@ -56,6 +64,10 @@ export default function ServersView({
   onDelete,
   onRefresh,
   onAction,
+  onReboot,
+  onDetail,
+  onVnc,
+  onReinstall,
   onAddToKeepalive,
   onBilling,
   onReorder,
@@ -95,9 +107,8 @@ export default function ServersView({
         <div>
           <h1>服务器</h1>
           <p>
-            这里登记的是「阿里云账号 + 一台 ECS 实例」。AccessKey Secret 用本机主密钥加密后存
-            SQLite，界面上不显示，只在编辑弹窗里能换。
-            {idleCount > 0 && ` 其中 ${idleCount} 台是闲散机器，可以直接手动开关机。`}
+            这里管理阿里云 ECS 实例：支持添加时自动拉取实例 ID，以及实例详情/磁盘查看、开关机、重启、内置 VNC 远程终端与重装系统。
+            {idleCount > 0 && ` 当前 ${idleCount} 台是闲散机器，可直接手动控制。`}
           </p>
         </div>
         <div className="page-actions">
@@ -130,8 +141,7 @@ export default function ServersView({
       {servers.length === 0 ? (
         <div className="card">
           <Empty icon={<ServerIcon size={20} />} title="还没有服务器">
-            添加后可以把它放进「单机保活」或「联合换班」。建议使用只授予 ECS 启停/查询与 CDT
-            只读权限的 RAM 子账号。
+            添加后可自动读取阿里云实例 ID，支持实例管理（详情、VNC、重启、重装）以及「单机保活」与「联合换班」。
           </Empty>
         </div>
       ) : viewMode === 'list' ? (
@@ -143,6 +153,10 @@ export default function ServersView({
           onDelete={onDelete}
           onRefresh={onRefresh}
           onAction={onAction}
+          onReboot={onReboot}
+          onDetail={onDetail}
+          onVnc={onVnc}
+          onReinstall={onReinstall}
           onAddToKeepalive={onAddToKeepalive}
           onBilling={onBilling}
         />
@@ -153,6 +167,7 @@ export default function ServersView({
             const owner = server.managed ?? null
             const busy = busyId === server.id
             const locked = Boolean(owner?.active)
+            const hasInstance = Boolean(server.instance_id && server.region_id)
             const ownerText = owner ? ownerLabel(owner) : ''
             const lockHint =
               owner && locked
@@ -266,6 +281,51 @@ export default function ServersView({
                   <div style={{ fontSize: 11.5, color: 'var(--muted-soft)' }}>{server.remark}</div>
                 )}
 
+                <div className="server-manage-bar">
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    disabled={!hasInstance}
+                    title={hasInstance ? '查看实例规格、网络与磁盘详情' : '请先编辑补全实例 ID'}
+                    onClick={() => onDetail(server)}
+                  >
+                    <Info size={12} /> 详情
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    disabled={!hasInstance}
+                    title={hasInstance ? '打开内置全屏 VNC 远程控制台' : '请先编辑补全实例 ID'}
+                    onClick={() => onVnc(server)}
+                  >
+                    <Monitor size={12} /> VNC
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    disabled={!hasInstance || !running || locked || busy}
+                    title={
+                      locked
+                        ? '托管中，请先暂停或移出后再重启'
+                        : !running
+                          ? '仅运行中的实例可重启'
+                          : '重启实例'
+                    }
+                    onClick={() => onReboot(server)}
+                  >
+                    <RotateCw size={12} /> 重启
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    disabled={!hasInstance || locked || busy}
+                    title={locked ? '托管中，请先暂停或移出后再重装系统' : '更换系统盘 / 重装操作系统'}
+                    onClick={() => onReinstall(server)}
+                  >
+                    <Disc3 size={12} /> 重装
+                  </button>
+                </div>
+
                 <div className="card-foot">
                   <span className={`owner-tag${owner ? (locked ? ' locked' : ' paused') : ' free'}`}>
                     {owner ? (
@@ -325,6 +385,10 @@ function ServerTable({
   onDelete,
   onRefresh,
   onAction,
+  onReboot,
+  onDetail,
+  onVnc,
+  onReinstall,
   onAddToKeepalive,
   onBilling,
 }: {
@@ -335,6 +399,10 @@ function ServerTable({
   onDelete: (server: Server) => void
   onRefresh: (server: Server) => void
   onAction: (server: Server, action: 'start' | 'stop') => void
+  onReboot: (server: Server) => void
+  onDetail: (server: Server) => void
+  onVnc: (server: Server) => void
+  onReinstall: (server: Server) => void
   onAddToKeepalive: (server: Server) => void
   onBilling: (server: Server) => void
 }) {
@@ -343,15 +411,15 @@ function ServerTable({
       <table className="server-table">
         <colgroup>
           <col style={{ width: '11%' }} />
-          <col style={{ width: '10%' }} />
+          <col style={{ width: '9%' }} />
           <col style={{ width: '8%' }} />
           <col style={{ width: '9%' }} />
           <col style={{ width: '8%' }} />
-          <col style={{ width: '10%' }} />
+          <col style={{ width: '9%' }} />
           {/* 归属列要比别的列宽一点：卡片的文案是「换班组「组名」托管」，窄了会被省略号截掉 */}
-          <col style={{ width: '18%' }} />
           <col style={{ width: '15%' }} />
-          <col style={{ width: '11%' }} />
+          <col style={{ width: '12%' }} />
+          <col style={{ width: '19%' }} />
         </colgroup>
         <thead>
           <tr>
@@ -372,6 +440,7 @@ function ServerTable({
             const owner = server.managed ?? null
             const busy = busyId === server.id
             const locked = Boolean(owner?.active)
+            const hasInstance = Boolean(server.instance_id && server.region_id)
             const ownerText = ownerLabel(owner)
             return (
               <tr key={server.id}>
@@ -450,6 +519,38 @@ function ServerTable({
                 </td>
                 <td data-label="操作">
                   <div className="server-table-actions">
+                    <button
+                      className="btn ghost icon sm"
+                      title="实例详情与磁盘"
+                      disabled={!hasInstance}
+                      onClick={() => onDetail(server)}
+                    >
+                      <Info size={13} />
+                    </button>
+                    <button
+                      className="btn ghost icon sm"
+                      title="VNC 远程控制台"
+                      disabled={!hasInstance}
+                      onClick={() => onVnc(server)}
+                    >
+                      <Monitor size={13} />
+                    </button>
+                    <button
+                      className="btn ghost icon sm"
+                      title={running ? '重启实例' : '仅运行中的实例可重启'}
+                      disabled={!hasInstance || !running || locked || busy}
+                      onClick={() => onReboot(server)}
+                    >
+                      <RotateCw size={13} />
+                    </button>
+                    <button
+                      className="btn ghost icon sm"
+                      title="重装系统"
+                      disabled={!hasInstance || locked || busy}
+                      onClick={() => onReinstall(server)}
+                    >
+                      <Disc3 size={13} />
+                    </button>
                     <button
                       className="btn ghost icon sm"
                       title="刷新状态"

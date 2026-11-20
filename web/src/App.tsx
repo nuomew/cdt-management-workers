@@ -22,6 +22,7 @@ import KeepaliveDialog from './components/KeepaliveDialog'
 import ServersView from './components/ServersView'
 import ShiftView from './components/ShiftView'
 import ServerDialog from './components/ServerDialog'
+import { ServerDetailModal, ServerReinstallModal, ServerVncOverlay } from './components/ServerManageModals'
 import GroupDialog from './components/GroupDialog'
 import SettingsDrawer from './components/SettingsDrawer'
 import ConfirmDialog from './components/ConfirmDialog'
@@ -116,6 +117,9 @@ export default function App() {
     open: false,
     server: null,
   })
+  const [detailServer, setDetailServer] = useState<Server | null>(null)
+  const [vncServer, setVncServer] = useState<Server | null>(null)
+  const [reinstallServer, setReinstallServer] = useState<Server | null>(null)
   const [groupDialog, setGroupDialog] = useState<{ open: boolean; group: ShiftGroup | null }>({
     open: false,
     group: null,
@@ -346,6 +350,21 @@ export default function App() {
         await del(`/api/v1/servers/${server.id}`)
         await loadAll()
         toast('服务器已删除', 'success')
+      },
+    })
+  }
+
+  function rebootServer(server: Server) {
+    setConfirmBox({
+      title: '重启服务器',
+      message: `确定要重启「${server.label || server.instance_id}」？`,
+      hint: '重启期间实例会短暂中断连接，请确认已保存重要数据。',
+      confirmText: '确认重启',
+      failText: '重启失败',
+      run: async () => {
+        await post(`/api/v1/servers/${server.id}/reboot`, { force: false })
+        await loadAll()
+        toast('已下发重启指令', 'success')
       },
     })
   }
@@ -746,6 +765,10 @@ export default function App() {
             onDelete={deleteServer}
             onRefresh={(server) => refreshServer(server.id)}
             onAction={(server, action) => serverAction(server.id, action)}
+            onReboot={rebootServer}
+            onDetail={setDetailServer}
+            onVnc={setVncServer}
+            onReinstall={setReinstallServer}
             onBilling={serverBilling}
             onReorder={reorderServers}
             onAddToKeepalive={(server) => {
@@ -814,6 +837,32 @@ export default function App() {
           onSaved={(message) => {
             setServerDialog({ open: false, server: null })
             void refreshAfterSave(message)
+          }}
+        />
+      )}
+
+      {detailServer && (
+        <ServerDetailModal
+          server={detailServer}
+          onClose={() => setDetailServer(null)}
+          onOpenVnc={(srv) => setVncServer(srv)}
+          onOpenReinstall={(srv) => setReinstallServer(srv)}
+        />
+      )}
+
+      {vncServer && (
+        <ServerVncOverlay
+          server={vncServer}
+          onClose={() => setVncServer(null)}
+        />
+      )}
+
+      {reinstallServer && (
+        <ServerReinstallModal
+          server={reinstallServer}
+          onClose={() => setReinstallServer(null)}
+          onCompleted={() => {
+            void refreshAfterSave('系统重装完成，实例已重新启动')
           }}
         />
       )}

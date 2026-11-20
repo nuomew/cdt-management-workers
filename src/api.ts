@@ -839,6 +839,9 @@ app.onError((err, c) => {
       { status: err.status, headers: { "Content-Type": "application/json" } },
     );
   }
+  if (err instanceof aliyun.AliyunError) {
+    return c.json({ ok: false, code: "aliyun_error", message: err.message }, 502);
+  }
   console.error("unhandled API error", err);
   return c.json(
     { ok: false, code: "internal_error", message: "服务器内部错误，请查看日志" },
@@ -1092,6 +1095,322 @@ app.get("/api/v1/servers/:serverId/samples", async (c) => {
   return c.json({
     items: await repo.listSamples(c.env, paramInt(c, "serverId"), hours),
   });
+});
+
+async function loadServerAccount(
+  env: Env,
+  serverId: number,
+): Promise<{ server: ServerView; account: aliyun.AliyunAccount }> {
+  const server = await repo.getServer(env, serverId, true);
+  if (!server) throw httpErr(404, "not_found", "服务器不存在");
+  const instanceId = strOf(server.instance_id).trim();
+  const regionId = strOf(server.region_id).trim();
+  const ak = strOf(server.access_key_id).trim();
+  const sk = strOf(server.access_key_secret).trim();
+  if (!ak || !sk) {
+    throw invalid("这台服务器的 AccessKey 凭据不完整，请先在编辑中补全");
+  }
+  if (!regionId) throw invalid("这台服务器未填写地域，请先编辑补全");
+  if (!instanceId) throw invalid("这台服务器未填写实例 ID，请先编辑补全");
+  return {
+    server,
+    account: {
+      access_key_id: ak,
+      access_key_secret: sk,
+      region_id: regionId,
+      site: repo.normalizeSite(server.site),
+      instance_id: instanceId,
+      stop_mode: repo.normalizeStopMode(server.stop_mode),
+      quota_gb: finiteGb(server.quota_gb, 200),
+    },
+  };
+}
+
+// Discover ECS instances using form credentials (or an existing server's stored
+// credentials when editing with blank AK/SK fields).
+app.post("/api/v1/aliyun/instances", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const serverId = numOf(payload["server_id"], 0);
+  let ak = strOf(payload["access_key_id"]).trim();
+  let sk = strOf(payload["access_key_secret"]).trim();
+  let site = strOf(payload["site"]).trim();
+  let regionId = strOf(payload["region_id"]).trim();
+  const scanAll = boolOf(payload["scan_all"]);
+
+  if (serverId > 0 && (!ak || !sk)) {
+    const existing = await repo.getServer(c.env, serverId, true);
+    if (!existing) throw httpErr(404, "not_found", "服务器不存在");
+    if (!ak) ak = strOf(existing.access_key_id).trim();
+    if (!sk) sk = strOf(existing.access_key_secret).trim();
+    if (!site) site = repo.normalizeSite(existing.site);
+    if (!regionId) regionId = strOf(existing.region_id).trim();
+  }
+
+  if (!ak || !sk) {
+    throw invalid("请先填写 AccessKey ID 与 AccessKey Secret");
+  }
+  const resolvedSite = site === "international" ? "international" : "china";
+  const result = await aliyun.discoverInstances(
+    c.env,
+    { access_key_id: ak, access_key_secret: sk, site: resolvedSite },
+    { regionId: regionId || "cn-hongkong", scanAll },
+  );
+  return c.json(result);
+});
+
+app.get("/api/v1/servers/:serverId/detail", async (c) => {
+  await requireAdmin(c);
+  const { account } = await loadServerAccount(c.env, paramInt(c, "serverId"));
+  const [detailResult, disksResult] = await Promise.allSettled([
+    aliyun.getInstanceDetail(c.env, account),
+    aliyun.listInstanceDisks(c.env, account),
+  ]);
+  if (detailResult.status === "rejected") throw detailResult.reason;
+  const disks = disksResult.status === "fulfilled" ? disksResult.value : [];
+  const diskError =
+    disksResult.status === "rejected"
+      ? disksResult.reason instanceof Error
+        ? disksResult.reason.message
+        : String(disksResult.reason)
+      : "";
+  return c.json({
+    detail: detailResult.value,
+    disks,
+    disk_error: diskError,
+  });
+});
+
+app.post("/api/v1/servers/:serverId/reboot", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const { server, account } = await loadServerAccount(c.env, serverId);
+  const payload = await jsonBody(c);
+  const force = boolOf(payload["force"]);
+  await aliyun.rebootInstance(c.env, account, force);
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev(force ? "强制重启" : "手动重启", messages.objServer(server.label)),
+    {
+      detail: `已发送${force ? "强制" : "正常"}重启指令（${account.instance_id}）`,
+      level: "info",
+      serverId,
+    },
+  );
+  return c.json({ ok: true, force });
+});
+
+app.post("/api/v1/servers/:serverId/vnc", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const { account } = await loadServerAccount(c.env, paramInt(c, "serverId"));
+  const [vnc, detailRes] = await Promise.all([
+    aliyun.getInstanceVncUrl(c.env, account),
+    aliyun.getInstanceDetail(c.env, account).catch(() => null),
+  ]);
+  return c.json({
+    vnc_url: vnc.vnc_url,
+    console_url: vnc.console_url,
+    instance_id: account.instance_id,
+    region_id: account.region_id,
+    os_name: detailRes?.os_name ?? "",
+    os_type: detailRes?.os_type ?? "",
+  });
+});
+
+app.get("/api/v1/servers/:serverId/images", async (c) => {
+  await requireAdmin(c);
+  const { account } = await loadServerAccount(c.env, paramInt(c, "serverId"));
+  const ownerRaw = (c.req.query("owner") ?? "system").trim();
+  const allowedOwners = new Set(["system", "self", "others", "marketplace"]);
+  const ownerAlias = allowedOwners.has(ownerRaw) ? ownerRaw : "system";
+  const osRaw = (c.req.query("ostype") ?? "").trim().toLowerCase();
+  const osType = osRaw === "linux" || osRaw === "windows" ? osRaw : "";
+  const items = await aliyun.listImages(c.env, account, { ownerAlias, osType });
+  return c.json({ items });
+});
+
+app.get("/api/v1/servers/:serverId/keypairs", async (c) => {
+  await requireAdmin(c);
+  const { account } = await loadServerAccount(c.env, paramInt(c, "serverId"));
+  const items = await aliyun.listKeyPairs(c.env, account);
+  return c.json({ items });
+});
+
+app.post("/api/v1/servers/:serverId/reinstall", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const { server, account } = await loadServerAccount(c.env, serverId);
+  const payload = await jsonBody(c);
+  const imageId = strOf(payload["image_id"]).trim();
+  const password = strOf(payload["password"]);
+  const keyPairName = strOf(payload["key_pair_name"]).trim();
+  const diskSizeRaw = numOf(payload["system_disk_size"], 0);
+  const systemDiskSize = Number.isFinite(diskSizeRaw) && diskSizeRaw > 0 ? Math.trunc(diskSizeRaw) : 0;
+
+  if (!imageId) throw invalid("请选择目标系统镜像");
+  if (!password && !keyPairName) throw invalid("请设置新登录密码或指定 SSH 密钥对");
+  if (password && (password.length < 8 || password.length > 30)) {
+    throw invalid("登录密码长度需为 8–30 位");
+  }
+
+  const detail = await aliyun.getInstanceDetail(c.env, account);
+  if (detail.status === "Running") {
+    // Use KeepCharging (normal stop) before ReplaceSystemDisk per Aliyun docs so
+    // pay-as-you-go spot/regular inventory is not released mid-reinstall.
+    await aliyun.stopInstance(c.env, account, "KeepCharging", true);
+    await repo.addEvent(
+      c.env,
+      "manual",
+      messages.ev("重装系统", messages.objServer(server.label)),
+      {
+        detail: `开始重装流程（镜像 ${imageId}），正在停止实例`,
+        level: "warn",
+        serverId,
+      },
+    );
+    return c.json({
+      status: "stopping",
+      instance_id: account.instance_id,
+      message: "正在停止实例，停机完成后自动更换系统盘…",
+    });
+  }
+
+  if (detail.status === "Stopped") {
+    const res = await aliyun.replaceSystemDisk(c.env, account, {
+      imageId,
+      password: password || undefined,
+      keyPairName: keyPairName || undefined,
+      systemDiskSize,
+    });
+    await repo.addEvent(
+      c.env,
+      "manual",
+      messages.ev("重装系统", messages.objServer(server.label)),
+      {
+        detail: `已提交更换系统盘（镜像 ${imageId}）`,
+        level: "warn",
+        serverId,
+      },
+    );
+    return c.json({
+      status: "reinstalling",
+      instance_id: account.instance_id,
+      disk_id: res.disk_id,
+      message: "重装任务已提交，正在更换系统盘…",
+    });
+  }
+
+  throw httpErr(
+    409,
+    "invalid_state",
+    `实例当前状态为 ${detail.status}，请等待其进入运行中或已停机后再试`,
+  );
+});
+
+app.post("/api/v1/servers/:serverId/reinstall-progress", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const { server, account } = await loadServerAccount(c.env, serverId);
+  const payload = await jsonBody(c);
+  const phase = strOf(payload["phase"]).trim();
+  const imageId = strOf(payload["image_id"]).trim();
+  const password = strOf(payload["password"]);
+  const keyPairName = strOf(payload["key_pair_name"]).trim();
+  const diskSizeRaw = numOf(payload["system_disk_size"], 0);
+  const systemDiskSize = Number.isFinite(diskSizeRaw) && diskSizeRaw > 0 ? Math.trunc(diskSizeRaw) : 0;
+
+  if (!phase) throw invalid("缺少阶段参数 phase");
+
+  const detail = await aliyun.getInstanceDetail(c.env, account);
+
+  if (phase === "stopping") {
+    if (detail.status === "Stopped") {
+      if (!imageId) throw invalid("缺少镜像 ID");
+      const res = await aliyun.replaceSystemDisk(c.env, account, {
+        imageId,
+        password: password || undefined,
+        keyPairName: keyPairName || undefined,
+        systemDiskSize,
+      });
+      await repo.addEvent(
+        c.env,
+        "manual",
+        messages.ev("重装系统", messages.objServer(server.label)),
+        {
+          detail: `实例已停机，已提交更换系统盘（镜像 ${imageId}）`,
+          level: "info",
+          serverId,
+        },
+      );
+      return c.json({
+        status: "reinstalling",
+        current_status: detail.status,
+        disk_id: res.disk_id,
+        message: "实例已停机，正在更换系统盘…",
+      });
+    }
+    return c.json({
+      status: "stopping",
+      current_status: detail.status,
+      message: `正在等待实例停机（当前：${detail.status}）…`,
+    });
+  }
+
+  if (phase === "reinstalling") {
+    const locked = detail.operation_locks.length > 0;
+    if (detail.status === "Stopped" && !locked) {
+      await aliyun.startInstance(c.env, account);
+      await repo.addEvent(
+        c.env,
+        "manual",
+        messages.ev("重装后开机", messages.objServer(server.label)),
+        {
+          detail: `系统盘更换完成，已发送开机指令（${account.instance_id}）`,
+          level: "info",
+          serverId,
+        },
+      );
+      return c.json({
+        status: "starting",
+        current_status: detail.status,
+        message: "系统盘更换完成，正在自动开机…",
+      });
+    }
+    return c.json({
+      status: "reinstalling",
+      current_status: detail.status,
+      is_locked: locked,
+      message: locked ? "系统盘正在写入重装中…" : "正在等待重装完成…",
+    });
+  }
+
+  if (phase === "starting") {
+    if (detail.status === "Running") {
+      try {
+        await refreshServer(c.env, serverId);
+      } catch {
+        // Snapshot refresh failure does not negate completed reinstall.
+      }
+      return c.json({
+        status: "completed",
+        current_status: detail.status,
+        message: "重装系统完成，实例已启动运行！",
+      });
+    }
+    return c.json({
+      status: "starting",
+      current_status: detail.status,
+      message: `实例正在启动（当前：${detail.status}）…`,
+    });
+  }
+
+  throw invalid(`未知的重装阶段：${phase}`);
 });
 
 // -- Single keepalive ---------------------------------------------------------
