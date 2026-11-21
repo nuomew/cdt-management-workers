@@ -344,6 +344,11 @@ button.nav-parent:hover svg,
   margin-bottom: 20px;
 }
 
+.page-head > div:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .page-head h1 {
   display: flex;
   align-items: center;
@@ -377,7 +382,14 @@ button.nav-parent:hover svg,
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: wrap;
+  flex-shrink: 0;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+
+.page-actions > * {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .section {
@@ -556,6 +568,7 @@ button.nav-parent:hover svg,
   .page-head .page-actions {
     margin-left: 0;
     width: 100%;
+    overflow-x: auto;
   }
 
   .member-row {
