@@ -1641,6 +1641,696 @@ app.post("/api/v1/servers/:serverId/reinstall-progress", async (c) => {
   throw invalid(`未知的重装阶段：${phase}`);
 });
 
+// -- Renewal & Auto-Renew -----------------------------------------------------
+
+const VALID_RENEW_MONTHS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 24, 36]);
+const VALID_AUTORENEW_MONTHS = new Set([1, 2, 3, 6, 12, 24, 36]);
+const VALID_AUTORENEW_YEARS = new Set([1, 2, 3, 4, 5]);
+const VALID_AUTORENEW_WEEKS = new Set([1, 2, 3, 4]);
+
+function validateEcsPassword(password: string): void {
+  if (password.length < 8 || password.length > 30) {
+    throw invalid("登录密码长度需为 8–30 位");
+  }
+  const classes = [
+    /[A-Z]/.test(password),
+    /[a-z]/.test(password),
+    /[0-9]/.test(password),
+    /[^A-Za-z0-9\s]/.test(password),
+  ].filter(Boolean).length;
+  if (classes < 3) {
+    throw invalid("密码须同时包含大写字母、小写字母、数字和特殊符号中的至少三类");
+  }
+}
+
+function validateEcsInstanceName(name: string): void {
+  if (name.length < 2 || name.length > 128) {
+    throw invalid("实例名称长度需为 2–128 个字符");
+  }
+  if (/^https?:\/\//i.test(name)) {
+    throw invalid("实例名称不能以 http:// 或 https:// 开头");
+  }
+  if (!/^[A-Za-z\u4e00-\u9fa5][A-Za-z0-9\u4e00-\u9fa5:._-]*$/.test(name)) {
+    throw invalid("实例名称须以字母或中文开头，仅允许中英文、数字、冒号(:)、点(.)、下划线(_)或短划线(-)");
+  }
+}
+
+app.get("/api/v1/servers/:serverId/renewal", async (c) => {
+  await requireAdmin(c);
+  const { account } = await loadServerAccount(c.env, paramInt(c, "serverId"));
+  const detail = await aliyun.getInstanceDetail(c.env, account);
+  const isPrePaid = detail.instance_charge_type === "PrePaid";
+  if (!isPrePaid) {
+    return c.json({
+      supported: false,
+      instance_id: detail.instance_id,
+      instance_name: detail.instance_name,
+      status: detail.status,
+      instance_charge_type: detail.instance_charge_type,
+      expired_time: detail.expired_time,
+      auto_renew: null,
+      reason: "当前实例为按量付费（PostPaid），按使用时长实时计费，无需也不支持续费。",
+    });
+  }
+  const autoRenew = await aliyun
+    .getInstanceAutoRenewAttribute(c.env, account)
+    .catch(() => null);
+  return c.json({
+    supported: true,
+    instance_id: detail.instance_id,
+    instance_name: detail.instance_name,
+    status: detail.status,
+    instance_charge_type: detail.instance_charge_type,
+    expired_time: detail.expired_time,
+    auto_renew: autoRenew,
+    reason: "",
+  });
+});
+
+app.post("/api/v1/servers/:serverId/renewal/price", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const { account } = await loadServerAccount(c.env, paramInt(c, "serverId"));
+  const payload = await jsonBody(c);
+  const months = Math.trunc(numOf(payload["period_months"], 1));
+  if (!VALID_RENEW_MONTHS.has(months)) {
+    throw invalid("续费时长仅支持 1–9 个月或 1–3 年（12 / 24 / 36 个月）");
+  }
+  const quote = await aliyun.describeRenewalPrice(c.env, account, {
+    period: months >= 12 && months % 12 === 0 ? months / 12 : months,
+    periodUnit: months >= 12 && months % 12 === 0 ? "Year" : "Month",
+  });
+  return c.json({ quote, period_months: months });
+});
+
+app.post("/api/v1/servers/:serverId/renewal/pay", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const { server, account } = await loadServerAccount(c.env, serverId);
+  const payload = await jsonBody(c);
+  const months = Math.trunc(numOf(payload["period_months"], 0));
+  if (!VALID_RENEW_MONTHS.has(months)) {
+    throw invalid("续费时长仅支持 1–9 个月或 1–3 年（12 / 24 / 36 个月）");
+  }
+  if (!boolOf(payload["confirm_pay"])) {
+    throw invalid("请先确认续费价格并勾选扣费确认后再提交");
+  }
+  const clientToken = strOf(payload["client_token"]).trim();
+  const res = await aliyun.renewInstance(c.env, account, {
+    periodMonths: months,
+    clientToken: clientToken || undefined,
+  });
+  const detail = await aliyun.getInstanceDetail(c.env, account).catch(() => null);
+  const periodLabel = months >= 12 && months % 12 === 0 ? `${months / 12} 年` : `${months} 个月`;
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("包年包月续费", messages.objServer(server.label)),
+    {
+      detail: `已续费 ${periodLabel}（订单 ${res.order_id || "—"}，实例 ${account.instance_id}）`,
+      level: "info",
+      serverId,
+    },
+  );
+  return c.json({
+    ok: true,
+    order_id: res.order_id,
+    expired_time: detail?.expired_time ?? "",
+  });
+});
+
+app.post("/api/v1/servers/:serverId/renewal/auto", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const { server, account } = await loadServerAccount(c.env, serverId);
+  const payload = await jsonBody(c);
+  const statusRaw = strOf(payload["renewal_status"]).trim();
+  if (statusRaw !== "AutoRenewal" && statusRaw !== "Normal" && statusRaw !== "NotRenewal") {
+    throw invalid("自动续费状态仅支持 AutoRenewal、Normal 或 NotRenewal");
+  }
+  const unitRaw = strOf(payload["period_unit"]).trim() || "Month";
+  if (unitRaw !== "Month" && unitRaw !== "Year" && unitRaw !== "Week") {
+    throw invalid("自动续费周期单位仅支持 Month、Year 或 Week");
+  }
+  const duration = Math.trunc(numOf(payload["duration"], 1));
+  if (statusRaw === "AutoRenewal") {
+    const allowed =
+      unitRaw === "Year"
+        ? VALID_AUTORENEW_YEARS
+        : unitRaw === "Week"
+          ? VALID_AUTORENEW_WEEKS
+          : VALID_AUTORENEW_MONTHS;
+    if (!allowed.has(duration)) {
+      throw invalid(`当前周期单位（${unitRaw}）不支持时长 ${duration}`);
+    }
+  }
+  await aliyun.modifyInstanceAutoRenewAttribute(c.env, account, {
+    renewalStatus: statusRaw,
+    duration,
+    periodUnit: unitRaw,
+  });
+  const latest = await aliyun.getInstanceAutoRenewAttribute(c.env, account).catch(() => null);
+  const statusText =
+    statusRaw === "AutoRenewal"
+      ? `开启自动续费（每 ${duration} ${unitRaw === "Year" ? "年" : unitRaw === "Week" ? "周" : "个月"}）`
+      : statusRaw === "NotRenewal"
+        ? "设为到期不续费"
+        : "关闭自动续费（改为手动续费）";
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("调整自动续费", messages.objServer(server.label)),
+    {
+      detail: `${statusText}（${account.instance_id}）`,
+      level: "info",
+      serverId,
+    },
+  );
+  return c.json({ ok: true, auto_renew: latest });
+});
+
+// -- Instance Attribute (Password / InstanceName / DeletionProtection) --------
+
+app.post("/api/v1/servers/:serverId/attribute", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const { server, account } = await loadServerAccount(c.env, serverId);
+  const payload = await jsonBody(c);
+  const instanceName = strOf(payload["instance_name"]).trim();
+  const password = strOf(payload["password"]);
+  const hasDeletionProtection =
+    payload["deletion_protection"] !== undefined && payload["deletion_protection"] !== null;
+  const deletionProtection = hasDeletionProtection
+    ? boolOf(payload["deletion_protection"])
+    : undefined;
+  const syncLabel = boolOf(payload["sync_label"]);
+  const rebootAfter = boolOf(payload["reboot_after"]);
+
+  if (!instanceName && !password && deletionProtection === undefined) {
+    throw invalid("请至少填写一项要修改的内容（实例名称、新密码或释放保护）");
+  }
+  if (instanceName) validateEcsInstanceName(instanceName);
+  if (password) validateEcsPassword(password);
+
+  await aliyun.modifyInstanceAttribute(c.env, account, {
+    instanceName: instanceName || undefined,
+    password: password || undefined,
+    deletionProtection,
+  });
+
+  if (instanceName && syncLabel) {
+    await repo.upsertServer(c.env, {
+      id: serverId,
+      label: instanceName,
+      region_id: server.region_id,
+      site: server.site,
+      instance_id: server.instance_id,
+      quota_gb: server.quota_gb,
+      threshold_gb: server.threshold_gb,
+      remark: server.remark,
+      stop_mode: server.stop_mode,
+    });
+  }
+
+  let rebooted = false;
+  if (password && rebootAfter) {
+    const detail = await aliyun.getInstanceDetail(c.env, account).catch(() => null);
+    if (detail?.status === "Running") {
+      await aliyun.rebootInstance(c.env, account, false);
+      rebooted = true;
+    }
+  }
+
+  const changed: string[] = [];
+  if (instanceName) changed.push(`实例名改为 ${instanceName}`);
+  if (password) changed.push(rebooted ? "已重置登录密码并触发重启" : "已重置登录密码（需重启生效）");
+  if (deletionProtection !== undefined) {
+    changed.push(deletionProtection ? "已开启释放保护" : "已关闭释放保护");
+  }
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("修改实例属性", messages.objServer(instanceName && syncLabel ? instanceName : server.label)),
+    {
+      detail: `${changed.join("，")}（${account.instance_id}）`,
+      level: "info",
+      serverId,
+    },
+  );
+  return c.json({ ok: true, rebooted });
+});
+
+// -- Security Group Rules -----------------------------------------------------
+
+function normalizePortRange(protocol: string, raw: string): string {
+  if (protocol === "ICMP" || protocol === "ALL") return "-1/-1";
+  const cleaned = raw.trim();
+  if (/^\d+$/.test(cleaned)) {
+    const port = Number(cleaned);
+    if (port < 1 || port > 65535) throw invalid("端口号须在 1–65535 之间");
+    return `${port}/${port}`;
+  }
+  const match = cleaned.match(/^(\d+)\s*[/\-:]\s*(\d+)$/);
+  if (!match) {
+    throw invalid("端口范围格式应为单个端口（如 22）或区间（如 8000/9000）");
+  }
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  if (start < 1 || end > 65535 || start > end) {
+    throw invalid("端口范围须满足 1 <= 起始端口 <= 结束端口 <= 65535");
+  }
+  return `${start}/${end}`;
+}
+
+function validateCidrIp(raw: string): string {
+  const cidr = raw.trim();
+  if (!cidr) throw invalid("请输入授权对象 CIDR（例如 0.0.0.0/0）");
+  const ipv4Cidr = /^(\d{1,3}\.){3}\d{1,3}(\/(\d{1,2}))?$/;
+  const ipv6Cidr = /^[0-9a-fA-F:]+(\/\d{1,3})?$/;
+  if (ipv4Cidr.test(cidr)) {
+    const [ip, prefixRaw] = cidr.split("/");
+    const octets = ip!.split(".").map(Number);
+    if (octets.some((o) => o < 0 || o > 255)) throw invalid(`无效的 IPv4 地址：${cidr}`);
+    if (prefixRaw !== undefined) {
+      const p = Number(prefixRaw);
+      if (p < 0 || p > 32) throw invalid(`无效的 IPv4 掩码：${cidr}`);
+    }
+    return cidr;
+  }
+  if (cidr.includes(":") && ipv6Cidr.test(cidr)) {
+    const [, prefixRaw] = cidr.split("/");
+    if (prefixRaw !== undefined) {
+      const p = Number(prefixRaw);
+      if (p < 0 || p > 128) throw invalid(`无效的 IPv6 掩码：${cidr}`);
+    }
+    return cidr;
+  }
+  throw invalid(`无效的授权对象 CIDR「${cidr}」（示例：0.0.0.0/0 或 1.2.3.4/32）`);
+}
+
+app.get("/api/v1/servers/:serverId/security-groups", async (c) => {
+  await requireAdmin(c);
+  const { account } = await loadServerAccount(c.env, paramInt(c, "serverId"));
+  const detail = await aliyun.getInstanceDetail(c.env, account);
+  const sgIds = detail.security_group_ids;
+  if (sgIds.length === 0) {
+    return c.json({ security_groups: [] });
+  }
+  const results = await Promise.all(
+    sgIds.map((sgId) => aliyun.describeSecurityGroupAttribute(c.env, account, sgId)),
+  );
+  return c.json({ security_groups: results });
+});
+
+app.post("/api/v1/servers/:serverId/security-groups/:sgId/rules", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const { server, account } = await loadServerAccount(c.env, serverId);
+  const sgId = c.req.param("sgId").trim();
+  if (!sgId) throw invalid("缺少安全组 ID");
+
+  const payload = await jsonBody(c);
+  const directionRaw = strOf(payload["direction"]).trim().toLowerCase();
+  const direction = directionRaw === "egress" ? "egress" : "ingress";
+  const protocolRaw = strOf(payload["ip_protocol"]).trim().toUpperCase();
+  if (
+    protocolRaw !== "TCP" &&
+    protocolRaw !== "UDP" &&
+    protocolRaw !== "ICMP" &&
+    protocolRaw !== "ALL"
+  ) {
+    throw invalid("协议类型仅支持 TCP、UDP、ICMP 或 ALL");
+  }
+  const portRange = normalizePortRange(protocolRaw, strOf(payload["port_range"]));
+  const cidrIp = validateCidrIp(strOf(payload["cidr_ip"]) || "0.0.0.0/0");
+  const policyRaw = strOf(payload["policy"]).trim().toLowerCase();
+  const policy = policyRaw === "drop" ? "drop" : "accept";
+  const priority = Math.min(100, Math.max(1, Math.trunc(numOf(payload["priority"], 1))));
+  const description = strOf(payload["description"]).trim().slice(0, 256);
+
+  await aliyun.authorizeSecurityGroupRule(c.env, account, {
+    securityGroupId: sgId,
+    direction,
+    ipProtocol: protocolRaw,
+    portRange,
+    cidrIp,
+    policy,
+    priority,
+    description: description || undefined,
+  });
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("添加安全组规则", messages.objServer(server.label)),
+    {
+      detail: `${sgId} ${direction === "ingress" ? "入方向" : "出方向"} ${policy === "accept" ? "允许" : "拒绝"} ${protocolRaw} ${portRange} (${cidrIp})`,
+      level: "info",
+      serverId,
+    },
+  );
+  const updated = await aliyun.describeSecurityGroupAttribute(c.env, account, sgId);
+  return c.json({ ok: true, security_group: updated });
+});
+
+app.delete("/api/v1/servers/:serverId/security-groups/:sgId/rules/:ruleId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const { server, account } = await loadServerAccount(c.env, serverId);
+  const sgId = c.req.param("sgId").trim();
+  const ruleId = c.req.param("ruleId").trim();
+  if (!sgId || !ruleId) throw invalid("缺少安全组 ID 或规则 ID");
+  const dirQuery = (c.req.query("direction") ?? "ingress").trim().toLowerCase();
+  const direction = dirQuery === "egress" ? "egress" : "ingress";
+
+  await aliyun.revokeSecurityGroupRule(c.env, account, {
+    securityGroupId: sgId,
+    direction,
+    ruleId,
+  });
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("删除安全组规则", messages.objServer(server.label)),
+    {
+      detail: `${sgId} 移除${direction === "ingress" ? "入方向" : "出方向"}规则 ${ruleId}`,
+      level: "warn",
+      serverId,
+    },
+  );
+  const updated = await aliyun.describeSecurityGroupAttribute(c.env, account, sgId);
+  return c.json({ ok: true, security_group: updated });
+});
+
+// -- Instance Release (Destroy on Aliyun) -------------------------------------
+
+app.post("/api/v1/servers/:serverId/release", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const { server, account } = await loadServerAccount(c.env, serverId);
+  const payload = await jsonBody(c);
+  const confirmId = strOf(payload["confirm_instance_id"]).trim();
+  const force = boolOf(payload["force"]);
+  const terminateSubscription = boolOf(payload["terminate_subscription"]);
+  const removeFromPanel = boolOf(payload["remove_from_panel"]);
+
+  if (confirmId !== account.instance_id) {
+    throw invalid(`确认实例 ID 不匹配，请完整输入 ${account.instance_id}`);
+  }
+
+  // Block destroying an instance that is actively managed by keepalive or shift group.
+  const managed = managedMap(
+    await repo.listGroups(c.env),
+    await repo.listKeepalives(c.env),
+  ).get(serverId);
+  if (managed?.active) {
+    throw httpErr(
+      409,
+      "managed_conflict",
+      `这台服务器正由「${managed.name}」托管运行，请先暂停或移出托管后再释放实例`,
+    );
+  }
+
+  await aliyun.deleteInstance(c.env, account, {
+    force,
+    forceStop: true,
+    terminateSubscription,
+  });
+
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("释放云端实例", messages.objServer(server.label)),
+    {
+      detail: `已向阿里云提交释放指令（${account.instance_id}${force ? "，强制释放" : ""}）${removeFromPanel ? "，并从本面板移除" : ""}`,
+      level: "warn",
+      serverId: removeFromPanel ? 0 : serverId,
+    },
+  );
+
+  if (removeFromPanel) {
+    await repo.deleteServer(c.env, serverId);
+  }
+  return c.json({ ok: true, removed_from_panel: removeFromPanel });
+});
+
+// -- Provision New ECS Instance -----------------------------------------------
+
+async function resolveProvisionAccount(
+  env: Env,
+  payload: AnyRow,
+): Promise<{ account: aliyun.AliyunAccount; site: string }> {
+  const sourceServerId = numOf(payload["source_server_id"], 0);
+  let ak = strOf(payload["access_key_id"]).trim();
+  let sk = strOf(payload["access_key_secret"]).trim();
+  let site = strOf(payload["site"]).trim();
+  const regionId = strOf(payload["region_id"]).trim();
+
+  if (sourceServerId > 0) {
+    const existing = await repo.getServer(env, sourceServerId, true);
+    if (!existing) throw httpErr(404, "not_found", "所选来源服务器不存在");
+    ak = strOf(existing.access_key_id).trim();
+    sk = strOf(existing.access_key_secret).trim();
+    if (!site) site = repo.normalizeSite(existing.site);
+  }
+  if (!ak || !sk) {
+    throw invalid("请选择已有服务器账号，或填写完整的 AccessKey ID 与 AccessKey Secret");
+  }
+  if (!regionId) {
+    throw invalid("请选择目标地域");
+  }
+  const normalizedSite = repo.normalizeSite(site);
+  return {
+    site: normalizedSite,
+    account: {
+      access_key_id: ak,
+      access_key_secret: sk,
+      region_id: regionId,
+      site: normalizedSite,
+      instance_id: "",
+    },
+  };
+}
+
+const VALID_SYSTEM_DISK_CATEGORIES = new Set([
+  "cloud_essd",
+  "cloud_essd_entry",
+  "cloud_efficiency",
+  "cloud_ssd",
+  "cloud_auto",
+]);
+
+app.post("/api/v1/aliyun/provision/options", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const { account } = await resolveProvisionAccount(c.env, payload);
+  const chargeType = strOf(payload["charge_type"]).trim() === "PrePaid" ? "PrePaid" : "PostPaid";
+  const imageOwnerRaw = strOf(payload["image_owner"]).trim() || "system";
+  const imageOwner = new Set(["system", "self", "others"]).has(imageOwnerRaw)
+    ? imageOwnerRaw
+    : "system";
+
+  const [resources, images, keyPairs] = await Promise.all([
+    aliyun.listProvisionResources(c.env, account, { chargeType }),
+    aliyun
+      .listImages(c.env, account, { ownerAlias: imageOwner })
+      .catch(() => [] as aliyun.EcsImage[]),
+    aliyun.listKeyPairs(c.env, account).catch(() => [] as string[]),
+  ]);
+  return c.json({
+    ...resources,
+    images,
+    key_pairs: keyPairs,
+  });
+});
+
+app.post("/api/v1/aliyun/provision/init-network", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const { account } = await resolveProvisionAccount(c.env, payload);
+  const zoneId = strOf(payload["zone_id"]).trim();
+  if (!zoneId) throw invalid("请先选择可用区");
+  const created = await aliyun.ensureDefaultNetwork(c.env, account, zoneId);
+  const refreshed = await aliyun.listProvisionResources(c.env, account, {
+    chargeType: "PostPaid",
+  });
+  return c.json({
+    ok: true,
+    created,
+    vswitches: refreshed.vswitches,
+    security_groups: refreshed.security_groups,
+  });
+});
+
+app.post("/api/v1/aliyun/provision/price", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const { account } = await resolveProvisionAccount(c.env, payload);
+  const instanceType = strOf(payload["instance_type"]).trim();
+  if (!instanceType) throw invalid("请先选择或输入实例规格");
+  const chargeType = strOf(payload["charge_type"]).trim() === "PrePaid" ? "PrePaid" : "PostPaid";
+  const periodMonths = Math.trunc(numOf(payload["period_months"], 1));
+  if (chargeType === "PrePaid" && !VALID_RENEW_MONTHS.has(periodMonths)) {
+    throw invalid("包年包月购买时长仅支持 1–9 个月或 1–3 年（12 / 24 / 36 个月）");
+  }
+  const diskCategory = strOf(payload["system_disk_category"]).trim() || "cloud_essd";
+  if (!VALID_SYSTEM_DISK_CATEGORIES.has(diskCategory)) {
+    throw invalid(`不支持的系统盘类型：${diskCategory}`);
+  }
+  const diskSize = Math.trunc(numOf(payload["system_disk_size"], 40));
+  if (diskSize < 20 || diskSize > 2048) {
+    throw invalid("系统盘容量须在 20–2048 GiB 之间");
+  }
+  const netChargeType =
+    strOf(payload["internet_charge_type"]).trim() === "PayByBandwidth"
+      ? "PayByBandwidth"
+      : "PayByTraffic";
+  const bwOut = Math.trunc(numOf(payload["internet_max_bandwidth_out"], 100));
+  if (bwOut < 0 || bwOut > 200) {
+    throw invalid("公网出带宽上限须在 0–200 Mbps 之间");
+  }
+  const quote = await aliyun.describeInstancePrice(c.env, account, {
+    instanceType,
+    imageId: strOf(payload["image_id"]).trim() || undefined,
+    chargeType,
+    periodMonths,
+    systemDiskCategory: diskCategory,
+    systemDiskSize: diskSize,
+    internetChargeType: netChargeType,
+    internetMaxBandwidthOut: bwOut,
+  });
+  return c.json({ quote });
+});
+
+app.post("/api/v1/aliyun/provision/create", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  if (!boolOf(payload["confirm_pay"])) {
+    throw invalid("请先完成询价并勾选扣费确认后再开通实例");
+  }
+  const { account, site } = await resolveProvisionAccount(c.env, payload);
+  const instanceType = strOf(payload["instance_type"]).trim();
+  const imageId = strOf(payload["image_id"]).trim();
+  const vswitchId = strOf(payload["vswitch_id"]).trim();
+  const securityGroupId = strOf(payload["security_group_id"]).trim();
+  const zoneId = strOf(payload["zone_id"]).trim();
+  const instanceName = strOf(payload["instance_name"]).trim();
+  const chargeType = strOf(payload["charge_type"]).trim() === "PrePaid" ? "PrePaid" : "PostPaid";
+  const periodMonths = Math.trunc(numOf(payload["period_months"], 1));
+  const autoRenew = boolOf(payload["auto_renew"]);
+  const diskCategory = strOf(payload["system_disk_category"]).trim() || "cloud_essd";
+  const diskSize = Math.trunc(numOf(payload["system_disk_size"], 40));
+  const netChargeType =
+    strOf(payload["internet_charge_type"]).trim() === "PayByBandwidth"
+      ? "PayByBandwidth"
+      : "PayByTraffic";
+  const bwOut = Math.trunc(numOf(payload["internet_max_bandwidth_out"], 100));
+  const authMode = strOf(payload["auth_mode"]).trim() || "password";
+  const password = strOf(payload["password"]);
+  const keyPairName = strOf(payload["key_pair_name"]).trim();
+  const addToPanel = payload["add_to_panel"] !== false;
+  const panelLabel = strOf(payload["panel_label"]).trim();
+  const quotaGb = numOf(payload["quota_gb"], 200);
+  const thresholdGb = numOf(payload["threshold_gb"], 188);
+  const clientToken = strOf(payload["client_token"]).trim();
+
+  if (!instanceType) throw invalid("请选择或输入实例规格");
+  if (!imageId) throw invalid("请选择系统镜像");
+  if (!vswitchId) throw invalid("请选择虚拟交换机（若当前地域尚无网络，请先点击初始化默认网络）");
+  if (!securityGroupId) throw invalid("请选择安全组");
+  if (instanceName) validateEcsInstanceName(instanceName);
+  if (chargeType === "PrePaid" && !VALID_RENEW_MONTHS.has(periodMonths)) {
+    throw invalid("包年包月购买时长仅支持 1–9 个月或 1–3 年（12 / 24 / 36 个月）");
+  }
+  if (!VALID_SYSTEM_DISK_CATEGORIES.has(diskCategory)) {
+    throw invalid(`不支持的系统盘类型：${diskCategory}`);
+  }
+  if (diskSize < 20 || diskSize > 2048) {
+    throw invalid("系统盘容量须在 20–2048 GiB 之间");
+  }
+  if (bwOut < 0 || bwOut > 200) {
+    throw invalid("公网出带宽上限须在 0–200 Mbps 之间");
+  }
+  if (authMode === "password") {
+    validateEcsPassword(password);
+  } else if (authMode === "keypair") {
+    if (!keyPairName) throw invalid("请选择或输入 SSH 密钥对名称");
+  } else if (authMode !== "inherit") {
+    throw invalid("登录凭证模式仅支持 password、keypair 或 inherit");
+  }
+
+  const created = await aliyun.runInstances(c.env, account, {
+    zoneId: zoneId || undefined,
+    imageId,
+    instanceType,
+    securityGroupId,
+    vswitchId,
+    instanceName: instanceName || undefined,
+    chargeType,
+    periodMonths,
+    autoRenew: chargeType === "PrePaid" ? autoRenew : false,
+    systemDiskCategory: diskCategory,
+    systemDiskSize: diskSize,
+    internetChargeType: netChargeType,
+    internetMaxBandwidthOut: bwOut,
+    password: authMode === "password" ? password : undefined,
+    keyPairName: authMode === "keypair" ? keyPairName : undefined,
+    passwordInherit: authMode === "inherit",
+    clientToken: clientToken || undefined,
+  });
+
+  const newInstanceId = created.instance_ids[0] ?? "";
+  let serverId = 0;
+  if (addToPanel && newInstanceId) {
+    const label = panelLabel || instanceName || newInstanceId;
+    serverId = await repo.upsertServer(c.env, {
+      label,
+      access_key_id: account.access_key_id,
+      access_key_secret: account.access_key_secret,
+      region_id: account.region_id,
+      site,
+      instance_id: newInstanceId,
+      quota_gb: quotaGb > 0 ? quotaGb : 200,
+      threshold_gb: thresholdGb > 0 && thresholdGb <= (quotaGb > 0 ? quotaGb : 200)
+        ? thresholdGb
+        : Math.max(1, Math.round((quotaGb > 0 ? quotaGb : 200) * 0.94)),
+      remark: `${instanceType} · ${chargeType === "PrePaid" ? "包年包月" : "按量付费"}`,
+      stop_mode: chargeType === "PostPaid" ? "StopCharging" : "Stop",
+    });
+    // Best-effort initial status sync; newly launched instances may still be Pending.
+    await refreshServer(c.env, serverId).catch(() => {});
+  }
+
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("开通新 ECS 实例", messages.objServer(panelLabel || instanceName || newInstanceId)),
+    {
+      detail: `地域 ${account.region_id} · ${instanceType} · ${chargeType === "PrePaid" ? `包年包月 ${periodMonths} 个月` : "按量付费"} · 实例 ${newInstanceId || "—"}（订单 ${created.order_id || "—"}）`,
+      level: "info",
+      serverId,
+    },
+  );
+
+  return c.json({
+    ok: true,
+    instance_id: newInstanceId,
+    instance_ids: created.instance_ids,
+    order_id: created.order_id,
+    trade_price: created.trade_price,
+    server_id: serverId,
+  });
+});
+
 // -- Single keepalive ---------------------------------------------------------
 
 app.get("/api/v1/keepalives", async (c) => {

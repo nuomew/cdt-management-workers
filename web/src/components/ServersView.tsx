@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import {
   AlertTriangle,
+  CalendarClock,
   Disc3,
   GripVertical,
   Globe2,
@@ -18,8 +19,10 @@ import {
   PowerOff,
   RefreshCw,
   Repeat,
+  Rocket,
   RotateCw,
   Server as ServerIcon,
+  SlidersHorizontal,
   Trash2,
 } from 'lucide-react'
 import { regionLabel } from '../regions'
@@ -33,6 +36,7 @@ type Props = {
   busyId: number | null
   billingId: number | null
   onAdd: () => void
+  onProvision: () => void
   onEdit: (server: Server) => void
   onDelete: (server: Server) => void
   onRefresh: (server: Server) => void
@@ -42,6 +46,8 @@ type Props = {
   onVnc: (server: Server) => void
   onReinstall: (server: Server) => void
   onImages: (server: Server) => void
+  onRenew: (server: Server) => void
+  onOps: (server: Server) => void
   onAddToKeepalive: (server: Server) => void
   onBilling: (server: Server) => void
   onReorder: (orderedIds: number[]) => void
@@ -62,6 +68,7 @@ export default function ServersView({
   busyId,
   billingId,
   onAdd,
+  onProvision,
   onEdit,
   onDelete,
   onRefresh,
@@ -71,6 +78,8 @@ export default function ServersView({
   onVnc,
   onReinstall,
   onImages,
+  onRenew,
+  onOps,
   onAddToKeepalive,
   onBilling,
   onReorder,
@@ -110,7 +119,7 @@ export default function ServersView({
         <div>
           <h1>服务器</h1>
           <p>
-            这里管理阿里云 ECS 实例：支持添加时自动拉取实例 ID，以及实例详情/磁盘查看、开关机、重启、镜像制作与跨账号共享、内置 VNC 与重装系统。
+            管理阿里云 ECS 全生命周期：支持询价开通新实例、续费与自动续费、改密改名、安全组端口、镜像制作与跨账号共享、VNC 终端、重装系统与实例释放。
             {idleCount > 0 && ` 当前 ${idleCount} 台是闲散机器，可直接手动控制。`}
           </p>
         </div>
@@ -135,6 +144,9 @@ export default function ServersView({
               </button>
             </div>
           )}
+          <button type="button" className="btn" onClick={onProvision}>
+            <Rocket size={14} /> 开通实例
+          </button>
           <button className="btn primary" onClick={onAdd}>
             <Plus size={14} /> 添加服务器
           </button>
@@ -144,7 +156,7 @@ export default function ServersView({
       {servers.length === 0 ? (
         <div className="card">
           <Empty icon={<ServerIcon size={20} />} title="还没有服务器">
-            添加后可自动读取阿里云实例 ID，支持实例管理（详情、镜像、VNC、重启、重装）以及「单机保活」与「联合换班」。
+            可点击右上角「开通实例」直接询价创建阿里云 ECS，或「添加服务器」自动拉取已有实例纳入管理。
           </Empty>
         </div>
       ) : viewMode === 'list' ? (
@@ -161,6 +173,8 @@ export default function ServersView({
           onVnc={onVnc}
           onReinstall={onReinstall}
           onImages={onImages}
+          onRenew={onRenew}
+          onOps={onOps}
           onAddToKeepalive={onAddToKeepalive}
           onBilling={onBilling}
         />
@@ -331,6 +345,24 @@ export default function ServersView({
                   <button
                     type="button"
                     className="btn ghost sm"
+                    disabled={!hasInstance}
+                    title={hasInstance ? '查看到期时间、包年包月续费与自动续费设置' : '请先编辑补全实例 ID'}
+                    onClick={() => onRenew(server)}
+                  >
+                    <CalendarClock size={12} /> 续费
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    disabled={!hasInstance}
+                    title={hasInstance ? '改密、改名、释放保护、安全组规则与释放实例' : '请先编辑补全实例 ID'}
+                    onClick={() => onOps(server)}
+                  >
+                    <SlidersHorizontal size={12} /> 运维
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
                     disabled={!hasInstance || locked || busy}
                     title={locked ? '托管中，请先暂停或移出后再重装系统' : '更换系统盘 / 重装操作系统'}
                     onClick={() => onReinstall(server)}
@@ -403,6 +435,8 @@ function ServerTable({
   onVnc,
   onReinstall,
   onImages,
+  onRenew,
+  onOps,
   onAddToKeepalive,
   onBilling,
 }: {
@@ -418,6 +452,8 @@ function ServerTable({
   onVnc: (server: Server) => void
   onReinstall: (server: Server) => void
   onImages: (server: Server) => void
+  onRenew: (server: Server) => void
+  onOps: (server: Server) => void
   onAddToKeepalive: (server: Server) => void
   onBilling: (server: Server) => void
 }) {
@@ -549,6 +585,22 @@ function ServerTable({
                       onClick={() => onImages(server)}
                     >
                       <Layers size={13} />
+                    </button>
+                    <button
+                      className="btn ghost icon sm"
+                      title="续费与自动续费管理"
+                      disabled={!hasInstance}
+                      onClick={() => onRenew(server)}
+                    >
+                      <CalendarClock size={13} />
+                    </button>
+                    <button
+                      className="btn ghost icon sm"
+                      title="运维（改密 / 改名 / 释放保护 / 安全组 / 释放实例）"
+                      disabled={!hasInstance}
+                      onClick={() => onOps(server)}
+                    >
+                      <SlidersHorizontal size={13} />
                     </button>
                     <button
                       className="btn ghost icon sm"

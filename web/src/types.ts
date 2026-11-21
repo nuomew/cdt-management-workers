@@ -350,6 +350,7 @@ export type InstanceDetail = {
   instance_charge_type: string
   network_type: string
   operation_locks: string[]
+  deletion_protection?: boolean
 }
 
 /** 实例挂载的云盘信息 */
@@ -393,3 +394,88 @@ export type ImageShareAccount = {
 }
 
 export type ReinstallPhase = 'stopping' | 'reinstalling' | 'starting' | 'completed' | 'error'
+
+export type AutoRenewInfo = {
+  auto_renew_enabled: boolean
+  renewal_status: 'AutoRenewal' | 'Normal' | 'NotRenewal' | string
+  duration: number
+  period_unit: string
+}
+
+export type RenewalState = {
+  supported: boolean
+  instance_id: string
+  instance_name: string
+  status: string
+  instance_charge_type: string
+  expired_time: string
+  auto_renew: AutoRenewInfo | null
+  reason: string
+}
+
+export type PriceQuote = {
+  original_price: number
+  discount_price: number
+  trade_price: number
+  currency: string
+  period: number
+  price_unit: string
+  rules: string[]
+}
+
+export type SecurityGroupRule = {
+  rule_id: string
+  direction: 'ingress' | 'egress'
+  ip_protocol: string
+  port_range: string
+  source_cidr_ip: string
+  dest_cidr_ip: string
+  policy: string
+  priority: number
+  description: string
+  create_time: string
+}
+
+export type SecurityGroupDetail = {
+  security_group_id: string
+  security_group_name: string
+  vpc_id: string
+  description: string
+  rules: SecurityGroupRule[]
+}
+
+export type VSwitchInfo = {
+  vswitch_id: string
+  vswitch_name: string
+  vpc_id: string
+  zone_id: string
+  cidr_block: string
+  available_ip_count: number
+  is_default: boolean
+}
+
+export type SecurityGroupSummary = {
+  security_group_id: string
+  security_group_name: string
+  vpc_id: string
+  security_group_type: string
+  description: string
+}
+
+export type InstanceTypeOffer = {
+  instance_type: string
+  cpu: number
+  memory_gb: number
+  family: string
+  zones: string[]
+}
+
+export type ProvisionOptions = {
+  region_id: string
+  zones: string[]
+  instance_types: InstanceTypeOffer[]
+  vswitches: VSwitchInfo[]
+  security_groups: SecurityGroupSummary[]
+  images: EcsImage[]
+  key_pairs: string[]
+}

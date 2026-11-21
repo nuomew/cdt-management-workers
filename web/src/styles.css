@@ -4064,11 +4064,184 @@ input[type='number']::-webkit-inner-spin-button {
   margin-top: 2px;
 }
 
+/* 续费、运维（改密/安全组/释放）与开通实例 */
+.ops-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ops-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ops-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 13px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line);
+  background: var(--panel-inset);
+}
+
+.ops-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.ops-card-head strong {
+  font-size: 12.5px;
+  font-weight: 620;
+  color: var(--ink);
+}
+
+.ops-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ops-period-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ops-period-btn {
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--panel-solid);
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+  transition:
+    border-color var(--t-fast) var(--ease),
+    background var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease);
+}
+
+.ops-period-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.ops-period-btn.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 620;
+}
+
+.ops-period-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.price-quote-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
+  background: var(--panel-solid);
+  font-size: 12px;
+}
+
+.price-quote-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+}
+
+.price-quote-row.total {
+  padding-top: 6px;
+  border-top: 1px dashed var(--line);
+  color: var(--ink);
+}
+
+.price-quote-row.total strong {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.price-discount {
+  color: var(--green);
+  font-weight: 600;
+}
+
+.price-quote-rules {
+  font-size: 11px;
+  color: var(--muted-soft);
+}
+
+.ops-auto-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ops-sg-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ops-preset-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ops-sg-form {
+  display: grid;
+  grid-template-columns: 82px 120px 1fr 78px 66px 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.ops-sg-table-wrap {
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--panel-solid);
+}
+
+.ops-prov-region-row {
+  display: grid;
+  grid-template-columns: 1fr 1.3fr auto;
+  gap: 10px;
+  align-items: end;
+}
+
 @media (max-width: 720px) {
   .detail-grid,
   .reinstall-filters,
-  .img-share-controls {
+  .img-share-controls,
+  .ops-prov-region-row {
     grid-template-columns: 1fr;
+  }
+  .ops-sg-form {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .reinstall-steps {
     grid-template-columns: 1fr;

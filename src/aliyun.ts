@@ -74,6 +74,7 @@ export const CDT_REGION = "cn-hongkong";
 export const BSS_VERSION = "2017-12-14";
 export const ECS_VERSION = "2014-05-26";
 export const CDT_VERSION = "2021-08-13";
+export const VPC_VERSION = "2016-04-28";
 
 const BSS_ENDPOINTS: Record<string, { region: string; domain: string }> = {
   china: { region: "cn-hangzhou", domain: "business.aliyuncs.com" },
@@ -82,6 +83,10 @@ const BSS_ENDPOINTS: Record<string, { region: string; domain: string }> = {
 
 export function ecsDomain(region: string): string {
   return `ecs.${region}.aliyuncs.com`;
+}
+
+export function vpcDomain(region: string): string {
+  return `vpc.${region}.aliyuncs.com`;
 }
 
 /** Returns `{region, domain}` for BSS (balance/bill) by site; unknown site -> china. */
@@ -723,6 +728,7 @@ export interface InstanceDetail {
   instance_charge_type: string;
   network_type: string;
   operation_locks: string[];
+  deletion_protection: boolean;
 }
 
 export interface InstanceDisk {
@@ -760,6 +766,84 @@ export interface ImageShareAccount {
 export interface VncInfo {
   vnc_url: string;
   console_url: string;
+}
+
+export interface AutoRenewInfo {
+  auto_renew_enabled: boolean;
+  renewal_status: "AutoRenewal" | "Normal" | "NotRenewal" | string;
+  duration: number;
+  period_unit: string;
+}
+
+export interface PriceQuote {
+  original_price: number;
+  discount_price: number;
+  trade_price: number;
+  currency: string;
+  period: number;
+  price_unit: string;
+  rules: string[];
+}
+
+export interface SecurityGroupRule {
+  rule_id: string;
+  direction: "ingress" | "egress";
+  ip_protocol: string;
+  port_range: string;
+  source_cidr_ip: string;
+  dest_cidr_ip: string;
+  policy: string;
+  priority: number;
+  description: string;
+  create_time: string;
+}
+
+export interface SecurityGroupDetail {
+  security_group_id: string;
+  security_group_name: string;
+  vpc_id: string;
+  description: string;
+  rules: SecurityGroupRule[];
+}
+
+export interface VSwitchInfo {
+  vswitch_id: string;
+  vswitch_name: string;
+  vpc_id: string;
+  zone_id: string;
+  cidr_block: string;
+  available_ip_count: number;
+  is_default: boolean;
+}
+
+export interface SecurityGroupSummary {
+  security_group_id: string;
+  security_group_name: string;
+  vpc_id: string;
+  security_group_type: string;
+  description: string;
+}
+
+export interface InstanceTypeOffer {
+  instance_type: string;
+  cpu: number;
+  memory_gb: number;
+  family: string;
+  zones: string[];
+}
+
+export interface ProvisionResources {
+  region_id: string;
+  zones: string[];
+  instance_types: InstanceTypeOffer[];
+  vswitches: VSwitchInfo[];
+  security_groups: SecurityGroupSummary[];
+}
+
+export interface RunInstanceResult {
+  instance_ids: string[];
+  order_id: string;
+  trade_price: number | null;
 }
 
 function asArray<T>(value: unknown): T[] {
@@ -889,6 +973,7 @@ function parseInstanceDetail(
     instance_charge_type: asStrVal(raw["InstanceChargeType"]).trim(),
     network_type: asStrVal(raw["InstanceNetworkType"]).trim(),
     operation_locks: extractOperationLocks(raw),
+    deletion_protection: Boolean(raw["DeletionProtection"]),
   };
 }
 
@@ -1017,33 +1102,38 @@ export async function getInstanceDetail(
   if (isDryRun(env)) {
     const state = mockState(env, account);
     mockAdvance(state);
+    const meta = mockInstanceMeta(account);
+    if (meta.deleted) {
+      throw new AliyunError("实例不存在或已释放");
+    }
     return {
       instance_id: account.instance_id,
-      instance_name: `mock-${account.instance_id}`,
-      description: "Dry-run simulated ECS instance",
+      instance_name: meta.instance_name,
+      description: meta.description,
       status: state.status,
       stopped_mode: state.stopped_mode,
-      instance_type: "ecs.e-c1m1.large",
-      os_name: "Debian 12.6 64位",
+      instance_type: meta.instance_type,
+      os_name: meta.os_name,
       os_type: "linux",
       region_id: account.region_id,
-      zone_id: `${account.region_id}-a`,
+      zone_id: meta.zone_id,
       public_ips: state.public_ip ? [state.public_ip] : [],
       private_ips: ["172.16.0.10"],
-      vpc_id: "vpc-mock001",
-      vswitch_id: "vsw-mock001",
-      security_group_ids: ["sg-mock001"],
-      internet_charge_type: "PayByTraffic",
-      internet_max_bandwidth_in: 200,
-      internet_max_bandwidth_out: 200,
-      creation_time: "2026-01-01T00:00Z",
-      expired_time: "",
-      image_id: "debian_12_6_x64_20G_alibase_20240819.vhd",
-      cpu: 2,
-      memory: 2048,
-      instance_charge_type: "PostPaid",
+      vpc_id: meta.vpc_id,
+      vswitch_id: meta.vswitch_id,
+      security_group_ids: [meta.security_group_id],
+      internet_charge_type: meta.internet_charge_type,
+      internet_max_bandwidth_in: meta.bandwidth_out || 10,
+      internet_max_bandwidth_out: meta.bandwidth_out,
+      creation_time: meta.creation_time,
+      expired_time: meta.expired_time,
+      image_id: meta.image_id,
+      cpu: meta.cpu,
+      memory: meta.memory,
+      instance_charge_type: meta.charge_type,
       network_type: "vpc",
       operation_locks: [],
+      deletion_protection: meta.deletion_protection,
     };
   }
   let raw: Record<string, unknown> | null = null;
@@ -1559,6 +1649,1153 @@ export async function replaceSystemDisk(
     throw new AliyunError(`重装系统失败：${briefError(exc)}`);
   }
   return { disk_id: asStrVal(data["DiskId"]).trim() };
+}
+
+// ---------------------------------------------------------------------------
+// Renewal, Instance Attributes, Security Groups, Release & Provisioning
+// ---------------------------------------------------------------------------
+
+interface MockInstanceMeta {
+  instance_name: string;
+  description: string;
+  instance_type: string;
+  os_name: string;
+  image_id: string;
+  zone_id: string;
+  vpc_id: string;
+  vswitch_id: string;
+  security_group_id: string;
+  internet_charge_type: string;
+  bandwidth_out: number;
+  cpu: number;
+  memory: number;
+  charge_type: "PrePaid" | "PostPaid";
+  creation_time: string;
+  expired_time: string;
+  deletion_protection: boolean;
+  deleted: boolean;
+  auto_renew: AutoRenewInfo;
+}
+
+const mockInstanceMetas = new Map<string, MockInstanceMeta>();
+const mockSgRules = new Map<string, SecurityGroupRule[]>();
+const mockVSwitches = new Map<string, VSwitchInfo[]>();
+const mockSecGroups = new Map<string, SecurityGroupSummary[]>();
+
+function mockInstanceMeta(account: AliyunAccount): MockInstanceMeta {
+  const key = account.instance_id || account.access_key_id || "mock";
+  let meta = mockInstanceMetas.get(key);
+  if (!meta) {
+    const isPrePaid = key.toLowerCase().includes("prepaid");
+    const exp = isPrePaid
+      ? new Date(Date.now() + 20 * 24 * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, "Z")
+      : "";
+    meta = {
+      instance_name: `mock-${key}`,
+      description: "Dry-run simulated ECS instance",
+      instance_type: "ecs.e-c1m1.large",
+      os_name: "Debian 12.6 64位",
+      image_id: "debian_12_6_x64_20G_alibase_20240819.vhd",
+      zone_id: `${account.region_id}-a`,
+      vpc_id: "vpc-mock001",
+      vswitch_id: "vsw-mock001",
+      security_group_id: "sg-mock001",
+      internet_charge_type: "PayByTraffic",
+      bandwidth_out: 100,
+      cpu: 2,
+      memory: 2048,
+      charge_type: isPrePaid ? "PrePaid" : "PostPaid",
+      creation_time: "2026-01-01T00:00Z",
+      expired_time: exp,
+      deletion_protection: false,
+      deleted: false,
+      auto_renew: {
+        auto_renew_enabled: false,
+        renewal_status: "Normal",
+        duration: 1,
+        period_unit: "Month",
+      },
+    };
+    mockInstanceMetas.set(key, meta);
+  }
+  return meta;
+}
+
+function getMockSgRules(sgId: string): SecurityGroupRule[] {
+  let rules = mockSgRules.get(sgId);
+  if (!rules) {
+    rules = [
+      {
+        rule_id: `sgr-${sgId}-ssh`,
+        direction: "ingress",
+        ip_protocol: "TCP",
+        port_range: "22/22",
+        source_cidr_ip: "0.0.0.0/0",
+        dest_cidr_ip: "",
+        policy: "Accept",
+        priority: 1,
+        description: "SSH",
+        create_time: "2026-01-01T00:00Z",
+      },
+      {
+        rule_id: `sgr-${sgId}-https`,
+        direction: "ingress",
+        ip_protocol: "TCP",
+        port_range: "443/443",
+        source_cidr_ip: "0.0.0.0/0",
+        dest_cidr_ip: "",
+        policy: "Accept",
+        priority: 1,
+        description: "HTTPS",
+        create_time: "2026-01-01T00:00Z",
+      },
+    ];
+    mockSgRules.set(sgId, rules);
+  }
+  return rules;
+}
+
+function makeClientToken(prefix: string): string {
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  return `${prefix}-${hex}`.slice(0, 64);
+}
+
+/** Query auto-renewal attribute of a subscription (PrePaid) ECS instance. */
+export async function getInstanceAutoRenewAttribute(
+  env: Env,
+  account: AliyunAccount,
+): Promise<AutoRenewInfo> {
+  if (isDryRun(env)) {
+    const meta = mockInstanceMeta(account);
+    if (meta.charge_type !== "PrePaid") {
+      throw new AliyunError("按量付费实例不支持自动续费配置");
+    }
+    return { ...meta.auto_renew };
+  }
+  let data: Record<string, unknown>;
+  try {
+    data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+      Action: "DescribeInstanceAutoRenewAttribute",
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      InstanceId: account.instance_id,
+    });
+  } catch (exc) {
+    throw new AliyunError(`查询自动续费属性失败：${briefError(exc)}`);
+  }
+  const list = asArray<unknown>(
+    asRecord(data["InstanceRenewAttributes"])["InstanceRenewAttribute"],
+  );
+  const first = asRecord(list[0]);
+  return {
+    auto_renew_enabled: Boolean(first["AutoRenewEnabled"]),
+    renewal_status: asStrVal(first["RenewalStatus"]).trim() || "Normal",
+    duration: asNumVal(first["Duration"]),
+    period_unit: asStrVal(first["PeriodUnit"]).trim() || "Month",
+  };
+}
+
+/**
+ * Query renewal price for a PrePaid ECS instance.
+ * Aliyun DescribeRenewalPrice accepts Month (1..9) or Year (1..3), so multiples
+ * of 12 months are automatically converted to Year units.
+ */
+export async function describeRenewalPrice(
+  env: Env,
+  account: AliyunAccount,
+  opts: { period: number; periodUnit: "Month" | "Year" },
+): Promise<PriceQuote> {
+  let priceUnit: "Month" | "Year" = opts.periodUnit;
+  let period = Math.trunc(opts.period);
+  if (priceUnit === "Month" && period >= 12 && period % 12 === 0) {
+    priceUnit = "Year";
+    period = period / 12;
+  }
+  if (isDryRun(env)) {
+    const meta = mockInstanceMeta(account);
+    if (meta.charge_type !== "PrePaid") {
+      throw new AliyunError("仅包年包月实例支持续费询价");
+    }
+    const months = priceUnit === "Year" ? period * 12 : period;
+    const orig = Number((months * 45).toFixed(2));
+    const disc = months >= 12 ? Number((orig * 0.15).toFixed(2)) : 0;
+    return {
+      original_price: orig,
+      discount_price: disc,
+      trade_price: Number((orig - disc).toFixed(2)),
+      currency: account.site === "international" ? "USD" : "CNY",
+      period,
+      price_unit: priceUnit,
+      rules: disc > 0 ? ["年付 8.5 折优惠"] : [],
+    };
+  }
+  let data: Record<string, unknown>;
+  try {
+    data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+      Action: "DescribeRenewalPrice",
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      ResourceType: "instance",
+      ResourceId: account.instance_id,
+      Period: String(period),
+      PriceUnit: priceUnit,
+    });
+  } catch (exc) {
+    throw new AliyunError(`查询续费价格失败：${briefError(exc)}`);
+  }
+  return parsePriceQuote(data, period, priceUnit);
+}
+
+function parsePriceQuote(
+  data: Record<string, unknown>,
+  period: number,
+  priceUnit: string,
+): PriceQuote {
+  const info = asRecord(data["PriceInfo"]);
+  const price = asRecord(info["Price"]);
+  const rulesRaw = asArray<unknown>(asRecord(info["Rules"])["Rule"]);
+  const rules = rulesRaw
+    .map((r) => asStrVal(asRecord(r)["Description"]).trim())
+    .filter(Boolean);
+  return {
+    original_price: asNumVal(price["OriginalPrice"]),
+    discount_price: asNumVal(price["DiscountPrice"]),
+    trade_price: asNumVal(price["TradePrice"]),
+    currency: asStrVal(price["Currency"]).trim() || "CNY",
+    period,
+    price_unit: priceUnit,
+    rules,
+  };
+}
+
+/**
+ * Manually renew a PrePaid ECS instance (charges the Aliyun account balance).
+ * RenewInstance uses PeriodUnit=Month (with 12/24/36/48/60 for years) or Week.
+ */
+export async function renewInstance(
+  env: Env,
+  account: AliyunAccount,
+  opts: { periodMonths: number; clientToken?: string },
+): Promise<{ order_id: string }> {
+  const months = Math.trunc(opts.periodMonths);
+  if (isDryRun(env)) {
+    const meta = mockInstanceMeta(account);
+    if (meta.charge_type !== "PrePaid") {
+      throw new AliyunError("仅包年包月实例支持续费");
+    }
+    const baseMs = meta.expired_time ? Date.parse(meta.expired_time) : Date.now();
+    const next = new Date((Number.isFinite(baseMs) ? baseMs : Date.now()) + months * 30 * 24 * 3600 * 1000);
+    meta.expired_time = next.toISOString().replace(/\.\d{3}Z$/, "Z");
+    return { order_id: `2026${Date.now().toString().slice(-10)}` };
+  }
+  const token = (opts.clientToken || makeClientToken("renew")).slice(0, 64);
+  let data: Record<string, unknown>;
+  try {
+    data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+      Action: "RenewInstance",
+      Version: ECS_VERSION,
+      InstanceId: account.instance_id,
+      Period: String(months),
+      PeriodUnit: "Month",
+      ClientToken: token,
+    });
+  } catch (exc) {
+    throw new AliyunError(`实例续费失败：${briefError(exc)}`);
+  }
+  return { order_id: asStrVal(data["OrderId"]).trim() };
+}
+
+/** Enable, disable, or update auto-renewal settings on a PrePaid ECS instance. */
+export async function modifyInstanceAutoRenewAttribute(
+  env: Env,
+  account: AliyunAccount,
+  opts: {
+    renewalStatus: "AutoRenewal" | "Normal" | "NotRenewal";
+    duration?: number;
+    periodUnit?: "Month" | "Year" | "Week";
+  },
+): Promise<void> {
+  if (isDryRun(env)) {
+    const meta = mockInstanceMeta(account);
+    if (meta.charge_type !== "PrePaid") {
+      throw new AliyunError("仅包年包月实例支持设置自动续费");
+    }
+    meta.auto_renew = {
+      auto_renew_enabled: opts.renewalStatus === "AutoRenewal",
+      renewal_status: opts.renewalStatus,
+      duration: opts.renewalStatus === "AutoRenewal" ? opts.duration ?? 1 : meta.auto_renew.duration,
+      period_unit:
+        opts.renewalStatus === "AutoRenewal"
+          ? opts.periodUnit ?? "Month"
+          : meta.auto_renew.period_unit,
+    };
+    return;
+  }
+  const params: Record<string, string> = {
+    Action: "ModifyInstanceAutoRenewAttribute",
+    Version: ECS_VERSION,
+    RegionId: account.region_id,
+    InstanceId: account.instance_id,
+    RenewalStatus: opts.renewalStatus,
+    AutoRenew: opts.renewalStatus === "AutoRenewal" ? "true" : "false",
+  };
+  if (opts.renewalStatus === "AutoRenewal") {
+    params["Duration"] = String(Math.trunc(opts.duration ?? 1));
+    params["PeriodUnit"] = opts.periodUnit ?? "Month";
+  }
+  try {
+    await rpcCall(ecsDomain(account.region_id), account, params);
+  } catch (exc) {
+    throw new AliyunError(`更新自动续费设置失败：${briefError(exc)}`);
+  }
+}
+
+/**
+ * Update ECS instance attributes (InstanceName, Password, Description, DeletionProtection).
+ * Password changes take effect only after an ECS-level RebootInstance.
+ * Never log or return `opts.password`.
+ */
+export async function modifyInstanceAttribute(
+  env: Env,
+  account: AliyunAccount,
+  opts: {
+    instanceName?: string;
+    password?: string;
+    description?: string;
+    deletionProtection?: boolean;
+  },
+): Promise<void> {
+  if (isDryRun(env)) {
+    const meta = mockInstanceMeta(account);
+    if (opts.instanceName !== undefined && opts.instanceName !== "") {
+      meta.instance_name = opts.instanceName;
+    }
+    if (opts.description !== undefined) {
+      meta.description = opts.description;
+    }
+    if (opts.deletionProtection !== undefined) {
+      meta.deletion_protection = opts.deletionProtection;
+    }
+    return;
+  }
+  const params: Record<string, string> = {
+    Action: "ModifyInstanceAttribute",
+    Version: ECS_VERSION,
+    InstanceId: account.instance_id,
+  };
+  if (opts.instanceName) params["InstanceName"] = opts.instanceName;
+  if (opts.password) params["Password"] = opts.password;
+  if (opts.description !== undefined) params["Description"] = opts.description;
+  if (opts.deletionProtection !== undefined) {
+    params["DeletionProtection"] = opts.deletionProtection ? "true" : "false";
+  }
+  try {
+    await rpcCall(ecsDomain(account.region_id), account, params);
+  } catch (exc) {
+    throw new AliyunError(`修改实例属性失败：${briefError(exc)}`);
+  }
+}
+
+/** Query rules inside a specific ECS security group. */
+export async function describeSecurityGroupAttribute(
+  env: Env,
+  account: AliyunAccount,
+  securityGroupId: string,
+): Promise<SecurityGroupDetail> {
+  if (isDryRun(env)) {
+    return {
+      security_group_id: securityGroupId,
+      security_group_name: `mock-${securityGroupId}`,
+      vpc_id: "vpc-mock001",
+      description: "Dry-run security group",
+      rules: [...getMockSgRules(securityGroupId)],
+    };
+  }
+  let data: Record<string, unknown>;
+  try {
+    data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+      Action: "DescribeSecurityGroupAttribute",
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      SecurityGroupId: securityGroupId,
+      Direction: "all",
+    });
+  } catch (exc) {
+    throw new AliyunError(`获取安全组规则失败：${briefError(exc)}`);
+  }
+  const rawList = asArray<unknown>(asRecord(data["Permissions"])["Permission"]);
+  const rules: SecurityGroupRule[] = rawList.map((item) => {
+    const r = asRecord(item);
+    const dir = asStrVal(r["Direction"]).trim().toLowerCase() === "egress" ? "egress" : "ingress";
+    return {
+      rule_id: asStrVal(r["SecurityGroupRuleId"]).trim(),
+      direction: dir,
+      ip_protocol: asStrVal(r["IpProtocol"]).trim().toUpperCase(),
+      port_range: asStrVal(r["PortRange"]).trim(),
+      source_cidr_ip:
+        asStrVal(r["SourceCidrIp"]).trim() ||
+        asStrVal(r["Ipv6SourceCidrIp"]).trim() ||
+        asStrVal(r["SourceGroupId"]).trim(),
+      dest_cidr_ip:
+        asStrVal(r["DestCidrIp"]).trim() ||
+        asStrVal(r["Ipv6DestCidrIp"]).trim() ||
+        asStrVal(r["DestGroupId"]).trim(),
+      policy: asStrVal(r["Policy"]).trim() || "Accept",
+      priority: asNumVal(r["Priority"]) || 1,
+      description: asStrVal(r["Description"]).trim(),
+      create_time: asStrVal(r["CreateTime"]).trim(),
+    };
+  });
+  return {
+    security_group_id: asStrVal(data["SecurityGroupId"]).trim() || securityGroupId,
+    security_group_name: asStrVal(data["SecurityGroupName"]).trim(),
+    vpc_id: asStrVal(data["VpcId"]).trim(),
+    description: asStrVal(data["Description"]).trim(),
+    rules,
+  };
+}
+
+/** Add an ingress or egress security group rule using the non-deprecated Permissions.1.* format. */
+export async function authorizeSecurityGroupRule(
+  env: Env,
+  account: AliyunAccount,
+  opts: {
+    securityGroupId: string;
+    direction: "ingress" | "egress";
+    ipProtocol: "TCP" | "UDP" | "ICMP" | "ALL";
+    portRange: string;
+    cidrIp: string;
+    policy: "accept" | "drop";
+    priority: number;
+    description?: string;
+  },
+): Promise<void> {
+  if (isDryRun(env)) {
+    const rules = getMockSgRules(opts.securityGroupId);
+    const id = `sgr-mock-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    rules.unshift({
+      rule_id: id,
+      direction: opts.direction,
+      ip_protocol: opts.ipProtocol,
+      port_range: opts.portRange,
+      source_cidr_ip: opts.direction === "ingress" ? opts.cidrIp : "",
+      dest_cidr_ip: opts.direction === "egress" ? opts.cidrIp : "",
+      policy: opts.policy === "drop" ? "Drop" : "Accept",
+      priority: opts.priority,
+      description: opts.description || "",
+      create_time: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+    });
+    return;
+  }
+  const isIpv6 = opts.cidrIp.includes(":");
+  const action =
+    opts.direction === "egress" ? "AuthorizeSecurityGroupEgress" : "AuthorizeSecurityGroup";
+  const params: Record<string, string> = {
+    Action: action,
+    Version: ECS_VERSION,
+    RegionId: account.region_id,
+    SecurityGroupId: opts.securityGroupId,
+    "Permissions.1.IpProtocol": opts.ipProtocol,
+    "Permissions.1.PortRange": opts.portRange,
+    "Permissions.1.Policy": opts.policy,
+    "Permissions.1.Priority": String(Math.min(100, Math.max(1, Math.trunc(opts.priority)))),
+  };
+  if (opts.direction === "egress") {
+    params[isIpv6 ? "Permissions.1.Ipv6DestCidrIp" : "Permissions.1.DestCidrIp"] = opts.cidrIp;
+  } else {
+    params[isIpv6 ? "Permissions.1.Ipv6SourceCidrIp" : "Permissions.1.SourceCidrIp"] = opts.cidrIp;
+  }
+  if (opts.description) params["Permissions.1.Description"] = opts.description;
+  try {
+    await rpcCall(ecsDomain(account.region_id), account, params);
+  } catch (exc) {
+    throw new AliyunError(`添加安全组规则失败：${briefError(exc)}`);
+  }
+}
+
+/** Delete an ingress or egress security group rule by SecurityGroupRuleId. */
+export async function revokeSecurityGroupRule(
+  env: Env,
+  account: AliyunAccount,
+  opts: {
+    securityGroupId: string;
+    direction: "ingress" | "egress";
+    ruleId: string;
+  },
+): Promise<void> {
+  if (isDryRun(env)) {
+    const rules = getMockSgRules(opts.securityGroupId);
+    const idx = rules.findIndex((r) => r.rule_id === opts.ruleId && r.direction === opts.direction);
+    if (idx < 0) throw new AliyunError("安全组规则不存在");
+    rules.splice(idx, 1);
+    return;
+  }
+  const action =
+    opts.direction === "egress" ? "RevokeSecurityGroupEgress" : "RevokeSecurityGroup";
+  try {
+    await rpcCall(ecsDomain(account.region_id), account, {
+      Action: action,
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      SecurityGroupId: opts.securityGroupId,
+      "SecurityGroupRuleId.1": opts.ruleId,
+    });
+  } catch (exc) {
+    throw new AliyunError(`删除安全组规则失败：${briefError(exc)}`);
+  }
+}
+
+/**
+ * Release (permanently destroy) a PostPaid or expired PrePaid ECS instance.
+ * Irreversible on Aliyun — callers must enforce explicit confirmation.
+ */
+export async function deleteInstance(
+  env: Env,
+  account: AliyunAccount,
+  opts: { force?: boolean; forceStop?: boolean; terminateSubscription?: boolean } = {},
+): Promise<void> {
+  if (isDryRun(env)) {
+    const meta = mockInstanceMeta(account);
+    if (meta.deletion_protection) {
+      throw new AliyunError("该实例已开启释放保护，请先关闭释放保护");
+    }
+    if (meta.charge_type === "PrePaid" && !opts.terminateSubscription) {
+      throw new AliyunError("包年包月未到期实例不能直接释放");
+    }
+    const state = mockState(env, account);
+    if (state.status === "Running" && !opts.force) {
+      throw new AliyunError("运行中的实例需先停机，或勾选强制释放");
+    }
+    meta.deleted = true;
+    state.status = "Deleted";
+    return;
+  }
+  const params: Record<string, string> = {
+    Action: "DeleteInstance",
+    Version: ECS_VERSION,
+    InstanceId: account.instance_id,
+    Force: opts.force ? "true" : "false",
+  };
+  if (opts.force) {
+    params["ForceStop"] = opts.forceStop === false ? "false" : "true";
+  }
+  if (opts.terminateSubscription) {
+    params["TerminateSubscription"] = "true";
+  }
+  try {
+    await rpcCall(ecsDomain(account.region_id), account, params);
+  } catch (exc) {
+    throw new AliyunError(`释放实例失败：${briefError(exc)}`);
+  }
+}
+
+const PREFERRED_FAMILIES = [
+  "ecs.e-",
+  "ecs.u1-",
+  "ecs.t6-",
+  "ecs.t5-",
+  "ecs.s6-",
+  "ecs.n4.",
+  "ecs.c7.",
+  "ecs.g7.",
+  "ecs.c8i.",
+  "ecs.g8i.",
+  "ecs.c6.",
+  "ecs.g6.",
+];
+
+function instanceTypePriority(typeId: string): number {
+  const idx = PREFERRED_FAMILIES.findIndex((prefix) => typeId.startsWith(prefix));
+  return idx >= 0 ? idx : PREFERRED_FAMILIES.length;
+}
+
+/**
+ * List available zones, purchasable instance types (enriched with CPU/memory),
+ * VSwitches, and SecurityGroups in the target region for instance provisioning.
+ */
+export async function listProvisionResources(
+  env: Env,
+  account: AliyunAccount,
+  opts: { chargeType: "PostPaid" | "PrePaid" },
+): Promise<ProvisionResources> {
+  if (isDryRun(env)) {
+    const r = account.region_id;
+    const vsws = mockVSwitches.get(r) ?? [
+      {
+        vswitch_id: `vsw-mock-${r.slice(0, 6)}`,
+        vswitch_name: "default-vswitch",
+        vpc_id: `vpc-mock-${r.slice(0, 6)}`,
+        zone_id: `${r}-a`,
+        cidr_block: "172.16.0.0/20",
+        available_ip_count: 4000,
+        is_default: true,
+      },
+    ];
+    const sgs = mockSecGroups.get(r) ?? [
+      {
+        security_group_id: `sg-mock-${r.slice(0, 6)}`,
+        security_group_name: "default-sg",
+        vpc_id: vsws[0]?.vpc_id || `vpc-mock-${r.slice(0, 6)}`,
+        security_group_type: "normal",
+        description: "Default security group",
+      },
+    ];
+    return {
+      region_id: r,
+      zones: [`${r}-a`, `${r}-b`],
+      instance_types: [
+        { instance_type: "ecs.e-c1m1.large", cpu: 2, memory_gb: 2, family: "ecs.e", zones: [`${r}-a`, `${r}-b`] },
+        { instance_type: "ecs.e-c1m2.large", cpu: 2, memory_gb: 4, family: "ecs.e", zones: [`${r}-a`, `${r}-b`] },
+        { instance_type: "ecs.u1-c1m2.large", cpu: 2, memory_gb: 4, family: "ecs.u1", zones: [`${r}-a`] },
+        { instance_type: "ecs.c7.large", cpu: 2, memory_gb: 4, family: "ecs.c7", zones: [`${r}-a`, `${r}-b`] },
+      ],
+      vswitches: vsws,
+      security_groups: sgs,
+    };
+  }
+
+  const [availRes, vswRes, sgRes] = await Promise.all([
+    rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+      Action: "DescribeAvailableResource",
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      DestinationResource: "InstanceType",
+      IoOptimized: "optimized",
+      NetworkCategory: "vpc",
+      InstanceChargeType: opts.chargeType,
+    }).catch((exc) => {
+      throw new AliyunError(`查询地域可用库存失败：${briefError(exc)}`);
+    }),
+    rpcCall<Record<string, unknown>>(vpcDomain(account.region_id), account, {
+      Action: "DescribeVSwitches",
+      Version: VPC_VERSION,
+      RegionId: account.region_id,
+      PageNumber: "1",
+      PageSize: "50",
+    }).catch(() => ({}) as Record<string, unknown>),
+    rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+      Action: "DescribeSecurityGroups",
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      PageNumber: "1",
+      PageSize: "50",
+    }).catch(() => ({}) as Record<string, unknown>),
+  ]);
+
+  const zones: string[] = [];
+  const typeZones = new Map<string, Set<string>>();
+  const availZones = asArray<unknown>(asRecord(availRes["AvailableZones"])["AvailableZone"]);
+  for (const zItem of availZones) {
+    const z = asRecord(zItem);
+    const zoneId = asStrVal(z["ZoneId"]).trim();
+    if (!zoneId || asStrVal(z["Status"]).trim() !== "Available") continue;
+    if (!zones.includes(zoneId)) zones.push(zoneId);
+    const resList = asArray<unknown>(asRecord(z["AvailableResources"])["AvailableResource"]);
+    for (const rItem of resList) {
+      const r = asRecord(rItem);
+      if (asStrVal(r["Type"]).trim() !== "InstanceType") continue;
+      const supported = asArray<unknown>(asRecord(r["SupportedResources"])["SupportedResource"]);
+      for (const sItem of supported) {
+        const s = asRecord(sItem);
+        if (asStrVal(s["Status"]).trim() !== "Available") continue;
+        const val = asStrVal(s["Value"]).trim();
+        if (!val) continue;
+        let set = typeZones.get(val);
+        if (!set) {
+          set = new Set<string>();
+          typeZones.set(val, set);
+        }
+        set.add(zoneId);
+      }
+    }
+  }
+
+  const sortedTypeIds = Array.from(typeZones.keys()).sort((a, b) => {
+    const pa = instanceTypePriority(a);
+    const pb = instanceTypePriority(b);
+    return pa !== pb ? pa - pb : a.localeCompare(b);
+  });
+
+  // Enrich the top 40 prioritized types (4 batches of 10) with exact CPU/RAM specs.
+  const specMap = new Map<string, { cpu: number; memory_gb: number; family: string }>();
+  const toEnrich = sortedTypeIds.slice(0, 40);
+  const chunks: string[][] = [];
+  for (let i = 0; i < toEnrich.length; i += 10) {
+    chunks.push(toEnrich.slice(i, i + 10));
+  }
+  await Promise.allSettled(
+    chunks.map(async (chunk) => {
+      const params: Record<string, string> = {
+        Action: "DescribeInstanceTypes",
+        Version: ECS_VERSION,
+      };
+      chunk.forEach((id, idx) => {
+        params[`InstanceTypes.${idx + 1}`] = id;
+      });
+      const res = await rpcCall<Record<string, unknown>>(
+        ecsDomain(account.region_id),
+        account,
+        params,
+      );
+      const list = asArray<unknown>(asRecord(res["InstanceTypes"])["InstanceType"]);
+      for (const item of list) {
+        const t = asRecord(item);
+        const id = asStrVal(t["InstanceTypeId"]).trim();
+        if (!id) continue;
+        specMap.set(id, {
+          cpu: asNumVal(t["CpuCoreCount"]),
+          memory_gb: asNumVal(t["MemorySize"]),
+          family: asStrVal(t["InstanceTypeFamily"]).trim(),
+        });
+      }
+    }),
+  );
+
+  const instanceTypes: InstanceTypeOffer[] = sortedTypeIds.slice(0, 120).map((id) => {
+    const spec = specMap.get(id);
+    return {
+      instance_type: id,
+      cpu: spec?.cpu ?? 0,
+      memory_gb: spec?.memory_gb ?? 0,
+      family: spec?.family ?? id.split(".").slice(0, 2).join("."),
+      zones: Array.from(typeZones.get(id) ?? []),
+    };
+  });
+  instanceTypes.sort((a, b) => {
+    const pa = instanceTypePriority(a.instance_type);
+    const pb = instanceTypePriority(b.instance_type);
+    if (pa !== pb) return pa - pb;
+    if (a.cpu > 0 && b.cpu > 0 && a.cpu !== b.cpu) return a.cpu - b.cpu;
+    if (a.memory_gb > 0 && b.memory_gb > 0 && a.memory_gb !== b.memory_gb) {
+      return a.memory_gb - b.memory_gb;
+    }
+    return a.instance_type.localeCompare(b.instance_type);
+  });
+
+  const vswitches: VSwitchInfo[] = asArray<unknown>(asRecord(vswRes["VSwitches"])["VSwitch"])
+    .map((item) => {
+      const v = asRecord(item);
+      return {
+        vswitch_id: asStrVal(v["VSwitchId"]).trim(),
+        vswitch_name: asStrVal(v["VSwitchName"]).trim(),
+        vpc_id: asStrVal(v["VpcId"]).trim(),
+        zone_id: asStrVal(v["ZoneId"]).trim(),
+        cidr_block: asStrVal(v["CidrBlock"]).trim(),
+        available_ip_count: asNumVal(v["AvailableIpAddressCount"]),
+        is_default: Boolean(v["IsDefault"]),
+      };
+    })
+    .filter((v) => v.vswitch_id);
+
+  const securityGroups: SecurityGroupSummary[] = asArray<unknown>(
+    asRecord(sgRes["SecurityGroups"])["SecurityGroup"],
+  )
+    .map((item) => {
+      const sg = asRecord(item);
+      return {
+        security_group_id: asStrVal(sg["SecurityGroupId"]).trim(),
+        security_group_name: asStrVal(sg["SecurityGroupName"]).trim(),
+        vpc_id: asStrVal(sg["VpcId"]).trim(),
+        security_group_type: asStrVal(sg["SecurityGroupType"]).trim() || "normal",
+        description: asStrVal(sg["Description"]).trim(),
+      };
+    })
+    .filter((sg) => sg.security_group_id && sg.vpc_id);
+
+  return {
+    region_id: account.region_id,
+    zones,
+    instance_types: instanceTypes,
+    vswitches,
+    security_groups: securityGroups,
+  };
+}
+
+/**
+ * Ensure a default VPC, default VSwitch in `zoneId`, and a basic SecurityGroup
+ * (with SSH port 22 open) exist in the target region so new regions can launch
+ * instances without leaving the panel.
+ */
+export async function ensureDefaultNetwork(
+  env: Env,
+  account: AliyunAccount,
+  zoneId: string,
+): Promise<{ vswitch_id: string; security_group_id: string; vpc_id: string }> {
+  if (isDryRun(env)) {
+    const r = account.region_id;
+    const vpcId = `vpc-mock-def-${r.slice(0, 6)}`;
+    const vswId = `vsw-mock-def-${zoneId.slice(-1)}`;
+    const sgId = `sg-mock-def-${r.slice(0, 6)}`;
+    mockVSwitches.set(r, [
+      {
+        vswitch_id: vswId,
+        vswitch_name: "cdt-default-vsw",
+        vpc_id: vpcId,
+        zone_id: zoneId,
+        cidr_block: "172.16.0.0/20",
+        available_ip_count: 4000,
+        is_default: true,
+      },
+    ]);
+    mockSecGroups.set(r, [
+      {
+        security_group_id: sgId,
+        security_group_name: "cdt-default-sg",
+        vpc_id: vpcId,
+        security_group_type: "normal",
+        description: "Auto-created by CDT-Management",
+      },
+    ]);
+    return { vswitch_id: vswId, security_group_id: sgId, vpc_id: vpcId };
+  }
+
+  let vpcId = "";
+  let vswitchId = "";
+
+  // 1. Check existing VSwitches in target zone first.
+  try {
+    const vswList = await rpcCall<Record<string, unknown>>(vpcDomain(account.region_id), account, {
+      Action: "DescribeVSwitches",
+      Version: VPC_VERSION,
+      RegionId: account.region_id,
+      ZoneId: zoneId,
+      PageSize: "20",
+    });
+    const first = asArray<unknown>(asRecord(vswList["VSwitches"])["VSwitch"])[0];
+    if (first) {
+      const rec = asRecord(first);
+      vswitchId = asStrVal(rec["VSwitchId"]).trim();
+      vpcId = asStrVal(rec["VpcId"]).trim();
+    }
+  } catch {
+    // Continue and attempt default VPC/VSwitch creation.
+  }
+
+  // 2. Create default VPC + default VSwitch if missing.
+  if (!vswitchId) {
+    try {
+      const vpcRes = await rpcCall<Record<string, unknown>>(
+        vpcDomain(account.region_id),
+        account,
+        {
+          Action: "CreateDefaultVpc",
+          Version: VPC_VERSION,
+          RegionId: account.region_id,
+          ClientToken: makeClientToken("defvpc"),
+        },
+      );
+      vpcId = asStrVal(vpcRes["VpcId"]).trim();
+    } catch {
+      // Default VPC may already exist; look it up.
+      try {
+        const vpcs = await rpcCall<Record<string, unknown>>(
+          vpcDomain(account.region_id),
+          account,
+          {
+            Action: "DescribeVpcs",
+            Version: VPC_VERSION,
+            RegionId: account.region_id,
+            IsDefault: "true",
+            PageSize: "5",
+          },
+        );
+        const firstVpc = asArray<unknown>(asRecord(vpcs["Vpcs"])["Vpc"])[0];
+        if (firstVpc) vpcId = asStrVal(asRecord(firstVpc)["VpcId"]).trim();
+      } catch {
+        // Let CreateDefaultVSwitch report any remaining error.
+      }
+    }
+
+    try {
+      const vswCreate = await rpcCall<Record<string, unknown>>(
+        vpcDomain(account.region_id),
+        account,
+        {
+          Action: "CreateDefaultVSwitch",
+          Version: VPC_VERSION,
+          RegionId: account.region_id,
+          ZoneId: zoneId,
+          ClientToken: makeClientToken("defvsw"),
+        },
+      );
+      vswitchId = asStrVal(vswCreate["VSwitchId"]).trim();
+    } catch (exc) {
+      throw new AliyunError(`初始化默认交换机失败：${briefError(exc)}`);
+    }
+
+    if (!vpcId && vswitchId) {
+      const vswLookup = await rpcCall<Record<string, unknown>>(
+        vpcDomain(account.region_id),
+        account,
+        {
+          Action: "DescribeVSwitches",
+          Version: VPC_VERSION,
+          RegionId: account.region_id,
+          VSwitchId: vswitchId,
+        },
+      ).catch(() => ({}) as Record<string, unknown>);
+      const first = asArray<unknown>(asRecord(vswLookup["VSwitches"])["VSwitch"])[0];
+      if (first) vpcId = asStrVal(asRecord(first)["VpcId"]).trim();
+    }
+  }
+
+  // 3. Find or create a SecurityGroup inside the VPC.
+  let securityGroupId = "";
+  if (vpcId) {
+    const sgList = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+      Action: "DescribeSecurityGroups",
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      VpcId: vpcId,
+      PageSize: "20",
+    }).catch(() => ({}) as Record<string, unknown>);
+    const firstSg = asArray<unknown>(asRecord(sgList["SecurityGroups"])["SecurityGroup"])[0];
+    if (firstSg) {
+      securityGroupId = asStrVal(asRecord(firstSg)["SecurityGroupId"]).trim();
+    }
+  }
+  if (!securityGroupId) {
+    try {
+      const createdSg = await rpcCall<Record<string, unknown>>(
+        ecsDomain(account.region_id),
+        account,
+        {
+          Action: "CreateSecurityGroup",
+          Version: ECS_VERSION,
+          RegionId: account.region_id,
+          VpcId: vpcId,
+          SecurityGroupName: "cdt-default-sg",
+          Description: "Auto-created by CDT-Management",
+          SecurityGroupType: "normal",
+          ClientToken: makeClientToken("defsg"),
+        },
+      );
+      securityGroupId = asStrVal(createdSg["SecurityGroupId"]).trim();
+      if (securityGroupId) {
+        // Open SSH 22/22 by default so newly created Linux instances are reachable.
+        await authorizeSecurityGroupRule(env, account, {
+          securityGroupId,
+          direction: "ingress",
+          ipProtocol: "TCP",
+          portRange: "22/22",
+          cidrIp: "0.0.0.0/0",
+          policy: "accept",
+          priority: 1,
+          description: "SSH default",
+        }).catch(() => {});
+      }
+    } catch (exc) {
+      throw new AliyunError(`初始化默认安全组失败：${briefError(exc)}`);
+    }
+  }
+
+  return { vswitch_id: vswitchId, security_group_id: securityGroupId, vpc_id: vpcId };
+}
+
+/** Query real-time price for creating a new ECS instance before placing an order. */
+export async function describeInstancePrice(
+  env: Env,
+  account: AliyunAccount,
+  opts: {
+    instanceType: string;
+    imageId?: string;
+    chargeType: "PostPaid" | "PrePaid";
+    periodMonths?: number;
+    systemDiskCategory: string;
+    systemDiskSize: number;
+    internetChargeType: "PayByTraffic" | "PayByBandwidth";
+    internetMaxBandwidthOut: number;
+  },
+): Promise<PriceQuote> {
+  let priceUnit: "Hour" | "Month" | "Year" = "Hour";
+  let period = 1;
+  if (opts.chargeType === "PrePaid") {
+    const months = Math.max(1, Math.trunc(opts.periodMonths ?? 1));
+    if (months >= 12 && months % 12 === 0) {
+      priceUnit = "Year";
+      period = months / 12;
+    } else {
+      priceUnit = "Month";
+      period = months;
+    }
+  }
+
+  if (isDryRun(env)) {
+    const baseHour = opts.instanceType.includes("c7") ? 0.42 : 0.14;
+    const diskHour = opts.systemDiskSize * 0.0006;
+    const bwHour =
+      opts.internetChargeType === "PayByBandwidth" ? opts.internetMaxBandwidthOut * 0.06 : 0;
+    const unitPrice =
+      priceUnit === "Hour"
+        ? baseHour + diskHour + bwHour
+        : (baseHour + diskHour + bwHour) * 24 * 30 * (priceUnit === "Year" ? period * 12 : period);
+    const orig = Number(unitPrice.toFixed(3));
+    const disc = priceUnit === "Year" ? Number((orig * 0.15).toFixed(3)) : 0;
+    return {
+      original_price: orig,
+      discount_price: disc,
+      trade_price: Number((orig - disc).toFixed(3)),
+      currency: account.site === "international" ? "USD" : "CNY",
+      period,
+      price_unit: priceUnit,
+      rules: disc > 0 ? ["包年 8.5 折优惠"] : [],
+    };
+  }
+
+  const params: Record<string, string> = {
+    Action: "DescribePrice",
+    Version: ECS_VERSION,
+    RegionId: account.region_id,
+    ResourceType: "instance",
+    InstanceType: opts.instanceType,
+    IoOptimized: "optimized",
+    InstanceNetworkType: "vpc",
+    "SystemDisk.Category": opts.systemDiskCategory,
+    "SystemDisk.Size": String(Math.trunc(opts.systemDiskSize)),
+    InternetChargeType: opts.internetChargeType,
+    InternetMaxBandwidthOut: String(Math.trunc(opts.internetMaxBandwidthOut)),
+    PriceUnit: priceUnit,
+    Period: String(period),
+    Amount: "1",
+  };
+  if (opts.imageId) params["ImageId"] = opts.imageId;
+  let data: Record<string, unknown>;
+  try {
+    data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, params);
+  } catch (exc) {
+    throw new AliyunError(`实例询价失败：${briefError(exc)}`);
+  }
+  return parsePriceQuote(data, period, priceUnit);
+}
+
+/**
+ * Provision (create and start) a new ECS instance via RunInstances.
+ * Charges the Aliyun account immediately — callers must enforce price preview
+ * and explicit user confirmation. Never logs `opts.password`.
+ */
+export async function runInstances(
+  env: Env,
+  account: AliyunAccount,
+  opts: {
+    zoneId?: string;
+    imageId: string;
+    instanceType: string;
+    securityGroupId: string;
+    vswitchId: string;
+    instanceName?: string;
+    chargeType: "PostPaid" | "PrePaid";
+    periodMonths?: number;
+    autoRenew?: boolean;
+    systemDiskCategory: string;
+    systemDiskSize: number;
+    internetChargeType: "PayByTraffic" | "PayByBandwidth";
+    internetMaxBandwidthOut: number;
+    password?: string;
+    keyPairName?: string;
+    passwordInherit?: boolean;
+    clientToken?: string;
+  },
+): Promise<RunInstanceResult> {
+  if (isDryRun(env)) {
+    const id = `i-mock-${opts.chargeType === "PrePaid" ? "prepaid-" : ""}${Date.now().toString(36).slice(-6)}`;
+    const mockAcct: AliyunAccount = { ...account, instance_id: id };
+    const st = mockState(env, mockAcct);
+    st.status = "Running";
+    st.stopped_mode = "";
+    const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+    const months = Math.max(1, Math.trunc(opts.periodMonths ?? 1));
+    const expIso =
+      opts.chargeType === "PrePaid"
+        ? new Date(Date.now() + months * 30 * 24 * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, "Z")
+        : "";
+    mockInstanceMetas.set(id, {
+      instance_name: opts.instanceName || id,
+      description: "Provisioned via CDT-Management",
+      instance_type: opts.instanceType,
+      os_name: opts.imageId,
+      image_id: opts.imageId,
+      zone_id: opts.zoneId || `${account.region_id}-a`,
+      vpc_id: "vpc-mock001",
+      vswitch_id: opts.vswitchId,
+      security_group_id: opts.securityGroupId,
+      internet_charge_type: opts.internetChargeType,
+      bandwidth_out: opts.internetMaxBandwidthOut,
+      cpu: 2,
+      memory: 2048,
+      charge_type: opts.chargeType,
+      creation_time: nowIso,
+      expired_time: expIso,
+      deletion_protection: false,
+      deleted: false,
+      auto_renew: {
+        auto_renew_enabled: Boolean(opts.autoRenew),
+        renewal_status: opts.autoRenew ? "AutoRenewal" : "Normal",
+        duration: 1,
+        period_unit: "Month",
+      },
+    });
+    return {
+      instance_ids: [id],
+      order_id: `2026${Date.now().toString().slice(-10)}`,
+      trade_price: opts.chargeType === "PrePaid" ? 45 * months : 0.16,
+    };
+  }
+
+  const params: Record<string, string> = {
+    Action: "RunInstances",
+    Version: ECS_VERSION,
+    RegionId: account.region_id,
+    ImageId: opts.imageId,
+    InstanceType: opts.instanceType,
+    SecurityGroupId: opts.securityGroupId,
+    VSwitchId: opts.vswitchId,
+    InstanceChargeType: opts.chargeType,
+    InternetChargeType: opts.internetChargeType,
+    InternetMaxBandwidthOut: String(Math.trunc(opts.internetMaxBandwidthOut)),
+    "SystemDisk.Category": opts.systemDiskCategory,
+    "SystemDisk.Size": String(Math.trunc(opts.systemDiskSize)),
+    Amount: "1",
+    ClientToken: (opts.clientToken || makeClientToken("run")).slice(0, 64),
+  };
+  if (opts.zoneId) params["ZoneId"] = opts.zoneId;
+  if (opts.instanceName) params["InstanceName"] = opts.instanceName;
+  if (opts.chargeType === "PrePaid") {
+    params["PeriodUnit"] = "Month";
+    params["Period"] = String(Math.max(1, Math.trunc(opts.periodMonths ?? 1)));
+    if (opts.autoRenew) {
+      params["AutoRenew"] = "true";
+      params["AutoRenewPeriod"] = "1";
+    }
+  }
+  if (opts.password) {
+    params["Password"] = opts.password;
+  } else if (opts.keyPairName) {
+    params["KeyPairName"] = opts.keyPairName;
+  } else if (opts.passwordInherit) {
+    params["PasswordInherit"] = "true";
+  }
+
+  let data: Record<string, unknown>;
+  try {
+    data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, params);
+  } catch (exc) {
+    throw new AliyunError(`开通实例失败：${briefError(exc)}`);
+  }
+  const ids = asArray<unknown>(asRecord(data["InstanceIdSets"])["InstanceIdSet"])
+    .map((v) => asStrVal(v).trim())
+    .filter(Boolean);
+  const priceRaw = data["TradePrice"];
+  const tradePrice =
+    priceRaw !== undefined && priceRaw !== null && Number.isFinite(Number(priceRaw))
+      ? Number(priceRaw)
+      : null;
+  return {
+    instance_ids: ids,
+    order_id: asStrVal(data["OrderId"]).trim(),
+    trade_price: tradePrice,
+  };
 }
 
 // ---------------------------------------------------------------------------

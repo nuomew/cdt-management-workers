@@ -28,6 +28,8 @@ import {
   ServerReinstallModal,
   ServerVncOverlay,
 } from './components/ServerManageModals'
+import { ServerOpsModal, ServerRenewModal } from './components/ServerOpsModals'
+import { ServerProvisionModal } from './components/ServerProvisionModal'
 import GroupDialog from './components/GroupDialog'
 import SettingsDrawer from './components/SettingsDrawer'
 import ConfirmDialog from './components/ConfirmDialog'
@@ -126,6 +128,9 @@ export default function App() {
   const [vncServer, setVncServer] = useState<Server | null>(null)
   const [reinstallServer, setReinstallServer] = useState<Server | null>(null)
   const [imagesServer, setImagesServer] = useState<Server | null>(null)
+  const [renewServer, setRenewServer] = useState<Server | null>(null)
+  const [opsServer, setOpsServer] = useState<Server | null>(null)
+  const [provisionOpen, setProvisionOpen] = useState(false)
   const [groupDialog, setGroupDialog] = useState<{ open: boolean; group: ShiftGroup | null }>({
     open: false,
     group: null,
@@ -767,6 +772,7 @@ export default function App() {
             busyId={busyServer}
             billingId={billingServer}
             onAdd={() => setServerDialog({ open: true, server: null })}
+            onProvision={() => setProvisionOpen(true)}
             onEdit={(server) => setServerDialog({ open: true, server })}
             onDelete={deleteServer}
             onRefresh={(server) => refreshServer(server.id)}
@@ -776,6 +782,8 @@ export default function App() {
             onVnc={setVncServer}
             onReinstall={setReinstallServer}
             onImages={setImagesServer}
+            onRenew={setRenewServer}
+            onOps={setOpsServer}
             onBilling={serverBilling}
             onReorder={reorderServers}
             onAddToKeepalive={(server) => {
@@ -855,6 +863,8 @@ export default function App() {
           onOpenVnc={(srv) => setVncServer(srv)}
           onOpenReinstall={(srv) => setReinstallServer(srv)}
           onOpenImages={(srv) => setImagesServer(srv)}
+          onOpenRenew={(srv) => setRenewServer(srv)}
+          onOpenOps={(srv) => setOpsServer(srv)}
         />
       )}
 
@@ -864,6 +874,37 @@ export default function App() {
           servers={overview.servers}
           onClose={() => setImagesServer(null)}
           onToast={toast}
+        />
+      )}
+
+      {renewServer && (
+        <ServerRenewModal
+          server={renewServer}
+          onClose={() => setRenewServer(null)}
+          onToast={toast}
+          onUpdated={() => void loadAll()}
+        />
+      )}
+
+      {opsServer && (
+        <ServerOpsModal
+          server={opsServer}
+          onClose={() => setOpsServer(null)}
+          onToast={toast}
+          onUpdated={() => void loadAll()}
+        />
+      )}
+
+      {provisionOpen && (
+        <ServerProvisionModal
+          servers={overview.servers}
+          defaultThresholdPercent={Number(settings.traffic_threshold_pct) || 90}
+          onClose={() => setProvisionOpen(false)}
+          onToast={toast}
+          onProvisioned={(message) => {
+            setProvisionOpen(false)
+            void refreshAfterSave(message)
+          }}
         />
       )}
 

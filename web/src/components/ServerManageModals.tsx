@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  CalendarClock,
   Check,
   CheckCircle2,
   Copy,
@@ -16,6 +17,7 @@ import {
   RotateCcw,
   Search,
   Share2,
+  SlidersHorizontal,
   Trash2,
   TriangleAlert,
   UserMinus,
@@ -97,12 +99,16 @@ export function ServerDetailModal({
   onOpenVnc,
   onOpenReinstall,
   onOpenImages,
+  onOpenRenew,
+  onOpenOps,
 }: {
   server: Server
   onClose: () => void
   onOpenVnc: (server: Server) => void
   onOpenReinstall: (server: Server) => void
   onOpenImages?: (server: Server) => void
+  onOpenRenew?: (server: Server) => void
+  onOpenOps?: (server: Server) => void
 }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -147,6 +153,30 @@ export function ServerDetailModal({
             {loading ? <LoaderCircle size={13} className="spin" /> : <RefreshCw size={13} />} 刷新
           </button>
           <span className="spacer" />
+          {onOpenRenew && (
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() => {
+                onClose()
+                onOpenRenew(server)
+              }}
+            >
+              <CalendarClock size={13} /> 续费
+            </button>
+          )}
+          {onOpenOps && (
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() => {
+                onClose()
+                onOpenOps(server)
+              }}
+            >
+              <SlidersHorizontal size={13} /> 运维
+            </button>
+          )}
           {onOpenImages && (
             <button
               type="button"
@@ -156,7 +186,7 @@ export function ServerDetailModal({
                 onOpenImages(server)
               }}
             >
-              <Layers size={13} /> 镜像管理
+              <Layers size={13} /> 镜像
             </button>
           )}
           <button
@@ -167,7 +197,7 @@ export function ServerDetailModal({
               onOpenVnc(server)
             }}
           >
-            <Monitor size={13} /> VNC 终端
+            <Monitor size={13} /> VNC
           </button>
           <button
             type="button"
@@ -177,7 +207,7 @@ export function ServerDetailModal({
               onOpenReinstall(server)
             }}
           >
-            <Disc3 size={13} /> 重装系统
+            <Disc3 size={13} /> 重装
           </button>
           <button type="button" className="btn primary sm" onClick={onClose}>
             关闭
