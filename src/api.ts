@@ -1221,6 +1221,13 @@ app.post("/api/v1/servers/:serverId/vnc", async (c) => {
   });
 });
 
+app.get("/api/v1/servers/:serverId/account-id", async (c) => {
+  await requireAdmin(c);
+  const { account } = await loadServerAccount(c.env, paramInt(c, "serverId"));
+  const accountId = await aliyun.getCallerAccountId(c.env, account);
+  return c.json({ account_id: accountId });
+});
+
 app.get("/api/v1/servers/:serverId/images", async (c) => {
   await requireAdmin(c);
   const { account } = await loadServerAccount(c.env, paramInt(c, "serverId"));
@@ -1229,8 +1236,229 @@ app.get("/api/v1/servers/:serverId/images", async (c) => {
   const ownerAlias = allowedOwners.has(ownerRaw) ? ownerRaw : "system";
   const osRaw = (c.req.query("ostype") ?? "").trim().toLowerCase();
   const osType = osRaw === "linux" || osRaw === "windows" ? osRaw : "";
-  const items = await aliyun.listImages(c.env, account, { ownerAlias, osType });
+  const includeAllStatus = c.req.query("all_status") === "1";
+  const items = await aliyun.listImages(c.env, account, {
+    ownerAlias,
+    osType,
+    includeAllStatus,
+  });
   return c.json({ items });
+});
+
+app.post("/api/v1/servers/:serverId/images", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const { server, account } = await loadServerAccount(c.env, serverId);
+  const payload = await jsonBody(c);
+  const imageName = strOf(payload["image_name"]).trim();
+  const description = strOf(payload["description"]).trim();
+  if (imageName.length < 2 || imageName.length > 128) {
+    throw invalid("镜像名称长度需为 2–128 个字符");
+  }
+  if (/^https?:\/\//i.test(imageName)) {
+    throw invalid("镜像名称不能以 http:// 或 https:// 开头");
+  }
+  if (!/^[A-Za-z\u4e00-\u9fa5][A-Za-z0-9\u4e00-\u9fa5:_-]*$/.test(imageName)) {
+    throw invalid("镜像名称须以字母或中文开头，只能包含中英文、数字、冒号(:)、下划线(_)或短划线(-)");
+  }
+  if (description.length > 256 || /^https?:\/\//i.test(description)) {
+    throw invalid("镜像描述长度不能超过 256 个字符，且不能以 http:// 或 https:// 开头");
+  }
+  const res = await aliyun.createImage(c.env, account, {
+    imageName,
+    description: description || undefined,
+  });
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("创建自定义镜像", messages.objServer(server.label)),
+    {
+      detail: `镜像 ${imageName}（${res.image_id}）创建中`,
+      level: "info",
+      serverId,
+    },
+  );
+  return c.json({ image_id: res.image_id });
+});
+
+app.delete("/api/v1/servers/:serverId/images/:imageId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const { server, account } = await loadServerAccount(c.env, serverId);
+  const imageId = c.req.param("imageId").trim();
+  if (!imageId) throw invalid("缺少镜像 ID");
+  const force = c.req.query("force") === "1";
+  await aliyun.deleteImage(c.env, account, imageId, force);
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("删除自定义镜像", messages.objServer(server.label)),
+    {
+      detail: `已${force ? "强制" : ""}删除镜像 ${imageId}`,
+      level: "warn",
+      serverId,
+    },
+  );
+  return c.json({ ok: true });
+});
+
+interface MatchedServerTag {
+  id: number;
+  label: string;
+  region_id: string;
+}
+
+async function resolveUidServerMap(
+  env: Env,
+): Promise<Map<string, MatchedServerTag[]>> {
+  const servers = await repo.listServers(env, true);
+  const uidMap = new Map<string, MatchedServerTag[]>();
+  const uniqueAks = new Map<string, ServerView>();
+  for (const s of servers) {
+    const ak = strOf(s.access_key_id).trim();
+    const sk = strOf(s.access_key_secret).trim();
+    if (ak && sk && !uniqueAks.has(ak)) uniqueAks.set(ak, s);
+  }
+  const akToUid = new Map<string, string>();
+  await Promise.allSettled(
+    Array.from(uniqueAks.entries()).map(async ([ak, s]) => {
+      const uid = await aliyun.getCallerAccountId(env, {
+        access_key_id: ak,
+        access_key_secret: strOf(s.access_key_secret).trim(),
+        region_id: strOf(s.region_id).trim() || "cn-hongkong",
+        site: repo.normalizeSite(s.site),
+      });
+      akToUid.set(ak, uid);
+    }),
+  );
+  for (const s of servers) {
+    const uid = akToUid.get(strOf(s.access_key_id).trim());
+    if (!uid) continue;
+    const list = uidMap.get(uid) ?? [];
+    list.push({
+      id: numOf(s.id),
+      label: s.label || s.instance_id || `#${s.id}`,
+      region_id: strOf(s.region_id).trim(),
+    });
+    uidMap.set(uid, list);
+  }
+  return uidMap;
+}
+
+async function enrichShares(
+  env: Env,
+  account: aliyun.AliyunAccount,
+  imageId: string,
+) {
+  const [rawShares, uidMap] = await Promise.all([
+    aliyun.getImageSharePermissions(env, account, imageId),
+    resolveUidServerMap(env).catch(() => new Map<string, MatchedServerTag[]>()),
+  ]);
+  return rawShares.map((item) => ({
+    ...item,
+    matched_servers: uidMap.get(item.aliyun_id) ?? [],
+  }));
+}
+
+app.get("/api/v1/servers/:serverId/images/:imageId/shares", async (c) => {
+  await requireAdmin(c);
+  const { account } = await loadServerAccount(c.env, paramInt(c, "serverId"));
+  const imageId = c.req.param("imageId").trim();
+  if (!imageId) throw invalid("缺少镜像 ID");
+  const items = await enrichShares(c.env, account, imageId);
+  return c.json({ items });
+});
+
+app.post("/api/v1/servers/:serverId/images/:imageId/shares", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const { server, account } = await loadServerAccount(c.env, serverId);
+  const imageId = c.req.param("imageId").trim();
+  if (!imageId) throw invalid("缺少镜像 ID");
+
+  const payload = await jsonBody(c);
+  const action = strOf(payload["action"]).trim().toLowerCase();
+  if (action !== "add" && action !== "remove") {
+    throw invalid("action 必须为 add 或 remove");
+  }
+
+  const targetServerId = numOf(payload["target_server_id"], 0);
+  const rawAccounts = Array.isArray(payload["accounts"]) ? payload["accounts"] : [];
+  const accountSet = new Set<string>();
+  let targetLabel = "";
+  let crossRegionWarning = "";
+
+  if (targetServerId > 0) {
+    if (targetServerId === serverId) {
+      throw invalid("不能选择当前服务器自身作为共享目标");
+    }
+    const target = await loadServerAccount(c.env, targetServerId);
+    targetLabel = target.server.label || target.account.instance_id;
+    const [sourceUid, targetUid] = await Promise.all([
+      aliyun.getCallerAccountId(c.env, account).catch(() => ""),
+      aliyun.getCallerAccountId(c.env, target.account),
+    ]);
+    if (action === "add" && sourceUid && sourceUid === targetUid) {
+      throw invalid(
+        `「${targetLabel}」与当前服务器属于同一个阿里云主账号（UID ${targetUid}），同账号同地域下自定义镜像天然互通，无需共享`,
+      );
+    }
+    if (action === "add" && target.account.region_id !== account.region_id) {
+      crossRegionWarning = `已共享给「${targetLabel}」所在账号（UID ${targetUid}），但阿里云共享镜像仅在源地域（${account.region_id}）生效，与目标服务器地域（${target.account.region_id}）不同。`;
+    }
+    accountSet.add(targetUid);
+  }
+
+  for (const item of rawAccounts) {
+    const uid = strOf(item).trim();
+    if (!uid) continue;
+    if (!/^\d{6,32}$/.test(uid)) {
+      throw invalid(`无效的阿里云账号 UID「${uid}」（应为纯数字主账号 UID，可在阿里云账号中心查看）`);
+    }
+    accountSet.add(uid);
+  }
+
+  const uids = Array.from(accountSet);
+  if (uids.length === 0) {
+    throw invalid("请选择目标服务器或输入至少一个阿里云账号 UID");
+  }
+  if (uids.length > 10) {
+    throw invalid("阿里云单次最多支持添加或取消 10 个共享账号，请分批操作");
+  }
+
+  await aliyun.modifyImageSharePermission(
+    c.env,
+    account,
+    imageId,
+    action === "add" ? { addAccounts: uids } : { removeAccounts: uids },
+  );
+
+  const labelSuffix = targetLabel ? `（${targetLabel}）` : "";
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev(
+      action === "add" ? "添加镜像共享" : "取消镜像共享",
+      messages.objServer(server.label),
+    ),
+    {
+      detail: `镜像 ${imageId} ${action === "add" ? "共享给" : "取消共享"} ${uids.join("、")}${labelSuffix}`,
+      level: "info",
+      serverId,
+    },
+  );
+
+  const shares = await enrichShares(c.env, account, imageId).catch(() => []);
+  return c.json({
+    ok: true,
+    action,
+    target_accounts: uids,
+    shares,
+    cross_region_warning: crossRegionWarning,
+  });
 });
 
 app.get("/api/v1/servers/:serverId/keypairs", async (c) => {

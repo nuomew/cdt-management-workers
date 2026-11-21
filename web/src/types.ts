@@ -366,6 +366,7 @@ export type InstanceDisk = {
 /** 阿里云 ECS 可选镜像 */
 export type EcsImage = {
   image_id: string
+  image_name?: string
   os_name: string
   os_type: string
   architecture: string
@@ -373,6 +374,22 @@ export type EcsImage = {
   size: number
   owner_alias: string
   description: string
+  status?: string
+  progress?: string
+  creation_time?: string
+  usage?: string
+  is_self_shared?: boolean
+}
+
+/** 自定义镜像的已共享账号条目 */
+export type ImageShareAccount = {
+  aliyun_id: string
+  shared_time: string
+  matched_servers: {
+    id: number
+    label: string
+    region_id: string
+  }[]
 }
 
 export type ReinstallPhase = 'stopping' | 'reinstalling' | 'starting' | 'completed' | 'error'

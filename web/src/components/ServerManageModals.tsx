@@ -1,23 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  Check,
   CheckCircle2,
+  Copy,
   Disc3,
   ExternalLink,
   HardDrive,
   Info,
   KeyRound,
+  Layers,
   LoaderCircle,
   Monitor,
+  Plus,
   RefreshCw,
   RotateCcw,
   Search,
+  Share2,
+  Trash2,
   TriangleAlert,
+  UserMinus,
+  UserPlus,
   X,
 } from 'lucide-react'
-import { SLOW_TIMEOUT_MS, api, post } from '../api'
+import { SLOW_TIMEOUT_MS, api, del, post } from '../api'
 import { regionLabel } from '../regions'
 import type {
   EcsImage,
+  ImageShareAccount,
   InstanceDetail,
   InstanceDisk,
   ReinstallPhase,
@@ -87,11 +96,13 @@ export function ServerDetailModal({
   onClose,
   onOpenVnc,
   onOpenReinstall,
+  onOpenImages,
 }: {
   server: Server
   onClose: () => void
   onOpenVnc: (server: Server) => void
   onOpenReinstall: (server: Server) => void
+  onOpenImages?: (server: Server) => void
 }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -136,6 +147,18 @@ export function ServerDetailModal({
             {loading ? <LoaderCircle size={13} className="spin" /> : <RefreshCw size={13} />} 刷新
           </button>
           <span className="spacer" />
+          {onOpenImages && (
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() => {
+                onClose()
+                onOpenImages(server)
+              }}
+            >
+              <Layers size={13} /> 镜像管理
+            </button>
+          )}
           <button
             type="button"
             className="btn sm"
@@ -634,6 +657,7 @@ export function ServerReinstallModal({
     const q = keyword.trim().toLowerCase()
     if (!q) return true
     return (
+      (img.image_name || '').toLowerCase().includes(q) ||
       img.os_name.toLowerCase().includes(q) ||
       img.image_id.toLowerCase().includes(q) ||
       img.description.toLowerCase().includes(q)
@@ -782,7 +806,11 @@ export function ServerReinstallModal({
                   className={`image-item${active ? ' selected' : ''}`}
                   onClick={() => setSelectedImage(img)}
                 >
-                  <div className="image-item-name">{img.os_name || img.image_id}</div>
+                  <div className="image-item-name">
+                    {img.owner_alias !== 'system' && img.image_name
+                      ? `${img.image_name}${img.os_name ? ` · ${img.os_name}` : ''}`
+                      : img.os_name || img.image_name || img.image_id}
+                  </div>
                   <div className="image-item-meta">
                     <code className="mono">{img.image_id}</code>
                     {img.architecture && <span>{img.architecture}</span>}
@@ -878,5 +906,784 @@ export function ServerReinstallModal({
         </div>
       )}
     </Modal>
+  )
+}
+
+/* ============================================================================
+   4. 镜像管理与跨账号共享（制作镜像 / 删除镜像 / 共享给 B 服务器或 UID / 取消共享）
+   ========================================================================== */
+
+type ImageTab = 'self' | 'others'
+
+const IMAGE_TABS: { value: ImageTab; label: string }[] = [
+  { value: 'self', label: '自定义镜像' },
+  { value: 'others', label: '共享给我的' },
+]
+
+function defaultImageName(): string {
+  const now = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `img-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`
+}
+
+function imageStatusBadge(
+  status?: string,
+  progress?: string,
+): { tone: 'green' | 'amber' | 'blue' | 'red' | 'gray'; label: string } {
+  switch (status) {
+    case 'Available':
+      return { tone: 'green', label: '可用' }
+    case 'Creating':
+      return { tone: 'amber', label: progress ? `创建中 ${progress}` : '创建中' }
+    case 'Waiting':
+      return { tone: 'blue', label: '排队中' }
+    case 'CreateFailed':
+      return { tone: 'red', label: '创建失败' }
+    case 'UnAvailable':
+      return { tone: 'red', label: '不可用' }
+    default:
+      return { tone: 'gray', label: status || '未知' }
+  }
+}
+
+export function ServerImagesModal({
+  server,
+  servers,
+  onClose,
+  onToast,
+}: {
+  server: Server
+  servers: Server[]
+  onClose: () => void
+  onToast: (message: string, tone?: 'success' | 'error' | 'info') => void
+}) {
+  const [tab, setTab] = useState<ImageTab>('self')
+  const [accountId, setAccountId] = useState('')
+  const [accountLoading, setAccountLoading] = useState(true)
+  const [accountError, setAccountError] = useState('')
+  const [copiedUid, setCopiedUid] = useState(false)
+
+  const [images, setImages] = useState<EcsImage[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  // 制作当前实例镜像
+  const [createOpen, setCreateOpen] = useState(false)
+  const [createName, setCreateName] = useState(defaultImageName)
+  const [createDesc, setCreateDesc] = useState('')
+  const [createError, setCreateError] = useState('')
+  const [creating, setCreating] = useState(false)
+
+  // 内联共享管理面板
+  const [expandedImageId, setExpandedImageId] = useState<string | null>(null)
+  const [sharesByImage, setSharesByImage] = useState<Record<string, ImageShareAccount[]>>({})
+  const [sharesLoading, setSharesLoading] = useState(false)
+  const [sharesError, setSharesError] = useState('')
+  const [shareBusyKey, setShareBusyKey] = useState('')
+  const [shareWarning, setShareWarning] = useState('')
+  const [targetServerId, setTargetServerId] = useState('')
+  const [manualUids, setManualUids] = useState('')
+
+  // 删除镜像确认
+  const [deleteTarget, setDeleteTarget] = useState<EcsImage | null>(null)
+  const [deleteForce, setDeleteForce] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+
+  const listSeqRef = useRef(0)
+
+  const otherServers = servers
+    .filter((item) => item.id !== server.id)
+    .sort((a, b) => {
+      const aSame = a.region_id === server.region_id ? 0 : 1
+      const bSame = b.region_id === server.region_id ? 0 : 1
+      return aSame - bSame || a.id - b.id
+    })
+
+  const loadAccountId = useCallback(async () => {
+    setAccountLoading(true)
+    setAccountError('')
+    try {
+      const res = await api<{ account_id: string }>(`/api/v1/servers/${server.id}/account-id`)
+      setAccountId(res.account_id || '')
+    } catch (err) {
+      setAccountError(err instanceof Error ? err.message : '获取阿里云账号 UID 失败')
+    } finally {
+      setAccountLoading(false)
+    }
+  }, [server.id])
+
+  const loadImages = useCallback(
+    async (owner: ImageTab) => {
+      const seq = ++listSeqRef.current
+      setLoading(true)
+      setError('')
+      try {
+        const res = await api<{ items: EcsImage[] }>(
+          `/api/v1/servers/${server.id}/images?owner=${owner}&all_status=1`,
+          { timeoutMs: SLOW_TIMEOUT_MS },
+        )
+        if (seq !== listSeqRef.current) return
+        setImages(res.items ?? [])
+      } catch (err) {
+        if (seq !== listSeqRef.current) return
+        setImages([])
+        setError(err instanceof Error ? err.message : '加载镜像列表失败')
+      } finally {
+        if (seq === listSeqRef.current) setLoading(false)
+      }
+    },
+    [server.id],
+  )
+
+  useEffect(() => {
+    void loadAccountId()
+  }, [loadAccountId])
+
+  useEffect(() => {
+    setExpandedImageId(null)
+    setSharesError('')
+    setShareWarning('')
+    void loadImages(tab)
+  }, [tab, loadImages])
+
+  const loadShares = useCallback(
+    async (imageId: string) => {
+      setSharesLoading(true)
+      setSharesError('')
+      try {
+        const res = await api<{ items: ImageShareAccount[] }>(
+          `/api/v1/servers/${server.id}/images/${encodeURIComponent(imageId)}/shares`,
+          { timeoutMs: SLOW_TIMEOUT_MS },
+        )
+        setSharesByImage((prev) => ({ ...prev, [imageId]: res.items ?? [] }))
+      } catch (err) {
+        setSharesError(err instanceof Error ? err.message : '加载镜像共享列表失败')
+      } finally {
+        setSharesLoading(false)
+      }
+    },
+    [server.id],
+  )
+
+  function toggleSharePanel(imageId: string) {
+    if (expandedImageId === imageId) {
+      setExpandedImageId(null)
+      setSharesError('')
+      setShareWarning('')
+      return
+    }
+    setExpandedImageId(imageId)
+    setSharesError('')
+    setShareWarning('')
+    setTargetServerId(otherServers[0] ? String(otherServers[0].id) : '')
+    setManualUids('')
+    void loadShares(imageId)
+  }
+
+  async function copyAccountId() {
+    if (!accountId) return
+    try {
+      await navigator.clipboard.writeText(accountId)
+      setCopiedUid(true)
+      onToast('已复制阿里云主账号 UID', 'success')
+      window.setTimeout(() => setCopiedUid(false), 1800)
+    } catch {
+      onToast('复制失败，请手动选中 UID 复制', 'info')
+    }
+  }
+
+  async function submitCreateImage() {
+    const name = createName.trim()
+    const desc = createDesc.trim()
+    setCreateError('')
+    if (name.length < 2 || name.length > 128) {
+      setCreateError('镜像名称长度需为 2–128 个字符')
+      return
+    }
+    if (/^https?:\/\//i.test(name)) {
+      setCreateError('镜像名称不能以 http:// 或 https:// 开头')
+      return
+    }
+    if (!/^[A-Za-z\u4e00-\u9fa5][A-Za-z0-9\u4e00-\u9fa5:_-]*$/.test(name)) {
+      setCreateError('镜像名称须以字母或中文开头，只能包含中英文、数字、冒号(:)、下划线(_)或短划线(-)')
+      return
+    }
+    setCreating(true)
+    try {
+      const res = await post<{ image_id: string }>(
+        `/api/v1/servers/${server.id}/images`,
+        { image_name: name, description: desc },
+        SLOW_TIMEOUT_MS,
+      )
+      onToast(`镜像创建任务已提交（${res.image_id}），制作完成后即可共享`, 'success')
+      setCreateOpen(false)
+      setCreateName(defaultImageName())
+      setCreateDesc('')
+      if (tab !== 'self') {
+        setTab('self')
+      } else {
+        void loadImages('self')
+      }
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : '创建镜像失败')
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  async function applyShareChange(
+    imageId: string,
+    busyKey: string,
+    payload: { action: 'add' | 'remove'; target_server_id?: number; accounts?: string[] },
+    successMessage: string,
+  ) {
+    setShareBusyKey(busyKey)
+    setSharesError('')
+    setShareWarning('')
+    try {
+      const res = await post<{
+        ok: boolean
+        shares: ImageShareAccount[]
+        cross_region_warning?: string
+      }>(
+        `/api/v1/servers/${server.id}/images/${encodeURIComponent(imageId)}/shares`,
+        payload,
+        SLOW_TIMEOUT_MS,
+      )
+      const nextShares = res.shares ?? []
+      setSharesByImage((prev) => ({ ...prev, [imageId]: nextShares }))
+      setImages((prev) =>
+        prev.map((img) =>
+          img.image_id === imageId ? { ...img, is_self_shared: nextShares.length > 0 } : img,
+        ),
+      )
+      if (res.cross_region_warning) {
+        setShareWarning(res.cross_region_warning)
+        onToast(res.cross_region_warning, 'info')
+      } else {
+        onToast(successMessage, 'success')
+      }
+      if (payload.action === 'add' && payload.accounts) {
+        setManualUids('')
+      }
+    } catch (err) {
+      setSharesError(err instanceof Error ? err.message : '更新镜像共享权限失败')
+    } finally {
+      setShareBusyKey('')
+    }
+  }
+
+  function handleShareToServer(imageId: string) {
+    const id = Number(targetServerId)
+    if (!Number.isInteger(id) || id <= 0) {
+      setSharesError('请先选择要共享给哪台服务器')
+      return
+    }
+    const target = otherServers.find((item) => item.id === id)
+    const label = target ? target.label || target.instance_id : `#${id}`
+    void applyShareChange(
+      imageId,
+      `add-server:${imageId}`,
+      { action: 'add', target_server_id: id },
+      `已将镜像共享给「${label}」所在账号`,
+    )
+  }
+
+  function handleShareToManualUids(imageId: string) {
+    const parsed = Array.from(
+      new Set(
+        manualUids
+          .split(/[\s,，、;；]+/)
+          .map((item) => item.trim())
+          .filter(Boolean),
+      ),
+    )
+    if (parsed.length === 0) {
+      setSharesError('请输入至少一个阿里云主账号 UID')
+      return
+    }
+    if (parsed.length > 10) {
+      setSharesError('阿里云单次最多添加 10 个共享账号，请分批操作')
+      return
+    }
+    const invalidUid = parsed.find((uid) => !/^\d{6,32}$/.test(uid))
+    if (invalidUid) {
+      setSharesError(`UID「${invalidUid}」格式不正确，应为纯数字主账号 UID`)
+      return
+    }
+    void applyShareChange(
+      imageId,
+      `add-uid:${imageId}`,
+      { action: 'add', accounts: parsed },
+      `已添加 ${parsed.length} 个共享账号`,
+    )
+  }
+
+  async function confirmDeleteImage() {
+    if (!deleteTarget) return
+    setDeleting(true)
+    try {
+      await del<{ ok: boolean }>(
+        `/api/v1/servers/${server.id}/images/${encodeURIComponent(deleteTarget.image_id)}?force=${deleteForce ? '1' : '0'}`,
+        SLOW_TIMEOUT_MS,
+      )
+      const deletedId = deleteTarget.image_id
+      setImages((prev) => prev.filter((item) => item.image_id !== deletedId))
+      if (expandedImageId === deletedId) setExpandedImageId(null)
+      setDeleteTarget(null)
+      setDeleteForce(false)
+      onToast(`已删除镜像 ${deletedId}`, 'success')
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : '删除镜像失败', 'error')
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  const selectedTargetServer = otherServers.find((item) => String(item.id) === targetServerId) ?? null
+
+  return (
+    <>
+      <Modal
+        wide
+        title={`镜像管理与共享 · ${server.label || server.instance_id}`}
+        icon={<Layers size={16} style={{ color: 'var(--accent)' }} />}
+        onClose={onClose}
+        footer={
+          <>
+            <span className="hint" style={{ margin: 0 }}>
+              自定义镜像支持跨账号共享（同地域生效）与随时取消共享
+            </span>
+            <span className="spacer" />
+            <button type="button" className="btn primary sm" onClick={onClose}>
+              关闭
+            </button>
+          </>
+        }
+      >
+        <div className="img-account-bar">
+          <div className="img-account-meta">
+            <span>
+              当前地域：<strong>{regionLabel(server.region_id)}</strong>{' '}
+              <code className="mono">{server.region_id}</code>
+            </span>
+            <span>
+              当前主账号 UID：
+              {accountLoading ? (
+                <LoaderCircle size={12} className="spin" style={{ verticalAlign: 'middle' }} />
+              ) : accountId ? (
+                <code className="mono">{accountId}</code>
+              ) : (
+                <span className="text-danger">{accountError || '获取失败'}</span>
+              )}
+            </span>
+          </div>
+          {accountId && (
+            <button type="button" className="btn ghost sm" onClick={() => void copyAccountId()}>
+              {copiedUid ? <Check size={12} /> : <Copy size={12} />}
+              {copiedUid ? '已复制 UID' : '复制 UID'}
+            </button>
+          )}
+        </div>
+
+        <div className="img-toolbar">
+          <Segmented value={tab} options={IMAGE_TABS} onChange={setTab} />
+          <div className="img-toolbar-actions">
+            <button
+              type="button"
+              className="btn ghost sm"
+              disabled={loading}
+              onClick={() => void loadImages(tab)}
+            >
+              {loading ? <LoaderCircle size={12} className="spin" /> : <RefreshCw size={12} />} 刷新
+            </button>
+            <button
+              type="button"
+              className={`btn sm${createOpen ? '' : ' primary'}`}
+              onClick={() => {
+                setCreateError('')
+                if (!createOpen) setCreateName(defaultImageName())
+                setCreateOpen((prev) => !prev)
+              }}
+            >
+              <Plus size={12} /> {createOpen ? '收起制作表单' : '制作当前实例镜像'}
+            </button>
+          </div>
+        </div>
+
+        {createOpen && (
+          <div className="img-create-box">
+            <div className="img-create-head">
+              <span>从实例 {server.instance_id} 制作自定义镜像</span>
+              <span className="hint" style={{ margin: 0 }}>
+                制作期间实例无需停机（建议先停止写入重要数据）
+              </span>
+            </div>
+            <div className="grid-2">
+              <div className="field" style={{ marginBottom: 0 }}>
+                <label htmlFor="create-img-name">镜像名称（必填）</label>
+                <input
+                  id="create-img-name"
+                  className="input"
+                  value={createName}
+                  onChange={(event) => setCreateName(event.target.value)}
+                  placeholder="例如 prod-hk-20261120"
+                  disabled={creating}
+                />
+              </div>
+              <div className="field" style={{ marginBottom: 0 }}>
+                <label htmlFor="create-img-desc">镜像描述（可选）</label>
+                <input
+                  id="create-img-desc"
+                  className="input"
+                  value={createDesc}
+                  onChange={(event) => setCreateDesc(event.target.value)}
+                  placeholder="备注用途或版本信息"
+                  disabled={creating}
+                />
+              </div>
+            </div>
+            {createError && (
+              <div className="auth-error" style={{ marginTop: 8 }}>
+                <TriangleAlert size={13} />
+                {createError}
+              </div>
+            )}
+            <div className="img-create-actions">
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={creating}
+                onClick={() => setCreateOpen(false)}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="btn primary sm"
+                disabled={creating}
+                onClick={() => void submitCreateImage()}
+              >
+                {creating ? <LoaderCircle size={12} className="spin" /> : <Plus size={12} />}
+                开始制作
+              </button>
+            </div>
+          </div>
+        )}
+
+        {tab === 'others' && (
+          <div className="img-notice info" style={{ marginBottom: 12 }}>
+            <Info size={14} style={{ flexShrink: 0, marginTop: 1 }} />
+            <span>
+              以下为其他阿里云账号共享给当前账号（{regionLabel(server.region_id)}）的镜像，可直接在当前服务器的「重装系统 → 共享」中选择使用。
+            </span>
+          </div>
+        )}
+
+        {loading ? (
+          <div className="manage-center">
+            <LoaderCircle size={20} className="spin" />
+            <span>正在加载{tab === 'self' ? '自定义镜像' : '共享给我的镜像'}…</span>
+          </div>
+        ) : error ? (
+          <div className="auth-error">
+            <TriangleAlert size={14} />
+            {error}
+          </div>
+        ) : images.length === 0 ? (
+          <div className="manage-center">
+            <Layers size={20} style={{ opacity: 0.45 }} />
+            <span>
+              {tab === 'self'
+                ? `当前地域（${regionLabel(server.region_id)}）暂无自定义镜像，点击上方「制作当前实例镜像」即可创建。`
+                : `当前地域（${regionLabel(server.region_id)}）暂无其他账号共享给你的镜像。`}
+            </span>
+          </div>
+        ) : (
+          <div className="img-cards">
+            {images.map((img) => {
+              const st = imageStatusBadge(img.status, img.progress)
+              const expanded = tab === 'self' && expandedImageId === img.image_id
+              const shares = sharesByImage[img.image_id] ?? []
+              const canShare = !img.status || img.status === 'Available'
+              return (
+                <div className={`img-card${expanded ? ' expanded' : ''}`} key={img.image_id}>
+                  <div className="img-card-head">
+                    <div className="img-card-main">
+                      <div className="img-card-title">
+                        <strong>{img.image_name || img.os_name || img.image_id}</strong>
+                        {img.status && <Badge tone={st.tone}>{st.label}</Badge>}
+                        {tab === 'self' && img.is_self_shared && <Badge tone="blue">已共享</Badge>}
+                      </div>
+                      <div className="img-card-meta">
+                        <code className="mono">{img.image_id}</code>
+                        {img.os_name && <span>{img.os_name}</span>}
+                        {img.architecture && <span>{img.architecture}</span>}
+                        {img.size > 0 && <span>{img.size} GiB</span>}
+                        {img.creation_time && <span>创建于 {formatIso(img.creation_time)}</span>}
+                      </div>
+                      {img.description && <div className="img-card-desc">{img.description}</div>}
+                    </div>
+
+                    {tab === 'self' && (
+                      <div className="img-card-actions">
+                        <button
+                          type="button"
+                          className={`btn sm${expanded ? ' primary' : ''}`}
+                          onClick={() => toggleSharePanel(img.image_id)}
+                        >
+                          <Share2 size={12} /> {expanded ? '收起共享' : '共享管理'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn ghost icon sm"
+                          title="删除自定义镜像"
+                          onClick={() => {
+                            setDeleteTarget(img)
+                            setDeleteForce(Boolean(img.is_self_shared))
+                          }}
+                        >
+                          <Trash2 size={13} style={{ color: 'var(--red)' }} />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {expanded && (
+                    <div className="img-share-box">
+                      <div className="img-share-section-title">
+                        <span>已共享账号（{shares.length}）</span>
+                        <button
+                          type="button"
+                          className="btn ghost sm"
+                          disabled={sharesLoading}
+                          onClick={() => void loadShares(img.image_id)}
+                        >
+                          {sharesLoading ? (
+                            <LoaderCircle size={11} className="spin" />
+                          ) : (
+                            <RefreshCw size={11} />
+                          )}{' '}
+                          刷新共享
+                        </button>
+                      </div>
+
+                      {sharesLoading ? (
+                        <div className="manage-center compact">
+                          <LoaderCircle size={14} className="spin" />
+                          <span>正在读取阿里云共享权限…</span>
+                        </div>
+                      ) : shares.length === 0 ? (
+                        <div className="hint" style={{ margin: 0 }}>
+                          当前尚未共享给任何其他阿里云账号。可在下方直接选择 B 服务器或输入对方主账号 UID 添加共享。
+                        </div>
+                      ) : (
+                        <div className="img-share-list">
+                          {shares.map((item) => {
+                            const removing = shareBusyKey === `remove:${img.image_id}:${item.aliyun_id}`
+                            return (
+                              <div className="img-share-row" key={item.aliyun_id}>
+                                <div className="img-share-row-info">
+                                  <code className="mono">{item.aliyun_id}</code>
+                                  {item.matched_servers.map((srv) => (
+                                    <span
+                                      className="img-share-chip"
+                                      key={srv.id}
+                                      title={`${srv.label} · ${regionLabel(srv.region_id)}`}
+                                    >
+                                      {srv.label}
+                                    </span>
+                                  ))}
+                                  {item.shared_time && (
+                                    <span className="img-share-time">
+                                      共享于 {formatIso(item.shared_time)}
+                                    </span>
+                                  )}
+                                </div>
+                                <button
+                                  type="button"
+                                  className="btn danger sm"
+                                  disabled={Boolean(shareBusyKey)}
+                                  onClick={() =>
+                                    void applyShareChange(
+                                      img.image_id,
+                                      `remove:${img.image_id}:${item.aliyun_id}`,
+                                      { action: 'remove', accounts: [item.aliyun_id] },
+                                      `已取消对账号 ${item.aliyun_id} 的共享`,
+                                    )
+                                  }
+                                >
+                                  {removing ? (
+                                    <LoaderCircle size={12} className="spin" />
+                                  ) : (
+                                    <UserMinus size={12} />
+                                  )}
+                                  取消共享
+                                </button>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+
+                      {!canShare && (
+                        <div className="img-notice">
+                          <TriangleAlert size={14} style={{ flexShrink: 0, marginTop: 1 }} />
+                          <span>该镜像尚未就绪（状态：{st.label}），等待状态变为「可用」后即可添加共享。</span>
+                        </div>
+                      )}
+
+                      <div className="img-share-controls">
+                        <div className="img-share-panel">
+                          <label htmlFor={`share-srv-${img.image_id}`}>
+                            方式一：直接共享给面板中的 B 服务器
+                          </label>
+                          {otherServers.length === 0 ? (
+                            <div className="hint" style={{ margin: 0 }}>
+                              面板中暂无其他服务器，请先添加 B 服务器或使用右侧 UID 手动共享。
+                            </div>
+                          ) : (
+                            <>
+                              <div className="img-share-inline">
+                                <select
+                                  id={`share-srv-${img.image_id}`}
+                                  className="select"
+                                  value={targetServerId}
+                                  disabled={!canShare || Boolean(shareBusyKey)}
+                                  onChange={(event) => setTargetServerId(event.target.value)}
+                                >
+                                  {otherServers.map((item) => {
+                                    const sameRegion = item.region_id === server.region_id
+                                    return (
+                                      <option key={item.id} value={String(item.id)}>
+                                        {item.label || item.instance_id}（
+                                        {sameRegion ? '同地域' : `跨地域·${regionLabel(item.region_id)}`}）
+                                      </option>
+                                    )
+                                  })}
+                                </select>
+                                <button
+                                  type="button"
+                                  className="btn primary sm"
+                                  disabled={!canShare || !targetServerId || Boolean(shareBusyKey)}
+                                  onClick={() => handleShareToServer(img.image_id)}
+                                >
+                                  {shareBusyKey === `add-server:${img.image_id}` ? (
+                                    <LoaderCircle size={12} className="spin" />
+                                  ) : (
+                                    <UserPlus size={12} />
+                                  )}
+                                  共享给它
+                                </button>
+                              </div>
+                              {selectedTargetServer &&
+                                selectedTargetServer.region_id !== server.region_id && (
+                                  <div className="hint" style={{ margin: 0, color: 'var(--amber)' }}>
+                                    提示：该服务器在 {regionLabel(selectedTargetServer.region_id)}，阿里云共享镜像仅在源地域（{regionLabel(server.region_id)}）生效。
+                                  </div>
+                                )}
+                            </>
+                          )}
+                        </div>
+
+                        <div className="img-share-panel">
+                          <label htmlFor={`share-uid-${img.image_id}`}>
+                            方式二：输入阿里云主账号 UID（支持多个）
+                          </label>
+                          <div className="img-share-inline">
+                            <input
+                              id={`share-uid-${img.image_id}`}
+                              className="input mono"
+                              value={manualUids}
+                              disabled={!canShare || Boolean(shareBusyKey)}
+                              onChange={(event) => setManualUids(event.target.value)}
+                              placeholder="16 位 UID，多个用逗号或空格分隔"
+                            />
+                            <button
+                              type="button"
+                              className="btn primary sm"
+                              disabled={!canShare || !manualUids.trim() || Boolean(shareBusyKey)}
+                              onClick={() => handleShareToManualUids(img.image_id)}
+                            >
+                              {shareBusyKey === `add-uid:${img.image_id}` ? (
+                                <LoaderCircle size={12} className="spin" />
+                              ) : (
+                                <UserPlus size={12} />
+                              )}
+                              添加共享
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      {shareWarning && (
+                        <div className="img-notice">
+                          <TriangleAlert size={14} style={{ flexShrink: 0, marginTop: 1 }} />
+                          <span>{shareWarning}</span>
+                        </div>
+                      )}
+
+                      {sharesError && (
+                        <div className="auth-error">
+                          <TriangleAlert size={13} />
+                          {sharesError}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </Modal>
+
+      {deleteTarget && (
+        <Modal
+          title="确认删除自定义镜像"
+          icon={<TriangleAlert size={14} style={{ color: 'var(--red)' }} />}
+          onClose={() => !deleting && setDeleteTarget(null)}
+          footer={
+            <>
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={deleting}
+                onClick={() => setDeleteTarget(null)}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="btn danger"
+                disabled={deleting}
+                onClick={() => void confirmDeleteImage()}
+              >
+                {deleting ? '删除中…' : '确认删除'}
+              </button>
+            </>
+          }
+        >
+          <div className="confirm-body">
+            <p className="confirm-text">
+              确定要删除自定义镜像「{deleteTarget.image_name || deleteTarget.image_id}」
+              （<code className="mono">{deleteTarget.image_id}</code>）吗？
+            </p>
+            <p className="confirm-hint">
+              删除后无法恢复；若已共享给其他账号，对方也将无法再使用该镜像创建或重装实例。
+            </p>
+            <label className="img-delete-force">
+              <input
+                type="checkbox"
+                checked={deleteForce}
+                disabled={deleting}
+                onChange={(event) => setDeleteForce(event.target.checked)}
+              />
+              <span>强制删除（当镜像仍存在共享关系或被实例引用时勾选）</span>
+            </label>
+          </div>
+        </Modal>
+      )}
+    </>
   )
 }

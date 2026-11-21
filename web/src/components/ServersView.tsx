@@ -6,6 +6,7 @@ import {
   Globe2,
   HeartPulse,
   Info,
+  Layers,
   LayoutGrid,
   List,
   LoaderCircle,
@@ -40,6 +41,7 @@ type Props = {
   onDetail: (server: Server) => void
   onVnc: (server: Server) => void
   onReinstall: (server: Server) => void
+  onImages: (server: Server) => void
   onAddToKeepalive: (server: Server) => void
   onBilling: (server: Server) => void
   onReorder: (orderedIds: number[]) => void
@@ -68,6 +70,7 @@ export default function ServersView({
   onDetail,
   onVnc,
   onReinstall,
+  onImages,
   onAddToKeepalive,
   onBilling,
   onReorder,
@@ -107,7 +110,7 @@ export default function ServersView({
         <div>
           <h1>服务器</h1>
           <p>
-            这里管理阿里云 ECS 实例：支持添加时自动拉取实例 ID，以及实例详情/磁盘查看、开关机、重启、内置 VNC 远程终端与重装系统。
+            这里管理阿里云 ECS 实例：支持添加时自动拉取实例 ID，以及实例详情/磁盘查看、开关机、重启、镜像制作与跨账号共享、内置 VNC 与重装系统。
             {idleCount > 0 && ` 当前 ${idleCount} 台是闲散机器，可直接手动控制。`}
           </p>
         </div>
@@ -141,7 +144,7 @@ export default function ServersView({
       {servers.length === 0 ? (
         <div className="card">
           <Empty icon={<ServerIcon size={20} />} title="还没有服务器">
-            添加后可自动读取阿里云实例 ID，支持实例管理（详情、VNC、重启、重装）以及「单机保活」与「联合换班」。
+            添加后可自动读取阿里云实例 ID，支持实例管理（详情、镜像、VNC、重启、重装）以及「单机保活」与「联合换班」。
           </Empty>
         </div>
       ) : viewMode === 'list' ? (
@@ -157,6 +160,7 @@ export default function ServersView({
           onDetail={onDetail}
           onVnc={onVnc}
           onReinstall={onReinstall}
+          onImages={onImages}
           onAddToKeepalive={onAddToKeepalive}
           onBilling={onBilling}
         />
@@ -295,6 +299,15 @@ export default function ServersView({
                     type="button"
                     className="btn ghost sm"
                     disabled={!hasInstance}
+                    title={hasInstance ? '管理自定义镜像与跨账号镜像共享' : '请先编辑补全实例 ID'}
+                    onClick={() => onImages(server)}
+                  >
+                    <Layers size={12} /> 镜像
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    disabled={!hasInstance}
                     title={hasInstance ? '打开内置全屏 VNC 远程控制台' : '请先编辑补全实例 ID'}
                     onClick={() => onVnc(server)}
                   >
@@ -389,6 +402,7 @@ function ServerTable({
   onDetail,
   onVnc,
   onReinstall,
+  onImages,
   onAddToKeepalive,
   onBilling,
 }: {
@@ -403,6 +417,7 @@ function ServerTable({
   onDetail: (server: Server) => void
   onVnc: (server: Server) => void
   onReinstall: (server: Server) => void
+  onImages: (server: Server) => void
   onAddToKeepalive: (server: Server) => void
   onBilling: (server: Server) => void
 }) {
@@ -526,6 +541,14 @@ function ServerTable({
                       onClick={() => onDetail(server)}
                     >
                       <Info size={13} />
+                    </button>
+                    <button
+                      className="btn ghost icon sm"
+                      title="镜像管理与跨账号共享"
+                      disabled={!hasInstance}
+                      onClick={() => onImages(server)}
+                    >
+                      <Layers size={13} />
                     </button>
                     <button
                       className="btn ghost icon sm"

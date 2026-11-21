@@ -737,6 +737,7 @@ export interface InstanceDisk {
 
 export interface EcsImage {
   image_id: string;
+  image_name: string;
   os_name: string;
   os_type: string;
   architecture: string;
@@ -744,6 +745,16 @@ export interface EcsImage {
   size: number;
   owner_alias: string;
   description: string;
+  status: string;
+  progress: string;
+  creation_time: string;
+  usage: string;
+  is_self_shared: boolean;
+}
+
+export interface ImageShareAccount {
+  aliyun_id: string;
+  shared_time: string;
 }
 
 export interface VncInfo {
@@ -1163,18 +1174,95 @@ export async function getInstanceVncUrl(
   return { vnc_url: vncUrl, console_url: consoleUrl };
 }
 
-/** List available ECS images in the instance's region for OS reinstallation. */
+const STS_DOMAIN = "sts.aliyuncs.com";
+const STS_VERSION = "2015-04-01";
+const callerAccountCache = new Map<string, string>();
+
+// In-memory mock store for CDT_DRY_RUN=1 image creation and sharing tests.
+interface MockImageEntry {
+  image: EcsImage;
+  ownerAccountId: string;
+  sharedWith: Map<string, string>;
+}
+const mockCustomImages = new Map<string, MockImageEntry>();
+
+function mockAccountIdFor(ak: string): string {
+  const hash = Array.from(ak || "mock").reduce((acc, ch) => (acc * 31 + ch.charCodeAt(0)) % 1_000_000_000, 100_000_000);
+  return `1000000${String(Math.abs(hash)).padStart(9, "0")}`;
+}
+
+/**
+ * Resolve the 16-digit Alibaba Cloud primary account UID for an AccessKey via
+ * STS GetCallerIdentity. Cached in memory per AccessKeyId.
+ */
+export async function getCallerAccountId(
+  env: Env,
+  account: Pick<AliyunAccount, "access_key_id" | "access_key_secret" | "region_id" | "site">,
+): Promise<string> {
+  const ak = account.access_key_id.trim();
+  if (!ak) throw new AliyunError("无法获取账号 UID：缺少 AccessKey ID");
+  if (isDryRun(env)) return mockAccountIdFor(ak);
+
+  const cached = callerAccountCache.get(ak);
+  if (cached) return cached;
+
+  const full: AliyunAccount = {
+    access_key_id: ak,
+    access_key_secret: account.access_key_secret,
+    region_id: account.region_id || "cn-hongkong",
+    site: account.site || "china",
+    instance_id: "",
+  };
+  let data: Record<string, unknown>;
+  try {
+    data = await rpcCall<Record<string, unknown>>(STS_DOMAIN, full, {
+      Action: "GetCallerIdentity",
+      Version: STS_VERSION,
+    });
+  } catch (exc) {
+    throw new AliyunError(`获取阿里云账号 UID 失败：${briefError(exc)}`);
+  }
+  const accountId = asStrVal(data["AccountId"]).trim();
+  if (!accountId) {
+    throw new AliyunError("获取阿里云账号 UID 失败：STS 未返回 AccountId");
+  }
+  callerAccountCache.set(ak, accountId);
+  return accountId;
+}
+
+/** List ECS images in the instance's region (supports reinstall and image management). */
 export async function listImages(
   env: Env,
   account: AliyunAccount,
-  opts: { ownerAlias?: string; osType?: string } = {},
+  opts: { ownerAlias?: string; osType?: string; includeAllStatus?: boolean } = {},
 ): Promise<EcsImage[]> {
   const ownerAlias = opts.ownerAlias || "system";
   const osType = opts.osType || "";
   if (isDryRun(env)) {
+    const selfUid = mockAccountIdFor(account.access_key_id);
+    if (ownerAlias === "self") {
+      const list = Array.from(mockCustomImages.values())
+        .filter((entry) => entry.ownerAccountId === selfUid)
+        .map((entry) => ({
+          ...entry.image,
+          is_self_shared: entry.sharedWith.size > 0,
+        }));
+      return list.filter((img) => !osType || img.os_type === osType.toLowerCase());
+    }
+    if (ownerAlias === "others") {
+      const list = Array.from(mockCustomImages.values())
+        .filter((entry) => entry.sharedWith.has(selfUid))
+        .map((entry) => ({
+          ...entry.image,
+          owner_alias: "others",
+          is_self_shared: false,
+        }));
+      return list.filter((img) => !osType || img.os_type === osType.toLowerCase());
+    }
     return [
       {
         image_id: "debian_12_6_x64_20G_alibase_20240819.vhd",
+        image_name: "debian_12_6_x64_20G_alibase_20240819.vhd",
         os_name: "Debian 12.6 64位",
         os_type: "linux",
         architecture: "x86_64",
@@ -1182,9 +1270,15 @@ export async function listImages(
         size: 20,
         owner_alias: ownerAlias,
         description: "Debian 12",
+        status: "Available",
+        progress: "100%",
+        creation_time: "2026-01-01T00:00Z",
+        usage: "none",
+        is_self_shared: false,
       },
       {
         image_id: "ubuntu_24_04_x64_20G_alibase_20240812.vhd",
+        image_name: "ubuntu_24_04_x64_20G_alibase_20240812.vhd",
         os_name: "Ubuntu 24.04 64位",
         os_type: "linux",
         architecture: "x86_64",
@@ -1192,6 +1286,11 @@ export async function listImages(
         size: 20,
         owner_alias: ownerAlias,
         description: "Ubuntu 24.04 LTS",
+        status: "Available",
+        progress: "100%",
+        creation_time: "2026-01-01T00:00Z",
+        usage: "none",
+        is_self_shared: false,
       },
     ].filter((img) => !osType || img.os_type === osType.toLowerCase());
   }
@@ -1199,11 +1298,18 @@ export async function listImages(
     Action: "DescribeImages",
     Version: ECS_VERSION,
     RegionId: account.region_id,
-    Status: "Available",
     PageNumber: "1",
     PageSize: "100",
   };
+  if (opts.includeAllStatus) {
+    params["Status"] = "Creating,Waiting,Available,UnAvailable,CreateFailed";
+  } else {
+    params["Status"] = "Available";
+  }
   if (ownerAlias) params["ImageOwnerAlias"] = ownerAlias;
+  // For `others`, set IsPublic=false so only images directly shared with this
+  // account are returned (excluding public community images).
+  if (ownerAlias === "others") params["IsPublic"] = "false";
   if (osType) params["OSType"] = osType;
   let data: Record<string, unknown>;
   try {
@@ -1214,17 +1320,181 @@ export async function listImages(
   const rawList = asArray<unknown>(asRecord(data["Images"])["Image"]);
   return rawList.map((item) => {
     const img = asRecord(item);
+    const isSelfSharedRaw = img["IsSelfShared"];
     return {
       image_id: asStrVal(img["ImageId"]).trim(),
-      os_name: asStrVal(img["OSName"]).trim() || asStrVal(img["OSNameEn"]).trim() || asStrVal(img["ImageName"]).trim(),
+      image_name: asStrVal(img["ImageName"]).trim(),
+      os_name:
+        asStrVal(img["OSName"]).trim() ||
+        asStrVal(img["OSNameEn"]).trim() ||
+        asStrVal(img["ImageName"]).trim(),
       os_type: asStrVal(img["OSType"]).trim().toLowerCase(),
       architecture: asStrVal(img["Architecture"]).trim(),
       image_version: asStrVal(img["ImageVersion"]).trim(),
       size: asNumVal(img["Size"]),
       owner_alias: asStrVal(img["ImageOwnerAlias"]).trim(),
       description: asStrVal(img["Description"]).trim(),
+      status: asStrVal(img["Status"]).trim() || "Available",
+      progress: asStrVal(img["Progress"]).trim(),
+      creation_time: asStrVal(img["CreationTime"]).trim(),
+      usage: asStrVal(img["Usage"]).trim(),
+      is_self_shared:
+        isSelfSharedRaw === true || asStrVal(isSelfSharedRaw).toLowerCase() === "true",
     };
   });
+}
+
+/** Create a custom image from the specified ECS instance. */
+export async function createImage(
+  env: Env,
+  account: AliyunAccount,
+  opts: { imageName: string; description?: string },
+): Promise<{ image_id: string }> {
+  if (isDryRun(env)) {
+    const id = `m-mock-${Date.now().toString(36)}`;
+    mockCustomImages.set(id, {
+      ownerAccountId: mockAccountIdFor(account.access_key_id),
+      sharedWith: new Map(),
+      image: {
+        image_id: id,
+        image_name: opts.imageName,
+        os_name: "Debian 12.6 64位",
+        os_type: "linux",
+        architecture: "x86_64",
+        image_version: "",
+        size: 40,
+        owner_alias: "self",
+        description: opts.description ?? "",
+        status: "Available",
+        progress: "100%",
+        creation_time: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+        usage: "none",
+        is_self_shared: false,
+      },
+    });
+    return { image_id: id };
+  }
+  const params: Record<string, string> = {
+    Action: "CreateImage",
+    Version: ECS_VERSION,
+    RegionId: account.region_id,
+    InstanceId: account.instance_id,
+    ImageName: opts.imageName,
+  };
+  if (opts.description) params["Description"] = opts.description;
+  let data: Record<string, unknown>;
+  try {
+    data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, params);
+  } catch (exc) {
+    throw new AliyunError(`创建自定义镜像失败：${briefError(exc)}`);
+  }
+  return { image_id: asStrVal(data["ImageId"]).trim() };
+}
+
+/** Delete a custom image owned by this account. */
+export async function deleteImage(
+  env: Env,
+  account: AliyunAccount,
+  imageId: string,
+  force = false,
+): Promise<void> {
+  if (isDryRun(env)) {
+    mockCustomImages.delete(imageId);
+    return;
+  }
+  try {
+    await rpcCall(ecsDomain(account.region_id), account, {
+      Action: "DeleteImage",
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      ImageId: imageId,
+      Force: force ? "true" : "false",
+    });
+  } catch (exc) {
+    throw new AliyunError(`删除自定义镜像失败：${briefError(exc)}`);
+  }
+}
+
+/** Query the list of Alibaba Cloud account UIDs a custom image is shared with. */
+export async function getImageSharePermissions(
+  env: Env,
+  account: AliyunAccount,
+  imageId: string,
+): Promise<ImageShareAccount[]> {
+  if (isDryRun(env)) {
+    const entry = mockCustomImages.get(imageId);
+    if (!entry) return [];
+    return Array.from(entry.sharedWith.entries()).map(([aliyun_id, shared_time]) => ({
+      aliyun_id,
+      shared_time,
+    }));
+  }
+  let data: Record<string, unknown>;
+  try {
+    data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+      Action: "DescribeImageSharePermission",
+      Version: ECS_VERSION,
+      RegionId: account.region_id,
+      ImageId: imageId,
+      PageNumber: "1",
+      PageSize: "100",
+    });
+  } catch (exc) {
+    throw new AliyunError(`查询镜像共享列表失败：${briefError(exc)}`);
+  }
+  const rawAccounts = asArray<unknown>(asRecord(data["Accounts"])["Account"]);
+  return rawAccounts
+    .map((item) => {
+      const rec = asRecord(item);
+      return {
+        aliyun_id:
+          asStrVal(rec["AliyunId"]).trim() || asStrVal(rec["AliyunUid"]).trim(),
+        shared_time: asStrVal(rec["SharedTime"]).trim(),
+      };
+    })
+    .filter((entry) => Boolean(entry.aliyun_id));
+}
+
+/**
+ * Add and/or remove Alibaba Cloud account UIDs for a custom image via
+ * ModifyImageSharePermission (max 10 accounts per operation per Aliyun docs).
+ */
+export async function modifyImageSharePermission(
+  env: Env,
+  account: AliyunAccount,
+  imageId: string,
+  opts: { addAccounts?: string[]; removeAccounts?: string[] },
+): Promise<void> {
+  const addList = (opts.addAccounts ?? []).map((s) => s.trim()).filter(Boolean).slice(0, 10);
+  const removeList = (opts.removeAccounts ?? []).map((s) => s.trim()).filter(Boolean).slice(0, 10);
+  if (addList.length === 0 && removeList.length === 0) {
+    throw new AliyunError("请指定要添加或取消共享的阿里云账号 UID");
+  }
+  if (isDryRun(env)) {
+    const entry = mockCustomImages.get(imageId);
+    if (!entry) throw new AliyunError("镜像不存在");
+    const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+    for (const uid of addList) entry.sharedWith.set(uid, nowIso);
+    for (const uid of removeList) entry.sharedWith.delete(uid);
+    return;
+  }
+  const params: Record<string, string> = {
+    Action: "ModifyImageSharePermission",
+    Version: ECS_VERSION,
+    RegionId: account.region_id,
+    ImageId: imageId,
+  };
+  addList.forEach((uid, idx) => {
+    params[`AddAccount.${idx + 1}`] = uid;
+  });
+  removeList.forEach((uid, idx) => {
+    params[`RemoveAccount.${idx + 1}`] = uid;
+  });
+  try {
+    await rpcCall(ecsDomain(account.region_id), account, params);
+  } catch (exc) {
+    throw new AliyunError(`修改镜像共享权限失败：${briefError(exc)}`);
+  }
 }
 
 /** List SSH key pairs in the region (used as optional login credential when reinstalling). */
