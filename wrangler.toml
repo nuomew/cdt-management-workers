@@ -19,6 +19,7 @@ crons = ["*/1 * * * *"]
 
 [assets]
 directory = "./web/dist"
+binding = "ASSETS"
 not_found_handling = "single-page-application"
 
 [vars]

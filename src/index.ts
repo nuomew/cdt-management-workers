@@ -44,7 +44,14 @@ export default {
       return app.fetch(request, runtimeEnv, ctx);
     }
     if (env.ASSETS) {
-      return env.ASSETS.fetch(request);
+      const assetRes = await env.ASSETS.fetch(request);
+      if (assetRes.status === 404 && (request.method === "GET" || request.method === "HEAD")) {
+        const lastSegment = url.pathname.split("/").pop() ?? "";
+        if (!lastSegment.includes(".")) {
+          return env.ASSETS.fetch(new Request(new URL("/index.html", url.origin), request));
+        }
+      }
+      return assetRes;
     }
     return new Response(
       JSON.stringify({
