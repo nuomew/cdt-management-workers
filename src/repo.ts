@@ -2254,3 +2254,391 @@ export async function pruneEvents(env: Env, days: number): Promise<void> {
   ]);
   await execute(env.DB, "DELETE FROM traffic_samples WHERE ts<?", [now - 7 * 86400]);
 }
+
+// ---------------------------------------------------------------------------
+// swas_servers (Aliyun Lightweight Application Server — independent registry)
+// ---------------------------------------------------------------------------
+
+export const SWAS_COLUMNS =
+  "id, label, access_key_id, access_key_secret, region_id, site, instance_id, remark, " +
+  "instance_status, public_ip, inner_ip, plan_id, plan_type, cpu, memory_gb, disk_size_gb, " +
+  "bandwidth_mbps, image_name, os_type, expired_time, business_status, " +
+  "traffic_used_gb, traffic_total_gb, traffic_overflow_gb, status_checked_at, traffic_checked_at, " +
+  "monthly_cost, balance_amount, billing_currency, billing_cycle, billing_updated_at, " +
+  "billing_error, created_at, sort_order";
+
+export interface SwasServerView {
+  id: number;
+  label: string;
+  access_key_id: string;
+  region_id: string;
+  site: string;
+  instance_id: string;
+  remark: string;
+  instance_status: string;
+  public_ip: string;
+  inner_ip: string;
+  plan_id: string;
+  plan_type: string;
+  cpu: number;
+  memory_gb: number;
+  disk_size_gb: number;
+  bandwidth_mbps: number;
+  image_name: string;
+  os_type: string;
+  expired_time: string;
+  business_status: string;
+  traffic_used_gb: number | null;
+  traffic_total_gb: number | null;
+  traffic_overflow_gb: number | null;
+  status_checked_at: number;
+  traffic_checked_at: number;
+  monthly_cost: number | null;
+  balance_amount: number | null;
+  billing_currency: string;
+  billing_cycle: string;
+  billing_updated_at: number;
+  billing_error: string;
+  created_at: number;
+  sort_order: number;
+  secret_configured: boolean;
+  /** Plaintext secret when decryptSecret=true; never returned in API responses. */
+  access_key_secret?: string;
+  /** Masked secret for UI display when decryptSecret=false. */
+  access_key_masked?: string;
+}
+
+async function swasRow(env: Env, row: Row, decryptSecret = false): Promise<SwasServerView> {
+  const item: SwasServerView = {
+    id: asInt(row["id"]),
+    label: asStr(row["label"]),
+    access_key_id: asStr(row["access_key_id"]),
+    region_id: asStr(row["region_id"]),
+    site: normalizeSite(row["site"]),
+    instance_id: asStr(row["instance_id"]),
+    remark: asStr(row["remark"]),
+    instance_status: asStr(row["instance_status"]),
+    public_ip: asStr(row["public_ip"]),
+    inner_ip: asStr(row["inner_ip"]),
+    plan_id: asStr(row["plan_id"]),
+    plan_type: asStr(row["plan_type"]),
+    cpu: asInt(row["cpu"]),
+    memory_gb: asNum(row["memory_gb"]),
+    disk_size_gb: asInt(row["disk_size_gb"]),
+    bandwidth_mbps: asInt(row["bandwidth_mbps"]),
+    image_name: asStr(row["image_name"]),
+    os_type: asStr(row["os_type"]),
+    expired_time: asStr(row["expired_time"]),
+    business_status: asStr(row["business_status"]),
+    traffic_used_gb: asOptNum(row["traffic_used_gb"]),
+    traffic_total_gb: asOptNum(row["traffic_total_gb"]),
+    traffic_overflow_gb: asOptNum(row["traffic_overflow_gb"]),
+    status_checked_at: asInt(row["status_checked_at"]),
+    traffic_checked_at: asInt(row["traffic_checked_at"]),
+    monthly_cost: asOptNum(row["monthly_cost"]),
+    balance_amount: asOptNum(row["balance_amount"]),
+    billing_currency: asStr(row["billing_currency"]),
+    billing_cycle: asStr(row["billing_cycle"]),
+    billing_updated_at: asInt(row["billing_updated_at"]),
+    billing_error: asStr(row["billing_error"]),
+    created_at: asInt(row["created_at"]),
+    sort_order: asInt(row["sort_order"]),
+    secret_configured: false,
+  };
+  const secret = asStr(row["access_key_secret"]);
+  item.secret_configured = Boolean(secret);
+  if (decryptSecret) {
+    if (!secret) {
+      item.access_key_secret = "";
+    } else {
+      try {
+        item.access_key_secret = await decrypt(secret, env.ENCRYPTION_KEY);
+      } catch {
+        throw new Error(
+          `${item.label || "该轻量服务器"} 的 AccessKey Secret 解密失败，请重新填写一遍 Secret`,
+        );
+      }
+    }
+  } else {
+    try {
+      item.access_key_masked = mask(await decrypt(secret, env.ENCRYPTION_KEY));
+    } catch {
+      item.access_key_masked = "⚠️ 解密失败";
+      item.secret_configured = false;
+    }
+  }
+  return item;
+}
+
+export async function listSwasServers(
+  env: Env,
+  decryptSecret = false,
+): Promise<SwasServerView[]> {
+  const rows = await query<Row>(
+    env.DB,
+    `SELECT ${SWAS_COLUMNS} FROM swas_servers ORDER BY ` +
+      "CASE WHEN sort_order=0 THEN id + 1000000 ELSE sort_order END, id",
+  );
+  const out: SwasServerView[] = [];
+  for (const row of rows) out.push(await swasRow(env, row, decryptSecret));
+  return out;
+}
+
+export async function getSwasServer(
+  env: Env,
+  swasId: number,
+  decryptSecret = false,
+): Promise<SwasServerView | null> {
+  const row = await queryOne<Row>(
+    env.DB,
+    `SELECT ${SWAS_COLUMNS} FROM swas_servers WHERE id=?`,
+    [swasId],
+  );
+  return row ? swasRow(env, row, decryptSecret) : null;
+}
+
+export interface SwasServerPayload {
+  id?: unknown;
+  label?: unknown;
+  access_key_id?: unknown;
+  access_key_secret?: unknown;
+  region_id?: unknown;
+  site?: unknown;
+  instance_id?: unknown;
+  remark?: unknown;
+  [key: string]: unknown;
+}
+
+export async function upsertSwasServer(
+  env: Env,
+  payload: SwasServerPayload,
+): Promise<number> {
+  const swasId = asInt(payload["id"], 0);
+  const label = asStr(payload["label"]).trim();
+  let ak = asStr(payload["access_key_id"]).trim();
+  const sk = asStr(payload["access_key_secret"]).trim();
+  const region = asStr(payload["region_id"]).trim();
+  let site = normalizeSite(payload["site"]);
+  const instance = asStr(payload["instance_id"]).trim();
+  const remark = asStr(payload["remark"]).trim();
+
+  if (!region) throw new Error("地域不能为空");
+  if (!instance) throw new Error("轻量实例 ID 不能为空");
+
+  if (swasId) {
+    const existing = await queryOne<Row>(
+      env.DB,
+      "SELECT access_key_id, access_key_secret, site, instance_id FROM swas_servers WHERE id=?",
+      [swasId],
+    );
+    if (existing === null) throw new Error("轻量服务器不存在");
+    if (!ak) ak = asStr(existing["access_key_id"]);
+    if (payload["site"] === null || payload["site"] === undefined) {
+      site = normalizeSite(existing["site"]);
+    }
+    const encrypted = sk
+      ? await encrypt(sk, env.ENCRYPTION_KEY)
+      : asStr(existing["access_key_secret"]);
+    const billingChanged =
+      ak !== asStr(existing["access_key_id"]) ||
+      instance !== asStr(existing["instance_id"]) ||
+      site !== normalizeSite(existing["site"]);
+    const resetBilling = billingChanged
+      ? ", monthly_cost=NULL, balance_amount=NULL, billing_currency='', " +
+        "billing_cycle='', billing_updated_at=0, billing_error=''"
+      : "";
+    await execute(
+      env.DB,
+      "UPDATE swas_servers SET label=?, access_key_id=?, access_key_secret=?, region_id=?, " +
+        "site=?, instance_id=?, remark=?" +
+        resetBilling +
+        " WHERE id=?",
+      [label || instance.slice(0, 12), ak, encrypted, region, site, instance, remark, swasId],
+    );
+    return swasId;
+  }
+
+  if (!ak) throw new Error("AccessKey ID 不能为空");
+  if (!sk) throw new Error("新建轻量服务器必须填写 AccessKey Secret（或复用已有服务器账号）");
+  const result = await execute(
+    env.DB,
+    "INSERT INTO swas_servers(label, access_key_id, access_key_secret, region_id, site, " +
+      "instance_id, remark, created_at) VALUES(?,?,?,?,?,?,?,?)",
+    [
+      label || instance.slice(0, 12),
+      ak,
+      await encrypt(sk, env.ENCRYPTION_KEY),
+      region,
+      site,
+      instance,
+      remark,
+      nowSeconds(),
+    ],
+  );
+  return result.lastInsertRowId;
+}
+
+export async function deleteSwasServer(env: Env, swasId: number): Promise<void> {
+  await execute(env.DB, "DELETE FROM swas_servers WHERE id=?", [swasId]);
+}
+
+export async function reorderSwasServers(env: Env, orderedIds: number[]): Promise<void> {
+  if (!orderedIds || orderedIds.length === 0) return;
+  const statements: { sql: string; params: (string | number | null)[] }[] = [
+    { sql: "UPDATE swas_servers SET sort_order=0", params: [] },
+  ];
+  orderedIds.forEach((id, index) => {
+    statements.push({
+      sql: "UPDATE swas_servers SET sort_order=? WHERE id=?",
+      params: [index + 1, Math.trunc(id)],
+    });
+  });
+  await batch(env.DB, statements);
+}
+
+export async function updateSwasSite(
+  env: Env,
+  swasId: number,
+  site: string,
+): Promise<void> {
+  await execute(env.DB, "UPDATE swas_servers SET site=? WHERE id=?", [
+    normalizeSite(site),
+    swasId,
+  ]);
+}
+
+export interface SwasRuntimeUpdate {
+  status?: string;
+  publicIp?: string;
+  innerIp?: string;
+  planId?: string;
+  planType?: string;
+  cpu?: number;
+  memoryGb?: number;
+  diskSizeGb?: number;
+  bandwidthMbps?: number;
+  imageName?: string;
+  osType?: string;
+  expiredTime?: string;
+  businessStatus?: string;
+  trafficUsedGb?: number | null;
+  trafficTotalGb?: number | null;
+  trafficOverflowGb?: number | null;
+}
+
+export async function updateSwasRuntime(
+  env: Env,
+  swasId: number,
+  opts: SwasRuntimeUpdate,
+): Promise<void> {
+  const now = nowSeconds();
+  const sets: string[] = [];
+  const params: (string | number | null)[] = [];
+
+  if (opts.status !== undefined) {
+    sets.push("instance_status=?", "status_checked_at=?");
+    params.push(opts.status, now);
+  }
+  if (opts.publicIp !== undefined) {
+    sets.push("public_ip=?");
+    params.push(opts.publicIp);
+  }
+  if (opts.innerIp !== undefined) {
+    sets.push("inner_ip=?");
+    params.push(opts.innerIp);
+  }
+  if (opts.planId !== undefined) {
+    sets.push("plan_id=?");
+    params.push(opts.planId);
+  }
+  if (opts.planType !== undefined) {
+    sets.push("plan_type=?");
+    params.push(opts.planType);
+  }
+  if (opts.cpu !== undefined) {
+    sets.push("cpu=?");
+    params.push(Math.trunc(opts.cpu));
+  }
+  if (opts.memoryGb !== undefined) {
+    sets.push("memory_gb=?");
+    params.push(opts.memoryGb);
+  }
+  if (opts.diskSizeGb !== undefined) {
+    sets.push("disk_size_gb=?");
+    params.push(Math.trunc(opts.diskSizeGb));
+  }
+  if (opts.bandwidthMbps !== undefined) {
+    sets.push("bandwidth_mbps=?");
+    params.push(Math.trunc(opts.bandwidthMbps));
+  }
+  if (opts.imageName !== undefined) {
+    sets.push("image_name=?");
+    params.push(opts.imageName);
+  }
+  if (opts.osType !== undefined) {
+    sets.push("os_type=?");
+    params.push(opts.osType);
+  }
+  if (opts.expiredTime !== undefined) {
+    sets.push("expired_time=?");
+    params.push(opts.expiredTime);
+  }
+  if (opts.businessStatus !== undefined) {
+    sets.push("business_status=?");
+    params.push(opts.businessStatus);
+  }
+  if (opts.trafficUsedGb !== undefined || opts.trafficTotalGb !== undefined) {
+    if (opts.trafficUsedGb !== undefined) {
+      sets.push("traffic_used_gb=?");
+      params.push(opts.trafficUsedGb);
+    }
+    if (opts.trafficTotalGb !== undefined) {
+      sets.push("traffic_total_gb=?");
+      params.push(opts.trafficTotalGb);
+    }
+    if (opts.trafficOverflowGb !== undefined) {
+      sets.push("traffic_overflow_gb=?");
+      params.push(opts.trafficOverflowGb);
+    }
+    sets.push("traffic_checked_at=?");
+    params.push(now);
+  }
+
+  if (sets.length === 0) return;
+  params.push(swasId);
+  await execute(env.DB, `UPDATE swas_servers SET ${sets.join(", ")} WHERE id=?`, params);
+}
+
+export async function updateSwasBilling(
+  env: Env,
+  swasId: number,
+  opts: BillingUpdate,
+): Promise<void> {
+  const sets: string[] = [];
+  const params: (string | number | null)[] = [];
+  if (opts.monthlyCost !== null && opts.monthlyCost !== undefined) {
+    sets.push("monthly_cost=?");
+    params.push(Number(opts.monthlyCost));
+  }
+  if (opts.balance !== null && opts.balance !== undefined) {
+    sets.push("balance_amount=?");
+    params.push(Number(opts.balance));
+  }
+  if (opts.currency) {
+    sets.push("billing_currency=?");
+    params.push(String(opts.currency));
+  }
+  if (opts.cycle) {
+    sets.push("billing_cycle=?");
+    params.push(String(opts.cycle));
+  }
+  sets.push("billing_error=?");
+  params.push(String(opts.error ?? ""));
+  if (opts.touch !== false) {
+    sets.push("billing_updated_at=?");
+    params.push(nowSeconds());
+  }
+  params.push(swasId);
+  await execute(env.DB, `UPDATE swas_servers SET ${sets.join(", ")} WHERE id=?`, params);
+}
+

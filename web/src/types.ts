@@ -189,6 +189,7 @@ export type Overview = {
   brand: string
   repo: string
   servers: Server[]
+  swas_servers?: SwasServer[]
   keepalives: Keepalive[]
   groups: ShiftGroup[]
   dns: DnsState
@@ -479,3 +480,159 @@ export type ProvisionOptions = {
   images: EcsImage[]
   key_pairs: string[]
 }
+
+export type SwasDisk = {
+  disk_id: string
+  disk_name: string
+  disk_type: string
+  category: string
+  size: number
+  device: string
+  status: string
+  creation_time: string
+  remark: string
+}
+
+export type SwasTrafficPackage = {
+  instance_id: string
+  used_bytes: number
+  total_bytes: number
+  remaining_bytes: number
+  overflow_bytes: number
+  used_gb: number
+  total_gb: number
+  remaining_gb: number
+  overflow_gb: number
+}
+
+export type SwasServer = {
+  id: number
+  label: string
+  access_key_id: string
+  access_key_masked: string
+  secret_configured: boolean
+  region_id: string
+  site: SiteType
+  instance_id: string
+  remark: string
+  instance_status: string
+  public_ip: string
+  inner_ip: string
+  plan_id: string
+  plan_type: string
+  cpu: number
+  memory_gb: number
+  disk_size_gb: number
+  bandwidth_mbps: number
+  image_name: string
+  os_type: string
+  expired_time: string
+  business_status: string
+  traffic_used_gb: number
+  traffic_total_gb: number
+  traffic_overflow_gb: number
+  status_checked_at: number
+  traffic_checked_at: number
+  sort_order: number
+  created_at: number
+  billing?: Billing | null
+}
+
+export type SwasInstanceDetail = {
+  instance_id: string
+  instance_name: string
+  region_id: string
+  status: string
+  business_status: string
+  ddos_status: string
+  disable_reason: string
+  charge_type: string
+  plan_id: string
+  plan_type: string
+  public_ip: string
+  inner_ip: string
+  cpu: number
+  memory_gb: number
+  disk_size_gb: number
+  disk_category: string
+  bandwidth_mbps: number
+  flow_gb: number
+  image_id: string
+  image_name: string
+  image_type: string
+  image_version: string
+  os_type: string
+  creation_time: string
+  expired_time: string
+  disks: SwasDisk[]
+  traffic?: SwasTrafficPackage | null
+}
+
+export type SwasFirewallRule = {
+  rule_id: string
+  rule_protocol: string
+  port: string
+  source_cidr_ip: string
+  policy: string
+  remark: string
+}
+
+export type SwasImageItem = {
+  image_id: string
+  image_name: string
+  image_type: string
+  platform: string
+  description: string
+}
+
+export type SwasSnapshot = {
+  snapshot_id: string
+  snapshot_name: string
+  status: string
+  progress: string
+  source_disk_id: string
+  source_disk_type: string
+  instance_id: string
+  creation_time: string
+  remark: string
+}
+
+export type SwasCustomImage = {
+  image_id: string
+  name: string
+  description: string
+  status: string
+  os_type: string
+  instance_id: string
+  instance_name: string
+  system_snapshot_id: string
+  system_snapshot_name: string
+  data_snapshot_id: string
+  in_share_ecs: boolean
+  in_share_user: boolean
+  required_system_disk_size: number
+  required_data_disk_size: number
+  source_image_name: string
+  creation_time: string
+}
+
+export type SwasShareAccount = {
+  user_id: string
+  shared_time: string
+}
+
+export type SwasPlan = {
+  plan_id: string
+  plan_type: string
+  core: number
+  memory: number
+  disk_size: number
+  disk_type: string
+  bandwidth: number
+  flow: number
+  isp_type: string
+  origin_price: number
+  currency: string
+  support_platform: string[]
+}
+

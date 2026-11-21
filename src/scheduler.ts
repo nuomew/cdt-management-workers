@@ -42,6 +42,7 @@ import { resolveRuntimeEnv } from "./db";
 import * as repo from "./repo";
 import * as dns from "./dns";
 import * as billing from "./billing";
+import * as swas from "./swas";
 import { dailyReport, reconcileAll } from "./shift";
 import { resolveSettings } from "./settings";
 
@@ -107,6 +108,13 @@ export async function runReconcile(env: Env): Promise<void> {
     await dns.reconcile(runtimeEnv, await repo.getSettings(runtimeEnv));
   } catch (e) {
     console.error("DNS reconcile failed", e);
+  }
+
+  // Lightweight application servers: read-only status + traffic package refresh.
+  try {
+    await swas.refreshAllSwasServers(runtimeEnv);
+  } catch (e) {
+    console.error("SWAS refresh failed", e);
   }
 
   // Billing is slow data; refreshDue() applies its own ~30 min TTL and

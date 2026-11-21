@@ -19,6 +19,7 @@ export interface ExecuteResult {
 const REQUIRED_TABLES = [
   "settings",
   "servers",
+  "swas_servers",
   "keepalives",
   "shift_groups",
   "shift_members",
@@ -30,8 +31,8 @@ const REQUIRED_TABLES = [
   "traffic_samples",
 ] as const;
 
-// Consolidated DDL matching migrations/0001_schema.sql so a freshly
-// auto-provisioned D1 database works on first request without manual SQL setup.
+// Consolidated DDL matching migrations/0001_schema.sql + 0003_swas_servers.sql so a
+// freshly auto-provisioned or upgraded D1 database works without manual SQL setup.
 const SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
@@ -55,6 +56,42 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     public_ip           TEXT    NOT NULL DEFAULT '',
     traffic_checked_at  INTEGER NOT NULL DEFAULT 0,
     status_checked_at   INTEGER NOT NULL DEFAULT 0,
+    monthly_cost        REAL,
+    balance_amount      REAL,
+    billing_currency    TEXT    NOT NULL DEFAULT '',
+    billing_cycle       TEXT    NOT NULL DEFAULT '',
+    billing_updated_at  INTEGER NOT NULL DEFAULT 0,
+    billing_error       TEXT    NOT NULL DEFAULT '',
+    created_at          INTEGER NOT NULL DEFAULT 0,
+    sort_order          INTEGER NOT NULL DEFAULT 0
+  )`,
+  `CREATE TABLE IF NOT EXISTS swas_servers (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    label               TEXT    NOT NULL,
+    access_key_id       TEXT    NOT NULL,
+    access_key_secret   TEXT    NOT NULL,
+    region_id           TEXT    NOT NULL,
+    site                TEXT    NOT NULL DEFAULT 'china',
+    instance_id         TEXT    NOT NULL,
+    remark              TEXT    NOT NULL DEFAULT '',
+    instance_status     TEXT    NOT NULL DEFAULT '',
+    public_ip           TEXT    NOT NULL DEFAULT '',
+    inner_ip            TEXT    NOT NULL DEFAULT '',
+    plan_id             TEXT    NOT NULL DEFAULT '',
+    plan_type           TEXT    NOT NULL DEFAULT '',
+    cpu                 INTEGER NOT NULL DEFAULT 0,
+    memory_gb           REAL    NOT NULL DEFAULT 0,
+    disk_size_gb        INTEGER NOT NULL DEFAULT 0,
+    bandwidth_mbps      INTEGER NOT NULL DEFAULT 0,
+    image_name          TEXT    NOT NULL DEFAULT '',
+    os_type             TEXT    NOT NULL DEFAULT '',
+    expired_time        TEXT    NOT NULL DEFAULT '',
+    business_status     TEXT    NOT NULL DEFAULT '',
+    traffic_used_gb     REAL,
+    traffic_total_gb    REAL,
+    traffic_overflow_gb REAL,
+    status_checked_at   INTEGER NOT NULL DEFAULT 0,
+    traffic_checked_at  INTEGER NOT NULL DEFAULT 0,
     monthly_cost        REAL,
     balance_amount      REAL,
     billing_currency    TEXT    NOT NULL DEFAULT '',

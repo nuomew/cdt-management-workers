@@ -25,11 +25,16 @@ import {
   addEvent,
   getServer,
   getSettings,
+  getSwasServer,
   listServers,
+  listSwasServers,
   normalizeSite,
   updateServerBilling,
   updateServerSite,
+  updateSwasBilling,
+  updateSwasSite,
   type ServerView,
+  type SwasServerView,
 } from "./repo";
 import { ev, objServer } from "./messages";
 
@@ -197,7 +202,78 @@ export async function refreshDue(env: Env, nowTs?: number): Promise<number> {
       // Swallowed on purpose (mirrors Python's log.exception + continue).
     }
   }
+  for (const swas of await listSwasServers(env)) {
+    if (!swas.secret_configured) continue;
+    const last = swas.billing_updated_at;
+    const cycle = swas.billing_cycle;
+    if (last && now - last < ttl && (cycle === "" || cycle === currentCycleName)) continue;
+    try {
+      if ((await refreshSwasServer(env, swas.id)) !== null) refreshed += 1;
+    } catch {
+      // Swallowed on purpose.
+    }
+  }
   return refreshed;
+}
+
+/** Fetch one lightweight server's monthly bill + account balance and persist to D1. */
+export async function refreshSwasServer(
+  env: Env,
+  swasId: number,
+  options?: { force?: boolean },
+): Promise<BillingSnapshot | null> {
+  const force = options?.force ?? false;
+  const config = await getSettings(env);
+  if (!enabled(config)) return null;
+
+  const server = await getSwasServer(env, swasId, true);
+  if (server === null) return null;
+
+  const cycle = currentCycle(config);
+  const account: AliyunAccount = {
+    access_key_id: server.access_key_id,
+    access_key_secret: server.access_key_secret ?? "",
+    region_id: server.region_id,
+    site: server.site || "china",
+    instance_id: server.instance_id,
+  };
+  let cost: number | null = null;
+  let balance: number | null = null;
+  let currency = "";
+  let detectedSite = "";
+  const errors: string[] = [];
+
+  try {
+    const bill = await getInstanceBill(env, account, cycle);
+    cost = bill.total;
+    detectedSite = bill.site;
+  } catch (exc) {
+    errors.push(exc instanceof Error ? exc.message : String(exc));
+  }
+
+  try {
+    const wallet = await getAccountBalance(env, account, force);
+    currency = wallet.currency;
+    detectedSite = detectedSite || wallet.site;
+    balance = wallet.amount;
+  } catch (exc) {
+    errors.push(exc instanceof Error ? exc.message : String(exc));
+  }
+
+  const configuredSite = normalizeSite(server.site);
+  if (detectedSite && detectedSite !== configuredSite) {
+    await updateSwasSite(env, swasId, detectedSite);
+  }
+
+  const errorText = errors.join("；");
+  await updateSwasBilling(env, swasId, {
+    monthlyCost: cost,
+    balance,
+    currency,
+    cycle: cost !== null ? cycle : "",
+    error: errorText,
+  });
+  return { monthly_cost: cost, balance, currency, cycle, error: errorText };
 }
 
 /**
@@ -233,7 +309,15 @@ async function markTransition(env: Env, server: ServerView, errorText: string): 
  * show "待更新" instead of presenting them as this month's cost.
  */
 export function summaryOf(
-  server: ServerView,
+  server: Pick<
+    ServerView | SwasServerView,
+    | "billing_cycle"
+    | "monthly_cost"
+    | "balance_amount"
+    | "billing_currency"
+    | "billing_updated_at"
+    | "billing_error"
+  >,
   config?: Record<string, string> | null,
 ): BillingSummary {
   const cycle = server.billing_cycle;

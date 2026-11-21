@@ -55,6 +55,7 @@ import * as notify from "./notify";
 import * as messages from "./messages";
 import * as billing from "./billing";
 import * as aliyun from "./aliyun";
+import * as swas from "./swas";
 import {
   BRAND,
   CSRF_COOKIE,
@@ -946,6 +947,44 @@ app.get("/api/v1/auth/me", async (c) => {
 
 // -- Overview ---------------------------------------------------------------
 
+function swasSummary(
+  item: repo.SwasServerView,
+  config?: Record<string, string> | null,
+): Record<string, unknown> {
+  return {
+    id: item.id,
+    label: item.label,
+    access_key_id: item.access_key_id,
+    access_key_masked: item.access_key_masked ?? "",
+    secret_configured: item.secret_configured,
+    region_id: item.region_id,
+    site: item.site,
+    instance_id: item.instance_id,
+    remark: item.remark,
+    instance_status: item.instance_status,
+    public_ip: item.public_ip,
+    inner_ip: item.inner_ip,
+    plan_id: item.plan_id,
+    plan_type: item.plan_type,
+    cpu: item.cpu,
+    memory_gb: item.memory_gb,
+    disk_size_gb: item.disk_size_gb,
+    bandwidth_mbps: item.bandwidth_mbps,
+    image_name: item.image_name,
+    os_type: item.os_type,
+    expired_time: item.expired_time,
+    business_status: item.business_status,
+    traffic_used_gb: item.traffic_used_gb,
+    traffic_total_gb: item.traffic_total_gb,
+    traffic_overflow_gb: item.traffic_overflow_gb,
+    status_checked_at: item.status_checked_at,
+    traffic_checked_at: item.traffic_checked_at,
+    sort_order: item.sort_order,
+    created_at: item.created_at,
+    billing: billing.summaryOf(item, config),
+  };
+}
+
 app.get("/api/v1/overview", async (c) => {
   await requireAdmin(c);
   const env = c.env;
@@ -956,6 +995,7 @@ app.get("/api/v1/overview", async (c) => {
   const keepalives = await repo.listKeepalives(env);
   const groups = await repo.listGroups(env);
   const servers = await repo.listServers(env);
+  const swasServers = await repo.listSwasServers(env);
   const managed = managedMap(groups, keepalives);
   const books = await dns.recordBooks(env);
   const cards = await dns.booksForCards(env, now.epoch, books);
@@ -972,6 +1012,7 @@ app.get("/api/v1/overview", async (c) => {
     brand: BRAND,
     repo: REPO,
     servers: servers.map((s) => serverSummary(s, managed, cards)),
+    swas_servers: swasServers.map((s) => swasSummary(s, config)),
     keepalives: keepalives.map((item) => ({
       ...item,
       in_window: keepaliveWindow(item as unknown as Keepalive, nowDate, tzName),
@@ -998,6 +1039,7 @@ app.post("/api/v1/reconcile", async (c) => {
   // Python's lock/None protocol, so there is no per-item `results` list
   // and no `busy` flag. The round still runs exactly once per call.
   await reconcileAll(c.env);
+  await swas.refreshAllSwasServers(c.env).catch(() => 0);
   // Manual reconcile also sweeps DNS, same as Python.
   return c.json({
     results: [],
@@ -2329,6 +2371,806 @@ app.post("/api/v1/aliyun/provision/create", async (c) => {
     trade_price: created.trade_price,
     server_id: serverId,
   });
+});
+
+// -- Lightweight Application Server (Aliyun SWAS) -----------------------------
+
+async function loadSwasAccount(
+  env: Env,
+  swasId: number,
+): Promise<{ server: repo.SwasServerView; account: aliyun.AliyunAccount }> {
+  const server = await repo.getSwasServer(env, swasId, true);
+  if (!server) throw httpErr(404, "not_found", "轻量服务器不存在");
+  if (!server.access_key_secret) {
+    throw invalid("这台轻量服务器还没有配置 AccessKey Secret，请先编辑补全");
+  }
+  return { server, account: swas.toAccount(server) };
+}
+
+/**
+ * Resolve Aliyun credentials for SWAS discover / import / provision.
+ * Supports reusing an existing ECS server (`source_server_id`), an existing
+ * SWAS server (`source_swas_id`), or explicit AK/SK in the request payload.
+ */
+async function resolveSwasSourceAccount(
+  env: Env,
+  payload: AnyRow,
+): Promise<{ account: aliyun.AliyunAccount; site: string }> {
+  const sourceServerId = numOf(payload["source_server_id"], 0);
+  const sourceSwasId = numOf(payload["source_swas_id"], 0);
+  let ak = strOf(payload["access_key_id"]).trim();
+  let sk = strOf(payload["access_key_secret"]).trim();
+  let site = strOf(payload["site"]).trim();
+  const regionId = strOf(payload["region_id"]).trim();
+
+  if (sourceSwasId > 0) {
+    const existing = await repo.getSwasServer(env, sourceSwasId, true);
+    if (!existing) throw httpErr(404, "not_found", "所选来源轻量服务器不存在");
+    ak = strOf(existing.access_key_id).trim();
+    sk = strOf(existing.access_key_secret).trim();
+    if (!site) site = repo.normalizeSite(existing.site);
+  } else if (sourceServerId > 0) {
+    const existing = await repo.getServer(env, sourceServerId, true);
+    if (!existing) throw httpErr(404, "not_found", "所选来源服务器不存在");
+    ak = strOf(existing.access_key_id).trim();
+    sk = strOf(existing.access_key_secret).trim();
+    if (!site) site = repo.normalizeSite(existing.site);
+  }
+
+  if (!ak || !sk) {
+    throw invalid("请选择已有服务器账号，或填写完整的 AccessKey ID 与 AccessKey Secret");
+  }
+  if (!regionId) {
+    throw invalid("请选择目标地域");
+  }
+  const normalizedSite = repo.normalizeSite(site);
+  return {
+    site: normalizedSite,
+    account: {
+      access_key_id: ak,
+      access_key_secret: sk,
+      region_id: regionId,
+      site: normalizedSite,
+      instance_id: "",
+    },
+  };
+}
+
+app.get("/api/v1/swas", async (c) => {
+  await requireAdmin(c);
+  const config = await repo.getSettings(c.env);
+  const items = await repo.listSwasServers(c.env);
+  return c.json({ items: items.map((s) => swasSummary(s, config)) });
+});
+
+app.post("/api/v1/swas", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const swasId = numOf(payload["id"], 0);
+
+  // Allow creating a SWAS record by reusing an existing ECS or SWAS account's AK/SK.
+  let ak = strOf(payload["access_key_id"]).trim();
+  let sk = strOf(payload["access_key_secret"]).trim();
+  let site = strOf(payload["site"]).trim();
+  const sourceServerId = numOf(payload["source_server_id"], 0);
+  const sourceSwasId = numOf(payload["source_swas_id"], 0);
+  if (!swasId && (!ak || !sk)) {
+    if (sourceSwasId > 0) {
+      const src = await repo.getSwasServer(c.env, sourceSwasId, true);
+      if (!src) throw httpErr(404, "not_found", "所选来源轻量服务器不存在");
+      ak = src.access_key_id;
+      sk = src.access_key_secret ?? "";
+      if (!site) site = src.site;
+    } else if (sourceServerId > 0) {
+      const src = await repo.getServer(c.env, sourceServerId, true);
+      if (!src) throw httpErr(404, "not_found", "所选来源服务器不存在");
+      ak = src.access_key_id;
+      sk = src.access_key_secret ?? "";
+      if (!site) site = src.site;
+    }
+  }
+
+  let savedId: number;
+  try {
+    savedId = await repo.upsertSwasServer(c.env, {
+      ...payload,
+      access_key_id: ak,
+      access_key_secret: sk,
+      site: site || payload["site"],
+    });
+  } catch (err) {
+    throw invalid(err instanceof Error ? err.message : String(err));
+  }
+
+  // Best-effort initial sync so cards immediately show specs, status, and traffic.
+  await swas.refreshSwasServer(c.env, savedId).catch(() => {});
+  const config = await repo.getSettings(c.env);
+  const saved = await repo.getSwasServer(c.env, savedId);
+  return c.json({ id: savedId, server: saved ? swasSummary(saved, config) : null });
+});
+
+app.post("/api/v1/swas/reorder", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const raw = payload["ids"];
+  if (!Array.isArray(raw)) throw invalid("ids 必须是数字数组");
+  const ids = raw.map((v) => numOf(v, 0)).filter((v) => v > 0);
+  await repo.reorderSwasServers(c.env, ids);
+  return c.json({ ok: true });
+});
+
+app.post("/api/v1/swas/discover", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const { account } = await resolveSwasSourceAccount(c.env, payload);
+  const instances = await swas.listInstances(c.env, account);
+  const ids = instances.map((i) => i.instance_id).filter(Boolean);
+  const trafficMap = ids.length
+    ? await swas.listTrafficPackages(c.env, account, ids).catch(() => new Map())
+    : new Map();
+  return c.json({
+    items: instances.map((inst) => ({
+      ...inst,
+      traffic: trafficMap.get(inst.instance_id) ?? inst.traffic ?? null,
+    })),
+  });
+});
+
+// -- SWAS Provisioning (must come before /:swasId) ----------------------------
+
+app.post("/api/v1/swas/provision/options", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const { account } = await resolveSwasSourceAccount(c.env, payload);
+  const imageTypeRaw = strOf(payload["image_type"]).trim().toLowerCase();
+  const imageType =
+    imageTypeRaw === "app" || imageTypeRaw === "custom" ? imageTypeRaw : "system";
+  const [plans, images] = await Promise.all([
+    swas.listPlans(c.env, account),
+    swas.listImages(c.env, account, imageType),
+  ]);
+  return c.json({
+    region_id: account.region_id,
+    site: account.site,
+    plans,
+    images,
+  });
+});
+
+app.post("/api/v1/swas/provision/price", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const { account } = await resolveSwasSourceAccount(c.env, payload);
+  const planId = strOf(payload["plan_id"]).trim();
+  if (!planId) throw invalid("请先选择套餐");
+  const periodMonths = Math.trunc(numOf(payload["period_months"], 1));
+  const dataDiskSize = Math.max(0, Math.trunc(numOf(payload["data_disk_size"], 0)));
+  if (dataDiskSize > 0 && (dataDiskSize % 20 !== 0 || dataDiskSize > 16380)) {
+    throw invalid("数据盘容量须为 0 或 20 的整数倍（最大 16380 GB）");
+  }
+  const quote = await swas.describePrice(c.env, account, {
+    planId,
+    periodMonths,
+    dataDiskSize,
+  });
+  return c.json({ quote });
+});
+
+app.post("/api/v1/swas/provision/create", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  if (!boolOf(payload["confirm_pay"])) {
+    throw invalid("请先完成实时询价并勾选扣费确认后再开通轻量服务器");
+  }
+  const { account, site } = await resolveSwasSourceAccount(c.env, payload);
+  const planId = strOf(payload["plan_id"]).trim();
+  const imageId = strOf(payload["image_id"]).trim();
+  const periodMonths = Math.trunc(numOf(payload["period_months"], 1));
+  const dataDiskSize = Math.max(0, Math.trunc(numOf(payload["data_disk_size"], 0)));
+  const autoRenew = boolOf(payload["auto_renew"]);
+  const autoRenewPeriod = Math.trunc(numOf(payload["auto_renew_period"], 1));
+  const addToPanel = payload["add_to_panel"] === undefined ? true : boolOf(payload["add_to_panel"]);
+  const panelLabel = strOf(payload["panel_label"]).trim();
+  const clientToken = strOf(payload["client_token"]).trim();
+
+  if (!planId) throw invalid("请选择轻量服务器套餐");
+  if (!imageId) throw invalid("请选择操作系统或应用镜像");
+
+  const created = await swas.createInstances(c.env, account, {
+    planId,
+    imageId,
+    periodMonths,
+    dataDiskSize,
+    autoRenew,
+    autoRenewPeriod,
+    clientToken: clientToken || undefined,
+  });
+  const newInstanceId = created.instance_ids[0] ?? "";
+
+  let swasId = 0;
+  if (addToPanel && newInstanceId) {
+    swasId = await repo.upsertSwasServer(c.env, {
+      label: panelLabel || `轻量-${newInstanceId.slice(-6)}`,
+      access_key_id: account.access_key_id,
+      access_key_secret: account.access_key_secret,
+      region_id: account.region_id,
+      site,
+      instance_id: newInstanceId,
+      remark: `${planId} · 包年包月 ${periodMonths} 个月`,
+    });
+    await swas.refreshSwasServer(c.env, swasId).catch(() => {});
+  }
+
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("开通新轻量服务器", messages.objServer(panelLabel || newInstanceId)),
+    {
+      detail: `地域 ${account.region_id} · 套餐 ${planId} · ${periodMonths} 个月 · 实例 ${newInstanceId || "—"}`,
+      level: "info",
+    },
+  );
+  return c.json({
+    ok: true,
+    instance_id: newInstanceId,
+    instance_ids: created.instance_ids,
+    request_id: created.request_id,
+    swas_id: swasId,
+  });
+});
+
+// -- Single SWAS instance routes ----------------------------------------------
+
+app.delete("/api/v1/swas/:swasId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const existing = await repo.getSwasServer(c.env, swasId);
+  if (!existing) throw httpErr(404, "not_found", "轻量服务器不存在");
+  await repo.deleteSwasServer(c.env, swasId);
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("移除轻量服务器", messages.objServer(existing.label)),
+    {
+      detail: `仅从面板移除（${existing.instance_id}），云端包年包月实例不受影响`,
+      level: "info",
+    },
+  );
+  return c.json({ ok: true });
+});
+
+app.post("/api/v1/swas/:swasId/refresh", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const detail = await swas.refreshSwasServer(c.env, swasId);
+  const config = await repo.getSettings(c.env);
+  const updated = await repo.getSwasServer(c.env, swasId);
+  return c.json({
+    ok: true,
+    detail,
+    server: updated ? swasSummary(updated, config) : null,
+  });
+});
+
+app.post("/api/v1/swas/:swasId/billing", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const snap = await billing.refreshSwasServer(c.env, swasId, { force: true });
+  if (snap === null) throw httpErr(404, "not_found", "轻量服务器不存在或费用查询已关闭");
+  return c.json({ ok: true, billing: snap });
+});
+
+app.post("/api/v1/swas/:swasId/actions/:action", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const action = c.req.param("action").trim().toLowerCase();
+  const payload = await jsonBody(c).catch(() => ({} as AnyRow));
+  const force = boolOf(payload["force"]);
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+
+  if (action === "start") {
+    await swas.startInstance(c.env, account);
+    await repo.updateSwasRuntime(c.env, swasId, { status: "Starting" });
+    await repo.addEvent(c.env, "manual", messages.ev("轻量开机", messages.objServer(server.label)), {
+      detail: `已提交开机指令（${account.instance_id}）`,
+    });
+  } else if (action === "stop") {
+    await swas.stopInstance(c.env, account, force);
+    await repo.updateSwasRuntime(c.env, swasId, { status: "Stopping" });
+    await repo.addEvent(c.env, "manual", messages.ev("轻量关机", messages.objServer(server.label)), {
+      detail: `已提交${force ? "强制" : ""}关机指令（${account.instance_id}）`,
+    });
+  } else if (action === "reboot") {
+    await swas.rebootInstance(c.env, account, force);
+    await repo.addEvent(c.env, "manual", messages.ev("轻量重启", messages.objServer(server.label)), {
+      detail: `已提交${force ? "强制" : ""}重启指令（${account.instance_id}）`,
+    });
+  } else {
+    throw invalid("不支持的电源操作，仅支持 start / stop / reboot");
+  }
+  await swas.refreshSwasServer(c.env, swasId).catch(() => {});
+  return c.json({ ok: true });
+});
+
+app.get("/api/v1/swas/:swasId/detail", async (c) => {
+  await requireAdmin(c);
+  const swasId = paramInt(c, "swasId");
+  const detail = await swas.refreshSwasServer(c.env, swasId);
+  return c.json({ detail });
+});
+
+app.post("/api/v1/swas/:swasId/vnc", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  const vncUrl = await swas.describeInstanceVncUrl(c.env, account);
+  const consoleUrl = `https://swasnext.console.aliyun.com/servers/${encodeURIComponent(account.region_id)}/${encodeURIComponent(account.instance_id)}/overview`;
+  return c.json({
+    vnc_url: vncUrl,
+    console_url: consoleUrl,
+    instance_id: account.instance_id,
+    os_type: server.os_type,
+    image_name: server.image_name,
+  });
+});
+
+app.post("/api/v1/swas/:swasId/vnc-password", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  const payload = await jsonBody(c);
+  const vncPassword = strOf(payload["vnc_password"]).trim();
+  if (!/^[A-Za-z0-9]{6}$/.test(vncPassword)) {
+    throw invalid("VNC 密码必须是 6 位英文字母或数字组合");
+  }
+  await swas.modifyInstanceVncPassword(c.env, account, vncPassword);
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("修改轻量 VNC 密码", messages.objServer(server.label)),
+    { detail: `已更新 VNC 连接密码（${account.instance_id}）`, level: "info" },
+  );
+  return c.json({ ok: true });
+});
+
+app.post("/api/v1/swas/:swasId/workbench", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const { account } = await loadSwasAccount(c.env, swasId);
+  const payload = await jsonBody(c).catch(() => ({} as AnyRow));
+  const redirectUrl = await swas.loginInstanceWorkbench(c.env, account, {
+    username: strOf(payload["username"]).trim() || undefined,
+    password: strOf(payload["password"]) || undefined,
+    port: numOf(payload["port"], 0) || undefined,
+  });
+  return c.json({ redirect_url: redirectUrl });
+});
+
+app.get("/api/v1/swas/:swasId/account-id", async (c) => {
+  await requireAdmin(c);
+  const swasId = paramInt(c, "swasId");
+  const { account } = await loadSwasAccount(c.env, swasId);
+  const accountId = await aliyun.getCallerAccountId(c.env, account);
+  return c.json({ account_id: accountId });
+});
+
+// -- SWAS Reset System & Images/KeyPairs --------------------------------------
+
+app.get("/api/v1/swas/:swasId/images", async (c) => {
+  await requireAdmin(c);
+  const swasId = paramInt(c, "swasId");
+  const { account } = await loadSwasAccount(c.env, swasId);
+  const typeRaw = (c.req.query("type") ?? "").trim().toLowerCase();
+  const imageType =
+    typeRaw === "system" || typeRaw === "app" || typeRaw === "custom" ? typeRaw : undefined;
+  const images = await swas.listImages(c.env, account, imageType);
+  return c.json({ images });
+});
+
+app.get("/api/v1/swas/:swasId/keypairs", async (c) => {
+  await requireAdmin(c);
+  const swasId = paramInt(c, "swasId");
+  const { account } = await loadSwasAccount(c.env, swasId);
+  const keyPairs = await swas.listKeyPairs(c.env, account);
+  return c.json({ key_pairs: keyPairs });
+});
+
+app.post("/api/v1/swas/:swasId/reset", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  const payload = await jsonBody(c);
+  const imageId = strOf(payload["image_id"]).trim();
+  const password = strOf(payload["password"]);
+  const keyPairName = strOf(payload["key_pair_name"]).trim();
+  const clientToken = strOf(payload["client_token"]).trim();
+  if (password) validateEcsPassword(password);
+
+  await swas.resetSystem(c.env, account, {
+    imageId: imageId || undefined,
+    password: password || undefined,
+    keyPairName: keyPairName || undefined,
+    clientToken: clientToken || undefined,
+  });
+  await repo.updateSwasRuntime(c.env, swasId, { status: "Resetting" });
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("轻量重置系统", messages.objServer(server.label)),
+    {
+      detail: `${imageId ? `更换镜像 ${imageId}` : "重置当前系统"}（${account.instance_id}）`,
+      level: "warn",
+    },
+  );
+  await swas.refreshSwasServer(c.env, swasId).catch(() => {});
+  return c.json({ ok: true });
+});
+
+// -- SWAS Snapshots & Custom Images (with Cross-Account & ECS Sharing) --------
+
+app.get("/api/v1/swas/:swasId/snapshots", async (c) => {
+  await requireAdmin(c);
+  const swasId = paramInt(c, "swasId");
+  const { account } = await loadSwasAccount(c.env, swasId);
+  const detail = await swas.getInstanceDetail(c.env, account);
+  const snapshots = await swas.listSnapshots(c.env, account);
+  return c.json({ disks: detail.disks, snapshots });
+});
+
+app.post("/api/v1/swas/:swasId/snapshots", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  const payload = await jsonBody(c);
+  const diskId = strOf(payload["disk_id"]).trim();
+  const snapshotName = strOf(payload["snapshot_name"]).trim();
+  if (!diskId) throw invalid("请选择要创建快照的磁盘");
+  if (snapshotName.length < 2 || snapshotName.length > 50) {
+    throw invalid("快照名称长度须为 2–50 个字符");
+  }
+  const snapshotId = await swas.createSnapshot(c.env, account, { diskId, snapshotName });
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("创建轻量快照", messages.objServer(server.label)),
+    { detail: `快照 ${snapshotName}（${snapshotId}，磁盘 ${diskId}）`, level: "info" },
+  );
+  return c.json({ ok: true, snapshot_id: snapshotId });
+});
+
+app.delete("/api/v1/swas/:swasId/snapshots/:snapshotId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const snapshotId = c.req.param("snapshotId").trim();
+  if (!snapshotId) throw invalid("缺少快照 ID");
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  await swas.deleteSnapshot(c.env, account, snapshotId);
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("删除轻量快照", messages.objServer(server.label)),
+    { detail: `已删除快照 ${snapshotId}`, level: "warn" },
+  );
+  return c.json({ ok: true });
+});
+
+app.get("/api/v1/swas/:swasId/custom-images", async (c) => {
+  await requireAdmin(c);
+  const swasId = paramInt(c, "swasId");
+  const { account } = await loadSwasAccount(c.env, swasId);
+  const images = await swas.listCustomImages(c.env, account);
+  return c.json({ images });
+});
+
+app.post("/api/v1/swas/:swasId/custom-images", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  const payload = await jsonBody(c);
+  const imageName = strOf(payload["image_name"]).trim();
+  const systemSnapshotId = strOf(payload["system_snapshot_id"]).trim();
+  const dataSnapshotId = strOf(payload["data_snapshot_id"]).trim();
+  const description = strOf(payload["description"]).trim().slice(0, 256);
+  if (imageName.length < 2 || imageName.length > 128) {
+    throw invalid("自定义镜像名称长度须为 2–128 个字符");
+  }
+  if (!systemSnapshotId) throw invalid("请选择一个系统盘快照作为镜像来源");
+  const imageId = await swas.createCustomImage(c.env, account, {
+    imageName,
+    systemSnapshotId,
+    dataSnapshotId: dataSnapshotId || undefined,
+    description: description || undefined,
+  });
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("创建轻量自定义镜像", messages.objServer(server.label)),
+    { detail: `镜像 ${imageName}（${imageId}，基于快照 ${systemSnapshotId}）`, level: "info" },
+  );
+  return c.json({ ok: true, image_id: imageId });
+});
+
+app.delete("/api/v1/swas/:swasId/custom-images/:imageId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const imageId = c.req.param("imageId").trim();
+  if (!imageId) throw invalid("缺少自定义镜像 ID");
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  await swas.deleteCustomImage(c.env, account, imageId);
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("删除轻量自定义镜像", messages.objServer(server.label)),
+    { detail: `已删除自定义镜像 ${imageId}`, level: "warn" },
+  );
+  return c.json({ ok: true });
+});
+
+app.post("/api/v1/swas/:swasId/custom-images/:imageId/share-ecs", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const imageId = c.req.param("imageId").trim();
+  const payload = await jsonBody(c);
+  const share = boolOf(payload["share"]);
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  await swas.modifyImageShareStatus(c.env, account, imageId, share);
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev(share ? "镜像共享到 ECS" : "取消镜像共享到 ECS", messages.objServer(server.label)),
+    { detail: `自定义镜像 ${imageId}`, level: "info" },
+  );
+  return c.json({ ok: true, in_share_ecs: share });
+});
+
+app.get("/api/v1/swas/:swasId/custom-images/:imageId/shares", async (c) => {
+  await requireAdmin(c);
+  const swasId = paramInt(c, "swasId");
+  const imageId = c.req.param("imageId").trim();
+  const { account } = await loadSwasAccount(c.env, swasId);
+  const accounts = await swas.listCustomImageShareAccounts(c.env, account, imageId);
+  return c.json({ accounts });
+});
+
+app.post("/api/v1/swas/:swasId/custom-images/:imageId/shares", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const imageId = c.req.param("imageId").trim();
+  const payload = await jsonBody(c);
+  const action = strOf(payload["action"]).trim().toLowerCase() === "remove" ? "remove" : "add";
+  let targetAccountId = strOf(payload["account_id"]).trim();
+  const targetSwasId = numOf(payload["target_swas_id"], 0);
+  const targetServerId = numOf(payload["target_server_id"], 0);
+
+  if (!targetAccountId && targetSwasId > 0) {
+    const target = await loadSwasAccount(c.env, targetSwasId);
+    targetAccountId = await aliyun.getCallerAccountId(c.env, target.account);
+  } else if (!targetAccountId && targetServerId > 0) {
+    const target = await loadServerAccount(c.env, targetServerId);
+    targetAccountId = await aliyun.getCallerAccountId(c.env, target.account);
+  }
+  if (!/^\d{6,24}$/.test(targetAccountId)) {
+    throw invalid("请填写有效的阿里云主账号 UID（纯数字）或选择目标服务器");
+  }
+
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  await swas.updateCustomImageShareAccounts(c.env, account, imageId, action, [targetAccountId]);
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev(action === "add" ? "轻量镜像跨账号共享" : "取消轻量镜像共享", messages.objServer(server.label)),
+    { detail: `镜像 ${imageId} ${action === "add" ? "→ 共享给" : "× 移除"} 账号 ${targetAccountId}` },
+  );
+  const accounts = await swas.listCustomImageShareAccounts(c.env, account, imageId);
+  return c.json({ ok: true, account_id: targetAccountId, accounts });
+});
+
+// -- SWAS Attribute (Rename / Password) & Firewall ----------------------------
+
+app.post("/api/v1/swas/:swasId/attribute", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  const payload = await jsonBody(c);
+  const instanceName = strOf(payload["instance_name"]).trim();
+  const password = strOf(payload["password"]);
+  const syncLabel = boolOf(payload["sync_label"]);
+  const rebootAfter = boolOf(payload["reboot_after"]);
+
+  if (!instanceName && !password) {
+    throw invalid("请至少填写实例名称或新密码");
+  }
+  if (instanceName && (instanceName.length < 2 || instanceName.length > 50)) {
+    throw invalid("轻量实例名称长度须为 2–50 个字符");
+  }
+  if (password) validateEcsPassword(password);
+
+  await swas.updateInstanceAttribute(c.env, account, {
+    instanceName: instanceName || undefined,
+    password: password || undefined,
+  });
+
+  if (instanceName && syncLabel) {
+    await repo.upsertSwasServer(c.env, {
+      id: swasId,
+      label: instanceName,
+      region_id: server.region_id,
+      site: server.site,
+      instance_id: server.instance_id,
+      remark: server.remark,
+    });
+  }
+
+  let rebooted = false;
+  if (password && rebootAfter) {
+    const detail = await swas.getInstanceDetail(c.env, account).catch(() => null);
+    if (detail?.status === "Running") {
+      await swas.rebootInstance(c.env, account, false);
+      rebooted = true;
+    }
+  }
+
+  const changed: string[] = [];
+  if (instanceName) changed.push(`实例名改为 ${instanceName}`);
+  if (password) changed.push(rebooted ? "已重置登录密码并触发重启" : "已重置登录密码（需重启生效）");
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("修改轻量实例属性", messages.objServer(instanceName && syncLabel ? instanceName : server.label)),
+    { detail: `${changed.join("，")}（${account.instance_id}）`, level: "info" },
+  );
+  return c.json({ ok: true, rebooted });
+});
+
+app.get("/api/v1/swas/:swasId/firewall", async (c) => {
+  await requireAdmin(c);
+  const swasId = paramInt(c, "swasId");
+  const { account } = await loadSwasAccount(c.env, swasId);
+  const rules = await swas.listFirewallRules(c.env, account);
+  return c.json({ rules });
+});
+
+app.post("/api/v1/swas/:swasId/firewall", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  const payload = await jsonBody(c);
+  const protoRaw = strOf(payload["rule_protocol"]).trim().toUpperCase();
+  if (protoRaw !== "TCP" && protoRaw !== "UDP" && protoRaw !== "TCP+UDP" && protoRaw !== "ICMP") {
+    throw invalid("轻量防火墙协议仅支持 TCP、UDP、TCP+UDP 或 ICMP");
+  }
+  const port = protoRaw === "ICMP" ? "-1/-1" : normalizePortRange("TCP", strOf(payload["port"]));
+  const cidrRaw = strOf(payload["source_cidr_ip"]).trim();
+  const sourceCidrIp = cidrRaw ? validateCidrIp(cidrRaw) : "0.0.0.0/0";
+  const remark = strOf(payload["remark"]).trim().slice(0, 128);
+
+  const ruleId = await swas.createFirewallRule(c.env, account, {
+    ruleProtocol: protoRaw,
+    port,
+    sourceCidrIp,
+    remark: remark || undefined,
+  });
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("添加轻量防火墙规则", messages.objServer(server.label)),
+    { detail: `${protoRaw} ${port} (${sourceCidrIp})${remark ? ` · ${remark}` : ""}` },
+  );
+  const rules = await swas.listFirewallRules(c.env, account);
+  return c.json({ ok: true, rule_id: ruleId, rules });
+});
+
+app.post("/api/v1/swas/:swasId/firewall/:ruleId/toggle", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const ruleId = c.req.param("ruleId").trim();
+  const payload = await jsonBody(c);
+  const enable = boolOf(payload["enable"]);
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  await swas.toggleFirewallRule(c.env, account, ruleId, enable);
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev(enable ? "启用防火墙规则" : "禁用防火墙规则", messages.objServer(server.label)),
+    { detail: `规则 ${ruleId}` },
+  );
+  const rules = await swas.listFirewallRules(c.env, account);
+  return c.json({ ok: true, rules });
+});
+
+app.delete("/api/v1/swas/:swasId/firewall/:ruleId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const ruleId = c.req.param("ruleId").trim();
+  if (!ruleId) throw invalid("缺少防火墙规则 ID");
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  await swas.deleteFirewallRule(c.env, account, ruleId);
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("删除轻量防火墙规则", messages.objServer(server.label)),
+    { detail: `已移除防火墙规则 ${ruleId}`, level: "warn" },
+  );
+  const rules = await swas.listFirewallRules(c.env, account);
+  return c.json({ ok: true, rules });
+});
+
+// -- SWAS Renewal (PrePaid) ---------------------------------------------------
+
+app.post("/api/v1/swas/:swasId/renewal/price", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const { account } = await loadSwasAccount(c.env, swasId);
+  const payload = await jsonBody(c);
+  const periodMonths = Math.trunc(numOf(payload["period_months"], 1));
+  const detail = await swas.getInstanceDetail(c.env, account);
+  const dataDiskSize = detail.disks
+    .filter((d) => d.disk_type.toLowerCase() === "data")
+    .reduce((acc, d) => acc + d.size, 0);
+  const quote = await swas.describePrice(c.env, account, {
+    planId: detail.plan_id,
+    periodMonths,
+    dataDiskSize,
+    instanceId: account.instance_id,
+  });
+  return c.json({
+    quote,
+    expired_time: detail.expired_time,
+    plan_id: detail.plan_id,
+  });
+});
+
+app.post("/api/v1/swas/:swasId/renewal/pay", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  const payload = await jsonBody(c);
+  if (!boolOf(payload["confirm_pay"])) {
+    throw invalid("请先查询续费价格并勾选确认扣费后再提交");
+  }
+  const periodMonths = Math.trunc(numOf(payload["period_months"], 1));
+  const clientToken = strOf(payload["client_token"]).trim();
+  const res = await swas.renewInstance(c.env, account, {
+    periodMonths,
+    clientToken: clientToken || undefined,
+  });
+  await swas.refreshSwasServer(c.env, swasId).catch(() => {});
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("轻量服务器续费", messages.objServer(server.label)),
+    {
+      detail: `已续费 ${periodMonths} 个月（${account.instance_id}）${res.expired_time ? `，新到期时间 ${res.expired_time}` : ""}`,
+      level: "info",
+    },
+  );
+  return c.json({ ok: true, ...res });
 });
 
 // -- Single keepalive ---------------------------------------------------------

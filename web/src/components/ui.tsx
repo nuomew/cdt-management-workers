@@ -30,6 +30,10 @@ const STATUS_TONE: Record<string, Tone> = {
   Starting: 'amber',
   Stopping: 'amber',
   Pending: 'amber',
+  Resetting: 'amber',
+  Rebuilding: 'amber',
+  Upgrading: 'amber',
+  Disabled: 'red',
   Unknown: 'gray',
 }
 
@@ -43,6 +47,10 @@ export const STATUS_LABEL: Record<string, string> = {
   Starting: '启动中',
   Stopping: '停止中',
   Pending: '创建中',
+  Resetting: '重置中',
+  Rebuilding: '重建中',
+  Upgrading: '变配中',
+  Disabled: '已过期/停服',
   Unknown: '未知',
 }
 

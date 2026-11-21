@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Activity,
   AlertTriangle,
+  Cloud,
   Gauge,
   Globe2,
   HeartPulse,
@@ -14,12 +15,30 @@ import {
   Zap,
 } from 'lucide-react'
 import { APIError, SLOW_TIMEOUT_MS, api, del, post } from './api'
-import type { InitStatus, Keepalive, Managed, Overview, Server, Settings, ShiftGroup } from './types'
+import type {
+  InitStatus,
+  Keepalive,
+  Managed,
+  Overview,
+  Server,
+  Settings,
+  ShiftGroup,
+  SwasServer,
+} from './types'
 import Auth from './components/Auth'
 import DashboardView from './components/DashboardView'
 import KeepaliveView from './components/KeepaliveView'
 import KeepaliveDialog from './components/KeepaliveDialog'
 import ServersView from './components/ServersView'
+import SwasView from './components/SwasView'
+import SwasDialog from './components/SwasDialog'
+import {
+  SwasDetailModal,
+  SwasImagesModal,
+  SwasResetModal,
+  SwasVncOverlay,
+} from './components/SwasManageModals'
+import { SwasOpsModal, SwasProvisionModal, SwasRenewModal } from './components/SwasOpsModals'
 import ShiftView from './components/ShiftView'
 import ServerDialog from './components/ServerDialog'
 import {
@@ -39,7 +58,7 @@ import { ownerLabel } from './owners'
 import { syncClock } from './time'
 
 type Phase = 'loading' | 'setup' | 'login' | 'ready' | 'fatal'
-type View = 'dashboard' | 'keepalive' | 'shift' | 'servers' | 'dns'
+type View = 'dashboard' | 'keepalive' | 'shift' | 'servers' | 'swas' | 'dns'
 type Toast = { id: number; tone: 'success' | 'error' | 'info'; message: string }
 
 /** 删除这类不可撤销的操作，统一走应用内二次确认（window.confirm 在桌面壳里可能被吞掉） */
@@ -73,7 +92,10 @@ const NAV_SECTIONS: NavSection[] = [
     title: '概览',
     key: 'dashboard',
     icon: Gauge,
-    children: [{ key: 'servers', label: '服务器', icon: ServerIcon }],
+    children: [
+      { key: 'servers', label: '服务器', icon: ServerIcon },
+      { key: 'swas', label: '轻量服务器', icon: Cloud },
+    ],
   },
   {
     title: '保活',
@@ -93,6 +115,7 @@ const NAV_SECTIONS: NavSection[] = [
 
 function navCount(key: View, overview: Overview): number {
   if (key === 'servers') return overview.servers.length
+  if (key === 'swas') return overview.swas_servers?.length ?? 0
   if (key === 'keepalive') return overview.keepalives.length
   if (key === 'shift') return overview.groups.length
   return 0
@@ -131,6 +154,19 @@ export default function App() {
   const [renewServer, setRenewServer] = useState<Server | null>(null)
   const [opsServer, setOpsServer] = useState<Server | null>(null)
   const [provisionOpen, setProvisionOpen] = useState(false)
+  const [busySwas, setBusySwas] = useState<number | null>(null)
+  const [billingSwas, setBillingSwas] = useState<number | null>(null)
+  const [swasDialog, setSwasDialog] = useState<{ open: boolean; server: SwasServer | null }>({
+    open: false,
+    server: null,
+  })
+  const [detailSwas, setDetailSwas] = useState<SwasServer | null>(null)
+  const [vncSwas, setVncSwas] = useState<SwasServer | null>(null)
+  const [resetSwas, setResetSwas] = useState<SwasServer | null>(null)
+  const [imagesSwas, setImagesSwas] = useState<SwasServer | null>(null)
+  const [renewSwas, setRenewSwas] = useState<SwasServer | null>(null)
+  const [opsSwas, setOpsSwas] = useState<SwasServer | null>(null)
+  const [swasProvisionOpen, setSwasProvisionOpen] = useState(false)
   const [groupDialog, setGroupDialog] = useState<{ open: boolean; group: ShiftGroup | null }>({
     open: false,
     group: null,
@@ -376,6 +412,95 @@ export default function App() {
         await post(`/api/v1/servers/${server.id}/reboot`, { force: false })
         await loadAll()
         toast('已下发重启指令', 'success')
+      },
+    })
+  }
+
+  async function swasAction(swasId: number, action: 'start' | 'stop') {
+    setBusySwas(swasId)
+    try {
+      await post(`/api/v1/swas/${swasId}/actions/${action}`, {}, SLOW_TIMEOUT_MS)
+      await loadAll()
+      toast(
+        action === 'start' ? '已下发轻量开机指令' : '已下发轻量关机指令',
+        'success',
+      )
+    } catch (error) {
+      toast(error instanceof Error ? error.message : '操作失败', 'error')
+    } finally {
+      setBusySwas(null)
+    }
+  }
+
+  async function reorderSwas(orderedIds: number[]) {
+    try {
+      await post('/api/v1/swas/reorder', { ids: orderedIds })
+      await loadAll()
+    } catch (error) {
+      toast(error instanceof Error ? error.message : '排序保存失败', 'error')
+    }
+  }
+
+  async function refreshSwas(swasId: number) {
+    setBusySwas(swasId)
+    try {
+      await post(`/api/v1/swas/${swasId}/refresh`, undefined, SLOW_TIMEOUT_MS)
+      await loadAll()
+      toast('轻量服务器状态与流量包已刷新', 'success')
+    } catch (error) {
+      toast(error instanceof Error ? error.message : '刷新失败', 'error')
+    } finally {
+      setBusySwas(null)
+    }
+  }
+
+  async function swasBilling(server: SwasServer) {
+    setBillingSwas(server.id)
+    try {
+      const result = await post<{ billing?: { error?: string } }>(
+        `/api/v1/swas/${server.id}/billing`,
+        undefined,
+        SLOW_TIMEOUT_MS,
+      )
+      await loadAll()
+      if (result?.billing?.error) {
+        toast(`费用已刷新，但${result.billing.error}`, 'info')
+      } else {
+        toast('轻量服务器费用已更新', 'success')
+      }
+    } catch (error) {
+      toast(error instanceof Error ? error.message : '费用查询失败', 'error')
+    } finally {
+      setBillingSwas(null)
+    }
+  }
+
+  function deleteSwas(server: SwasServer) {
+    setConfirmBox({
+      title: '移除轻量服务器',
+      message: `确定从面板移除「${server.label || server.instance_id}」？`,
+      hint: '仅删除本面板保存的账号配置与密钥；阿里云上的包年包月轻量实例本身不受影响，不会被关机或销毁。',
+      confirmText: '从面板移除',
+      failText: '移除失败',
+      run: async () => {
+        await del(`/api/v1/swas/${server.id}`)
+        await loadAll()
+        toast('已从面板移除轻量服务器', 'success')
+      },
+    })
+  }
+
+  function rebootSwas(server: SwasServer) {
+    setConfirmBox({
+      title: '重启轻量服务器',
+      message: `确定要重启「${server.label || server.instance_id}」？`,
+      hint: '重启期间轻量实例会短暂中断连接，请确认已保存重要数据。',
+      confirmText: '确认重启',
+      failText: '重启失败',
+      run: async () => {
+        await post(`/api/v1/swas/${server.id}/actions/reboot`, { force: false }, SLOW_TIMEOUT_MS)
+        await loadAll()
+        toast('已下发轻量重启指令', 'success')
       },
     })
   }
@@ -796,6 +921,29 @@ export default function App() {
           />
         )}
 
+        {view === 'swas' && (
+          <SwasView
+            servers={overview.swas_servers ?? []}
+            busyId={busySwas}
+            billingId={billingSwas}
+            onAdd={() => setSwasDialog({ open: true, server: null })}
+            onProvision={() => setSwasProvisionOpen(true)}
+            onEdit={(server) => setSwasDialog({ open: true, server })}
+            onDelete={deleteSwas}
+            onRefresh={(server) => refreshSwas(server.id)}
+            onAction={(server, action) => swasAction(server.id, action)}
+            onReboot={rebootSwas}
+            onDetail={setDetailSwas}
+            onVnc={setVncSwas}
+            onReset={setResetSwas}
+            onImages={setImagesSwas}
+            onRenew={setRenewSwas}
+            onOps={setOpsSwas}
+            onBilling={swasBilling}
+            onReorder={reorderSwas}
+          />
+        )}
+
         {view === 'dns' && (
           <DNSView
             dns={overview.dns}
@@ -921,6 +1069,90 @@ export default function App() {
           onClose={() => setReinstallServer(null)}
           onCompleted={() => {
             void refreshAfterSave('系统重装完成，实例已重新启动')
+          }}
+        />
+      )}
+
+      {swasDialog.open && (
+        <SwasDialog
+          server={swasDialog.server}
+          ecsServers={overview.servers}
+          swasServers={overview.swas_servers ?? []}
+          onClose={() => setSwasDialog({ open: false, server: null })}
+          onSaved={(message) => {
+            setSwasDialog({ open: false, server: null })
+            void refreshAfterSave(message)
+          }}
+        />
+      )}
+
+      {detailSwas && (
+        <SwasDetailModal
+          server={detailSwas}
+          onClose={() => setDetailSwas(null)}
+          onOpenVnc={(srv) => setVncSwas(srv)}
+          onOpenReset={(srv) => setResetSwas(srv)}
+          onOpenImages={(srv) => setImagesSwas(srv)}
+          onOpenRenew={(srv) => setRenewSwas(srv)}
+          onOpenOps={(srv) => setOpsSwas(srv)}
+        />
+      )}
+
+      {imagesSwas && (
+        <SwasImagesModal
+          server={imagesSwas}
+          ecsServers={overview.servers}
+          swasServers={overview.swas_servers ?? []}
+          onClose={() => setImagesSwas(null)}
+          onToast={toast}
+        />
+      )}
+
+      {renewSwas && (
+        <SwasRenewModal
+          server={renewSwas}
+          onClose={() => setRenewSwas(null)}
+          onToast={toast}
+          onUpdated={() => void loadAll()}
+        />
+      )}
+
+      {opsSwas && (
+        <SwasOpsModal
+          server={opsSwas}
+          onClose={() => setOpsSwas(null)}
+          onToast={toast}
+          onUpdated={() => void loadAll()}
+        />
+      )}
+
+      {swasProvisionOpen && (
+        <SwasProvisionModal
+          ecsServers={overview.servers}
+          swasServers={overview.swas_servers ?? []}
+          onClose={() => setSwasProvisionOpen(false)}
+          onProvisioned={(message) => {
+            setSwasProvisionOpen(false)
+            void refreshAfterSave(message)
+          }}
+        />
+      )}
+
+      {vncSwas && (
+        <SwasVncOverlay
+          server={vncSwas}
+          onClose={() => setVncSwas(null)}
+          onToast={toast}
+        />
+      )}
+
+      {resetSwas && (
+        <SwasResetModal
+          server={resetSwas}
+          onClose={() => setResetSwas(null)}
+          onCompleted={(message) => {
+            setResetSwas(null)
+            void refreshAfterSave(message)
           }}
         />
       )}
