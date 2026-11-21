@@ -289,7 +289,9 @@ export function SwasDetailModal({
                     ? `${traffic.used_gb.toFixed(2)} / ${traffic.total_gb.toFixed(0)} GiB`
                     : detail.flow_gb > 0
                       ? `套餐含 ${detail.flow_gb} GB/月`
-                      : '不限流量 / 无流量包'}
+                      : detail.bandwidth_mbps > 0
+                        ? `${detail.bandwidth_mbps}M无限制`
+                        : '不限流量 / 无流量包'}
                 </span>
               </div>
               {traffic && traffic.total_gb > 0 && (

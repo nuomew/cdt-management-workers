@@ -115,6 +115,7 @@ export interface PublicNodeItem {
   today_gb: number;
   health: HealthLevel;
   spec_summary: string;
+  bandwidth_mbps?: number;
 }
 
 export interface PublicHomePayload {
@@ -164,6 +165,7 @@ export interface PublicHomePayload {
     quota_gb: number;
     percent: number;
     status: string;
+    bandwidth_mbps?: number;
   }[];
 }
 
@@ -186,6 +188,7 @@ export interface AdminNodeMetric {
   health: HealthLevel;
   spec_summary: string;
   expired_time: string;
+  bandwidth_mbps?: number;
 }
 
 export interface AdminDashboardPayload {
@@ -212,6 +215,7 @@ export interface AdminDashboardPayload {
     today_gb: number;
     percent: number;
     status: string;
+    bandwidth_mbps?: number;
   }[];
 }
 
@@ -453,6 +457,7 @@ export async function buildPublicHomePayload(env: Env): Promise<PublicHomePayloa
       today_gb: 0,
       health: h,
       spec_summary: buildSwasSpec(s) || "轻量应用服务器",
+      bandwidth_mbps: s.bandwidth_mbps || 0,
     };
   });
 
@@ -468,6 +473,7 @@ export async function buildPublicHomePayload(env: Env): Promise<PublicHomePayloa
       quota_gb: n.quota_gb,
       percent: n.percent,
       status: n.status,
+      ...(n.bandwidth_mbps ? { bandwidth_mbps: n.bandwidth_mbps } : {}),
     }));
 
   return {
@@ -620,6 +626,7 @@ export async function buildAdminDashboardPayload(
       health: h,
       spec_summary: buildSwasSpec(s) || "SWAS",
       expired_time: s.expired_time || "",
+      bandwidth_mbps: s.bandwidth_mbps || 0,
     };
   });
 
@@ -670,6 +677,7 @@ export async function buildAdminDashboardPayload(
       today_gb: n.today_gb,
       percent: n.percent,
       status: n.status,
+      ...(n.bandwidth_mbps ? { bandwidth_mbps: n.bandwidth_mbps } : {}),
     }));
 
   return {

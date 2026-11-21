@@ -681,6 +681,7 @@ export type PublicNodeItem = {
   today_gb: number
   health: TelemetryHealth
   spec_summary: string
+  bandwidth_mbps?: number
 }
 
 export type PublicHomeSummary = {
@@ -732,6 +733,7 @@ export type PublicHomePayload = {
     quota_gb: number
     percent: number
     status: string
+    bandwidth_mbps?: number
   }[]
 }
 
@@ -754,6 +756,7 @@ export type AdminNodeMetric = {
   health: TelemetryHealth
   spec_summary: string
   expired_time: string
+  bandwidth_mbps?: number
 }
 
 export type AdminDashboardPayload = {
@@ -785,6 +788,7 @@ export type AdminDashboardPayload = {
     today_gb: number
     percent: number
     status: string
+    bandwidth_mbps?: number
   }[]
 }
 

@@ -282,9 +282,11 @@ export default function SwasView({
                   />
                 ) : (
                   <div style={{ fontSize: 11.5, color: 'var(--muted-soft)' }}>
-                    {usedGb !== null
-                      ? `已用流量 ${usedGb.toFixed(1)} GB（带宽型 / 不限流量包）`
-                      : '点击右上角刷新同步套餐流量包'}
+                    {server.bandwidth_mbps > 0
+                      ? `${server.bandwidth_mbps}M无限制${usedGb && usedGb > 0 ? ` · 已用 ${usedGb.toFixed(1)} GB` : ''}`
+                      : usedGb !== null
+                        ? `不限流量${usedGb > 0 ? ` · 已用 ${usedGb.toFixed(1)} GB` : ''}`
+                        : '点击右上角刷新同步套餐流量包'}
                   </div>
                 )}
 
@@ -515,6 +517,8 @@ function SwasTable({
                       </span>
                       <span className="server-table-muted"> / {server.traffic_total_gb.toFixed(0)} GB</span>
                     </div>
+                  ) : server.bandwidth_mbps > 0 ? (
+                    <span className="server-table-mono">{server.bandwidth_mbps}M无限制</span>
                   ) : (
                     <span className="server-table-muted">—</span>
                   )}

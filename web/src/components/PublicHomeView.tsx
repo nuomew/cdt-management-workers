@@ -31,6 +31,23 @@ function formatGb(gb: number): string {
   return `${gb.toFixed(gb >= 100 ? 1 : 2)} GB`
 }
 
+function unlimitedSwasLabel(bandwidthMbps?: number): string {
+  return bandwidthMbps && bandwidthMbps > 0 ? `${bandwidthMbps}M无限制` : '不限流量'
+}
+
+function unlimitedSwasPoolLabel(nodes: { kind: string; quota_gb: number; bandwidth_mbps?: number }[]): string {
+  const bws = Array.from(
+    new Set(
+      nodes
+        .filter((n) => n.kind === 'swas' && n.quota_gb <= 0 && (n.bandwidth_mbps ?? 0) > 0)
+        .map((n) => n.bandwidth_mbps as number),
+    ),
+  )
+  if (bws.length === 1) return `${bws[0]}M无限制`
+  if (bws.length > 1) return `${bws.sort((a, b) => a - b).join('/')}M无限制`
+  return '不限流量'
+}
+
 function DeltaChip({ pct, prefix }: { pct: number | null; prefix: string }) {
   if (pct === null) {
     return <span className="tele-delta flat">{prefix} 暂无基线</span>
@@ -249,7 +266,9 @@ export default function PublicHomeView({
                             <Cloud size={12} /> 轻量流量包 ({summary.swas_online}/{summary.swas_total})
                           </span>
                           <strong className="mono">
-                            {formatGb(summary.swas_used_gb)} / {formatGb(summary.swas_quota_gb)}
+                            {summary.swas_total > 0 && summary.swas_quota_gb <= 0
+                              ? unlimitedSwasPoolLabel(data.nodes)
+                              : `${formatGb(summary.swas_used_gb)} / ${formatGb(summary.swas_quota_gb)}`}
                           </strong>
                         </div>
                         <div className="tele-split-track">
@@ -340,57 +359,68 @@ export default function PublicHomeView({
                 <div className="card card-pad tele-empty">当前分类下暂无纳管节点</div>
               ) : (
                 <div className="tele-node-grid">
-                  {filteredNodes.map((node, idx) => (
-                    <div className={`card tele-node-card health-${node.health}`} key={`${node.kind}-${node.name}-${idx}`}>
-                      <div className="tele-node-top">
-                        <div className="tele-node-title">
-                          <span className={`tele-kind-chip ${node.kind}`}>
-                            {node.kind === 'ecs' ? 'ECS' : '轻量'}
-                          </span>
-                          <strong title={node.name}>{node.name}</strong>
+                  {filteredNodes.map((node, idx) => {
+                    const unlimitedSwas = node.kind === 'swas' && node.quota_gb <= 0
+                    return (
+                      <div className={`card tele-node-card health-${node.health}`} key={`${node.kind}-${node.name}-${idx}`}>
+                        <div className="tele-node-top">
+                          <div className="tele-node-title">
+                            <span className={`tele-kind-chip ${node.kind}`}>
+                              {node.kind === 'ecs' ? 'ECS' : '轻量'}
+                            </span>
+                            <strong title={node.name}>{node.name}</strong>
+                          </div>
+                          <Badge tone={statusTone(node.status)} pulse={node.status === 'Running'}>
+                            {statusLabel(node.status)}
+                          </Badge>
                         </div>
-                        <Badge tone={statusTone(node.status)} pulse={node.status === 'Running'}>
-                          {statusLabel(node.status)}
-                        </Badge>
-                      </div>
 
-                      <div className="tele-node-meta">
-                        <span>
-                          <MapPin size={11} /> {regionLabel(node.region_id)}
-                        </span>
-                        <span>{node.spec_summary}</span>
-                      </div>
-
-                      <div className="tele-node-meter">
-                        <div className="tele-node-nums">
-                          <strong className="mono">{formatGb(node.used_gb)}</strong>
-                          <span className="mono">
-                            {node.quota_gb > 0 ? `/ ${formatGb(node.quota_gb)} (${node.percent.toFixed(1)}%)` : '无固定配额'}
+                        <div className="tele-node-meta">
+                          <span>
+                            <MapPin size={11} /> {regionLabel(node.region_id)}
                           </span>
+                          <span>{node.spec_summary}</span>
                         </div>
-                        {node.quota_gb > 0 && (
-                          <Meter
-                            used={node.used_gb}
-                            quota={node.quota_gb}
-                            threshold={node.threshold_gb > 0 ? node.threshold_gb : node.quota_gb * 0.9}
-                          />
-                        )}
-                      </div>
 
-                      <div className="tele-node-foot">
-                        <span>
-                          {node.kind === 'ecs' ? (
-                            <>今日 +{formatGb(node.today_gb)}</>
-                          ) : (
-                            <>套餐月流量包</>
+                        <div className="tele-node-meter">
+                          <div className="tele-node-nums">
+                            <strong className="mono">
+                              {unlimitedSwas ? unlimitedSwasLabel(node.bandwidth_mbps) : formatGb(node.used_gb)}
+                            </strong>
+                            <span className="mono">
+                              {node.quota_gb > 0
+                                ? `/ ${formatGb(node.quota_gb)} (${node.percent.toFixed(1)}%)`
+                                : unlimitedSwas
+                                  ? '不限流量'
+                                  : '无固定配额'}
+                            </span>
+                          </div>
+                          {node.quota_gb > 0 && (
+                            <Meter
+                              used={node.used_gb}
+                              quota={node.quota_gb}
+                              threshold={node.threshold_gb > 0 ? node.threshold_gb : node.quota_gb * 0.9}
+                            />
                           )}
-                        </span>
-                        {node.threshold_gb > 0 && (
-                          <span className="mono">阈值 {node.threshold_gb} GB</span>
-                        )}
+                        </div>
+
+                        <div className="tele-node-foot">
+                          <span>
+                            {node.kind === 'ecs' ? (
+                              <>今日 +{formatGb(node.today_gb)}</>
+                            ) : unlimitedSwas ? (
+                              <>带宽型不限流量</>
+                            ) : (
+                              <>套餐月流量包</>
+                            )}
+                          </span>
+                          {node.threshold_gb > 0 && (
+                            <span className="mono">阈值 {node.threshold_gb} GB</span>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </section>
@@ -428,6 +458,7 @@ export default function PublicHomeView({
                   ) : (
                     <div className="tele-rank-list">
                       {data.ranking.map((item, idx) => {
+                        const unlimitedSwas = item.kind === 'swas' && item.quota_gb <= 0
                         const widthPct = Math.max(4, (item.used_gb / maxRankUsed) * 100)
                         return (
                           <div className="tele-rank-row" key={`${item.kind}-${item.name}-${idx}`}>
@@ -440,7 +471,9 @@ export default function PublicHomeView({
                               </span>
                               <strong className="tele-rank-name">{item.name}</strong>
                               <span className="tele-rank-region">{regionLabel(item.region_id)}</span>
-                              <span className="tele-rank-val mono">{formatGb(item.used_gb)}</span>
+                              <span className="tele-rank-val mono">
+                                {unlimitedSwas ? unlimitedSwasLabel(item.bandwidth_mbps) : formatGb(item.used_gb)}
+                              </span>
                             </div>
                             <div className="tele-rank-track">
                               <div

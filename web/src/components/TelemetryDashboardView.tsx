@@ -42,6 +42,23 @@ function formatGb(gb: number): string {
   return `${gb.toFixed(gb >= 100 ? 1 : 2)} GB`
 }
 
+function unlimitedSwasLabel(bandwidthMbps?: number): string {
+  return bandwidthMbps && bandwidthMbps > 0 ? `${bandwidthMbps}M无限制` : '不限流量'
+}
+
+function unlimitedSwasPoolLabel(nodes: { quota_gb: number; bandwidth_mbps?: number }[]): string {
+  const bws = Array.from(
+    new Set(
+      nodes
+        .filter((n) => n.quota_gb <= 0 && (n.bandwidth_mbps ?? 0) > 0)
+        .map((n) => n.bandwidth_mbps as number),
+    ),
+  )
+  if (bws.length === 1) return `${bws[0]}M无限制`
+  if (bws.length > 1) return `${bws.sort((a, b) => a - b).join('/')}M无限制`
+  return '不限流量'
+}
+
 function DeltaTag({ pct, label }: { pct: number | null; label: string }) {
   if (pct === null) {
     return <span className="tele-delta flat">{label} 暂无基线</span>
@@ -299,7 +316,9 @@ export default function TelemetryDashboardView({
                             <Cloud size={12} /> 轻量月流量包
                           </span>
                           <strong className="mono">
-                            {formatGb(summary.swas_used_gb)} / {formatGb(summary.swas_quota_gb)}
+                            {summary.swas_total > 0 && summary.swas_quota_gb <= 0
+                              ? unlimitedSwasPoolLabel(data.swas_nodes)
+                              : `${formatGb(summary.swas_used_gb)} / ${formatGb(summary.swas_quota_gb)}`}
                           </strong>
                         </div>
                         <div className="tele-split-track">
@@ -384,6 +403,7 @@ export default function TelemetryDashboardView({
             ) : (
               <div className="tele-node-grid">
                 {activeNodes.map((node) => {
+                  const unlimitedSwas = node.kind === 'swas' && node.quota_gb <= 0
                   const warnDays = node.days_to_threshold
                   const warnTone =
                     warnDays === 0
@@ -420,11 +440,15 @@ export default function TelemetryDashboardView({
 
                       <div className="tele-node-meter">
                         <div className="tele-node-nums">
-                          <strong className="mono">{formatGb(node.used_gb)}</strong>
+                          <strong className="mono">
+                            {unlimitedSwas ? unlimitedSwasLabel(node.bandwidth_mbps) : formatGb(node.used_gb)}
+                          </strong>
                           <span className="mono">
                             {node.quota_gb > 0
                               ? `/ ${formatGb(node.quota_gb)} (${node.percent.toFixed(1)}%)`
-                              : '无固定配额'}
+                              : unlimitedSwas
+                                ? '不限流量'
+                                : '无固定配额'}
                           </span>
                         </div>
                         {node.quota_gb > 0 && (
@@ -469,6 +493,7 @@ export default function TelemetryDashboardView({
               ) : (
                 <div className="tele-rank-list">
                   {data.ranking.map((item, idx) => {
+                    const unlimitedSwas = item.kind === 'swas' && item.quota_gb <= 0
                     const widthPct = Math.max(4, (item.used_gb / maxRankUsed) * 100)
                     return (
                       <div className="tele-rank-row" key={`${item.kind}-${item.id}`}>
@@ -487,8 +512,14 @@ export default function TelemetryDashboardView({
                             </span>
                           )}
                           <span className="tele-rank-val mono">
-                            {formatGb(item.used_gb)}
-                            {item.quota_gb > 0 ? ` (${item.percent.toFixed(1)}%)` : ''}
+                            {unlimitedSwas ? (
+                              unlimitedSwasLabel(item.bandwidth_mbps)
+                            ) : (
+                              <>
+                                {formatGb(item.used_gb)}
+                                {item.quota_gb > 0 ? ` (${item.percent.toFixed(1)}%)` : ''}
+                              </>
+                            )}
                           </span>
                         </div>
                         <div className="tele-rank-track">
