@@ -77,10 +77,10 @@ export function ArcGauge({
 
   const palette =
     resolved === 'crimson'
-      ? { start: '#f97316', end: '#ef4444', glow: 'rgba(239, 68, 68, 0.36)' }
+      ? { start: '#fb7185', end: '#e11d48', glow: 'rgba(225, 29, 72, 0.36)' }
       : resolved === 'amber'
         ? { start: '#fbbf24', end: '#f59e0b', glow: 'rgba(245, 158, 11, 0.36)' }
-        : { start: '#10b981', end: '#06b6d4', glow: 'rgba(16, 185, 129, 0.36)' }
+        : { start: '#f9a8d4', end: '#ec4899', glow: 'rgba(236, 72, 153, 0.38)' }
 
   // Subtle tick marks along the outer perimeter for instrument feel.
   const ticks = [0, 25, 50, 75, 100].map((pct) => {

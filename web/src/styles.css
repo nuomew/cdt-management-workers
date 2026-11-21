@@ -1,8 +1,8 @@
 /* ============================================================================
-   CDT-Management · 设计系统
+   CDT-Management · 设计系统（少女樱花粉主题）
    ----------------------------------------------------------------------------
-   取向：克制的深绿主色 + 冷灰中性色，靠层次、细边、柔和阴影和克制的渐变
-   做出质感，而不是靠高饱和色块堆砌。浅色像陶瓷，深色像磨砂玻璃。
+   取向：柔和樱花粉主色 + 奶霜粉中性色，靠层次、细边、柔和阴影和克制的渐变
+   做出通透质感。浅色像樱花陶瓷，深色像莓果磨砂玻璃。
    ========================================================================== */
 
 :root {
@@ -14,41 +14,41 @@
   -webkit-font-smoothing: antialiased;
 
   /* 表面 */
-  --bg: #eceff3;
-  --bg-sheen-1: rgba(16, 122, 88, 0.13);
-  --bg-sheen-2: rgba(38, 99, 184, 0.1);
-  --panel: rgba(255, 255, 255, 0.72);
+  --bg: #fdf5f8;
+  --bg-sheen-1: rgba(244, 114, 182, 0.22);
+  --bg-sheen-2: rgba(251, 146, 195, 0.18);
+  --panel: rgba(255, 255, 255, 0.78);
   --panel-solid: #ffffff;
-  --panel-soft: rgba(244, 246, 248, 0.9);
-  --panel-inset: rgba(16, 24, 40, 0.028);
+  --panel-soft: rgba(255, 245, 249, 0.92);
+  --panel-inset: rgba(219, 39, 119, 0.045);
 
   /* 文字 */
-  --ink: #101318;
-  --ink-soft: #343b45;
-  --muted: #666e7a;
-  --muted-soft: #8b929c;
+  --ink: #2b1622;
+  --ink-soft: #4e2d3f;
+  --muted: #845970;
+  --muted-soft: #a67c92;
 
   /* 线 */
-  --line: rgba(19, 28, 41, 0.1);
-  --line-strong: rgba(19, 28, 41, 0.17);
-  --hairline: rgba(255, 255, 255, 0.7);
+  --line: rgba(219, 39, 119, 0.12);
+  --line-strong: rgba(219, 39, 119, 0.22);
+  --hairline: rgba(255, 255, 255, 0.78);
 
-  /* 主色 */
-  --accent: #0b7a58;
-  --accent-2: #0e7490;
-  --accent-grad: linear-gradient(135deg, #0f8b63 0%, #0b7a58 46%, #0a6d6b 100%);
-  --accent-soft: rgba(11, 122, 88, 0.1);
-  --accent-ring: rgba(11, 122, 88, 0.22);
-  --green: #0b7a58;
-  --green-soft: rgba(11, 122, 88, 0.1);
+  /* 主色（少女樱花粉） */
+  --accent: #e05297;
+  --accent-2: #f472b6;
+  --accent-grad: linear-gradient(135deg, #f472b6 0%, #e05297 52%, #db4c8a 100%);
+  --accent-soft: rgba(224, 82, 151, 0.12);
+  --accent-ring: rgba(224, 82, 151, 0.26);
+  --green: #e05297;
+  --green-soft: rgba(224, 82, 151, 0.12);
 
   /* 状态色 */
-  --blue: #2563b8;
-  --blue-soft: rgba(37, 99, 184, 0.1);
-  --red: #bd3645;
-  --red-soft: rgba(189, 54, 69, 0.1);
-  --amber: #a06408;
-  --amber-soft: rgba(168, 102, 8, 0.12);
+  --blue: #a855f7;
+  --blue-soft: rgba(168, 85, 247, 0.12);
+  --red: #e11d48;
+  --red-soft: rgba(225, 29, 72, 0.11);
+  --amber: #c26d0a;
+  --amber-soft: rgba(194, 109, 10, 0.12);
 
   /* 形状 */
   --radius-xl: 22px;
@@ -57,10 +57,10 @@
   --radius-sm: 8px;
 
   /* 阴影：三层叠加，近处实、远处虚 */
-  --shadow-1: 0 1px 1px rgba(16, 24, 40, 0.04), 0 2px 6px -2px rgba(16, 24, 40, 0.07);
-  --shadow-2: 0 1px 2px rgba(16, 24, 40, 0.05), 0 8px 20px -12px rgba(16, 24, 40, 0.16);
-  --shadow-3: 0 2px 4px rgba(16, 24, 40, 0.06), 0 24px 48px -28px rgba(16, 24, 40, 0.28);
-  --shadow-pop: 0 8px 16px -8px rgba(16, 24, 40, 0.14), 0 40px 80px -32px rgba(16, 24, 40, 0.32);
+  --shadow-1: 0 1px 1px rgba(157, 23, 77, 0.04), 0 2px 8px -2px rgba(157, 23, 77, 0.08);
+  --shadow-2: 0 1px 2px rgba(157, 23, 77, 0.05), 0 8px 22px -12px rgba(157, 23, 77, 0.18);
+  --shadow-3: 0 2px 4px rgba(157, 23, 77, 0.06), 0 24px 48px -28px rgba(157, 23, 77, 0.28);
+  --shadow-pop: 0 8px 16px -8px rgba(157, 23, 77, 0.16), 0 40px 80px -32px rgba(157, 23, 77, 0.3);
 
   --ease: cubic-bezier(0.22, 1, 0.36, 1);
   --ease-snap: cubic-bezier(0.34, 1.4, 0.64, 1);
@@ -73,74 +73,74 @@
 @media (prefers-color-scheme: dark) {
   :root {
     color-scheme: dark;
-    --bg: #080b0f;
-    --bg-sheen-1: rgba(20, 190, 130, 0.14);
-    --bg-sheen-2: rgba(56, 132, 255, 0.12);
-    --panel: rgba(21, 26, 33, 0.66);
-    --panel-solid: #14181e;
-    --panel-soft: rgba(29, 35, 44, 0.72);
-    --panel-inset: rgba(255, 255, 255, 0.035);
+    --bg: #140c12;
+    --bg-sheen-1: rgba(244, 114, 182, 0.18);
+    --bg-sheen-2: rgba(192, 132, 252, 0.14);
+    --panel: rgba(34, 21, 30, 0.72);
+    --panel-solid: #1e131b;
+    --panel-soft: rgba(45, 27, 40, 0.76);
+    --panel-inset: rgba(255, 210, 230, 0.055);
 
-    --ink: #e9eef5;
-    --ink-soft: #c2cbd6;
-    --muted: #8d97a5;
-    --muted-soft: #6d7784;
+    --ink: #fdf2f8;
+    --ink-soft: #f5d0e3;
+    --muted: #c299af;
+    --muted-soft: #966e85;
 
-    --line: rgba(255, 255, 255, 0.09);
-    --line-strong: rgba(255, 255, 255, 0.16);
-    --hairline: rgba(255, 255, 255, 0.07);
+    --line: rgba(244, 114, 182, 0.16);
+    --line-strong: rgba(244, 114, 182, 0.28);
+    --hairline: rgba(255, 228, 242, 0.08);
 
-    --accent: #2fbe8c;
-    --accent-2: #38bdf8;
-    --accent-grad: linear-gradient(135deg, #34d399 0%, #22b184 45%, #1f9d8f 100%);
-    --accent-soft: rgba(47, 190, 140, 0.14);
-    --accent-ring: rgba(47, 190, 140, 0.3);
-    --green: #2fbe8c;
-    --green-soft: rgba(47, 190, 140, 0.14);
+    --accent: #f472b6;
+    --accent-2: #f9a8d4;
+    --accent-grad: linear-gradient(135deg, #f9a8d4 0%, #f472b6 48%, #ec4899 100%);
+    --accent-soft: rgba(244, 114, 182, 0.16);
+    --accent-ring: rgba(244, 114, 182, 0.34);
+    --green: #f472b6;
+    --green-soft: rgba(244, 114, 182, 0.16);
 
-    --blue: #5c9bff;
-    --blue-soft: rgba(92, 155, 255, 0.14);
-    --red: #f0707e;
-    --red-soft: rgba(240, 112, 126, 0.14);
-    --amber: #e0a13a;
-    --amber-soft: rgba(224, 161, 58, 0.16);
+    --blue: #c084fc;
+    --blue-soft: rgba(192, 132, 252, 0.16);
+    --red: #fb7185;
+    --red-soft: rgba(251, 113, 133, 0.16);
+    --amber: #f5b942;
+    --amber-soft: rgba(245, 185, 66, 0.16);
 
-    --shadow-1: 0 1px 1px rgba(0, 0, 0, 0.4), 0 2px 6px -2px rgba(0, 0, 0, 0.5);
-    --shadow-2: 0 1px 2px rgba(0, 0, 0, 0.45), 0 10px 24px -14px rgba(0, 0, 0, 0.8);
-    --shadow-3: 0 2px 6px rgba(0, 0, 0, 0.5), 0 28px 56px -30px rgba(0, 0, 0, 0.9);
-    --shadow-pop: 0 10px 20px -10px rgba(0, 0, 0, 0.6), 0 48px 96px -36px rgba(0, 0, 0, 0.95);
+    --shadow-1: 0 1px 1px rgba(0, 0, 0, 0.42), 0 2px 6px -2px rgba(0, 0, 0, 0.52);
+    --shadow-2: 0 1px 2px rgba(0, 0, 0, 0.48), 0 10px 24px -14px rgba(0, 0, 0, 0.8);
+    --shadow-3: 0 2px 6px rgba(0, 0, 0, 0.52), 0 28px 56px -30px rgba(0, 0, 0, 0.9);
+    --shadow-pop: 0 10px 20px -10px rgba(0, 0, 0, 0.62), 0 48px 96px -36px rgba(0, 0, 0, 0.95);
   }
 
-  /* 登录 / 注册页固定亮色：作为品牌门面不跟随系统深色模式，始终是同一套浅色外观 */
+  /* 登录 / 注册页固定亮色：始终呈现柔和樱花粉浅色外观 */
   .auth {
     color-scheme: light;
-    --bg: #eceff3;
-    --panel: rgba(255, 255, 255, 0.72);
+    --bg: #fdf5f8;
+    --panel: rgba(255, 255, 255, 0.78);
     --panel-solid: #ffffff;
-    --panel-soft: rgba(244, 246, 248, 0.9);
-    --panel-inset: rgba(16, 24, 40, 0.028);
-    --ink: #101318;
-    --ink-soft: #343b45;
-    --muted: #666e7a;
-    --muted-soft: #8b929c;
-    --line: rgba(19, 28, 41, 0.1);
-    --line-strong: rgba(19, 28, 41, 0.17);
-    --hairline: rgba(255, 255, 255, 0.7);
-    --accent: #0b7a58;
-    --accent-2: #0e7490;
-    --accent-grad: linear-gradient(135deg, #0f8b63 0%, #0b7a58 46%, #0a6d6b 100%);
-    --accent-soft: rgba(11, 122, 88, 0.1);
-    --accent-ring: rgba(11, 122, 88, 0.22);
-    --green: #0b7a58;
-    --green-soft: rgba(11, 122, 88, 0.1);
-    --red: #bd3645;
-    --red-soft: rgba(189, 54, 69, 0.1);
-    --amber: #a06408;
-    --amber-soft: rgba(168, 102, 8, 0.12);
-    --shadow-1: 0 1px 1px rgba(16, 24, 40, 0.04), 0 2px 6px -2px rgba(16, 24, 40, 0.07);
-    --shadow-2: 0 1px 2px rgba(16, 24, 40, 0.05), 0 8px 20px -12px rgba(16, 24, 40, 0.16);
-    --shadow-3: 0 2px 4px rgba(16, 24, 40, 0.06), 0 24px 48px -28px rgba(16, 24, 40, 0.28);
-    --shadow-pop: 0 8px 16px -8px rgba(16, 24, 40, 0.14), 0 40px 80px -32px rgba(16, 24, 40, 0.32);
+    --panel-soft: rgba(255, 245, 249, 0.92);
+    --panel-inset: rgba(219, 39, 119, 0.045);
+    --ink: #2b1622;
+    --ink-soft: #4e2d3f;
+    --muted: #845970;
+    --muted-soft: #a67c92;
+    --line: rgba(219, 39, 119, 0.12);
+    --line-strong: rgba(219, 39, 119, 0.22);
+    --hairline: rgba(255, 255, 255, 0.78);
+    --accent: #e05297;
+    --accent-2: #f472b6;
+    --accent-grad: linear-gradient(135deg, #f472b6 0%, #e05297 52%, #db4c8a 100%);
+    --accent-soft: rgba(224, 82, 151, 0.12);
+    --accent-ring: rgba(224, 82, 151, 0.26);
+    --green: #e05297;
+    --green-soft: rgba(224, 82, 151, 0.12);
+    --red: #e11d48;
+    --red-soft: rgba(225, 29, 72, 0.11);
+    --amber: #c26d0a;
+    --amber-soft: rgba(194, 109, 10, 0.12);
+    --shadow-1: 0 1px 1px rgba(157, 23, 77, 0.04), 0 2px 8px -2px rgba(157, 23, 77, 0.08);
+    --shadow-2: 0 1px 2px rgba(157, 23, 77, 0.05), 0 8px 22px -12px rgba(157, 23, 77, 0.18);
+    --shadow-3: 0 2px 4px rgba(157, 23, 77, 0.06), 0 24px 48px -28px rgba(157, 23, 77, 0.28);
+    --shadow-pop: 0 8px 16px -8px rgba(157, 23, 77, 0.16), 0 40px 80px -32px rgba(157, 23, 77, 0.3);
     background: var(--bg);
   }
 }
@@ -309,10 +309,10 @@ a:hover {
   overflow: hidden;
   /* 顶部内高光 + 外层色晕，比纯色块显得有厚度 */
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.26),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.12),
-    0 1px 2px rgba(11, 122, 88, 0.28),
-    0 10px 20px -12px rgba(11, 122, 88, 0.5);
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    inset 0 -1px 0 rgba(157, 23, 77, 0.14),
+    0 1px 2px rgba(224, 82, 151, 0.28),
+    0 10px 20px -12px rgba(224, 82, 151, 0.52);
 }
 
 /* hover 时一道光从左扫到右，给主按钮一点「活」的质感 */
@@ -335,10 +335,10 @@ a:hover {
 
 .btn.primary:hover:not(:disabled) {
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.3),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.12),
-    0 2px 4px rgba(11, 122, 88, 0.3),
-    0 16px 28px -14px rgba(11, 122, 88, 0.6);
+    inset 0 1px 0 rgba(255, 255, 255, 0.36),
+    inset 0 -1px 0 rgba(157, 23, 77, 0.14),
+    0 2px 4px rgba(224, 82, 151, 0.32),
+    0 16px 28px -14px rgba(224, 82, 151, 0.62);
 }
 
 .btn.danger {
@@ -994,7 +994,7 @@ input[type='number']::-webkit-inner-spin-button {
 .meter-fill {
   height: 100%;
   border-radius: 999px;
-  background: linear-gradient(90deg, #12a074, #0b7a58);
+  background: linear-gradient(90deg, #f9a8d4, #e05297);
   transition: width 500ms var(--ease);
 }
 
@@ -3760,7 +3760,7 @@ input[type='number']::-webkit-inner-spin-button {
 }
 
 .reinstall-step.done {
-  border-color: rgba(11, 122, 88, 0.32);
+  border-color: rgba(224, 82, 151, 0.34);
   color: var(--green);
 }
 
@@ -4628,11 +4628,11 @@ input[type='number']::-webkit-inner-spin-button {
 }
 
 .tele-split-bar.ecs {
-  background: linear-gradient(90deg, #10b981, #06b6d4);
+  background: linear-gradient(90deg, #f9a8d4, #ec4899);
 }
 
 .tele-split-bar.swas {
-  background: linear-gradient(90deg, #3b82f6, #0ea5e9);
+  background: linear-gradient(90deg, #d8b4fe, #a855f7);
 }
 
 .tele-forecast-bar {
@@ -5006,6 +5006,24 @@ input[type='number']::-webkit-inner-spin-button {
   grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
   gap: 16px;
   margin-top: 26px;
+  align-items: stretch;
+}
+
+.tele-bottom-grid > .section {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.tele-bottom-grid .section-head {
+  min-height: 32px;
+  align-items: center;
+}
+
+.tele-bottom-grid > .section > .card {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
 }
 
 .tele-rank-list {
@@ -5042,17 +5060,17 @@ input[type='number']::-webkit-inner-spin-button {
 }
 
 .tele-rank-idx.top-1 {
-  background: linear-gradient(135deg, #f59e0b, #d97706);
+  background: linear-gradient(135deg, #f472b6, #db2777);
   color: #ffffff;
 }
 
 .tele-rank-idx.top-2 {
-  background: linear-gradient(135deg, #94a3b8, #64748b);
+  background: linear-gradient(135deg, #c084fc, #9333ea);
   color: #ffffff;
 }
 
 .tele-rank-idx.top-3 {
-  background: linear-gradient(135deg, #d97706, #92400e);
+  background: linear-gradient(135deg, #fda4af, #f43f5e);
   color: #ffffff;
 }
 
@@ -5102,11 +5120,11 @@ input[type='number']::-webkit-inner-spin-button {
 }
 
 .tele-rank-fill.ecs {
-  background: linear-gradient(90deg, #10b981, #06b6d4);
+  background: linear-gradient(90deg, #f9a8d4, #ec4899);
 }
 
 .tele-rank-fill.swas {
-  background: linear-gradient(90deg, #3b82f6, #0ea5e9);
+  background: linear-gradient(90deg, #d8b4fe, #a855f7);
 }
 
 @media (max-width: 1060px) {
