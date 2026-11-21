@@ -335,6 +335,15 @@ export default function SwasView({
                   <button
                     type="button"
                     className="btn ghost sm"
+                    disabled={!hasInstance || !running || busy}
+                    title={running ? '重启轻量实例' : '仅运行中的实例可重启'}
+                    onClick={() => onReboot(server)}
+                  >
+                    <RotateCw size={12} /> 重启
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
                     disabled={!hasInstance}
                     title="查看到期时间、实时询价与包年包月续费"
                     onClick={() => onRenew(server)}
@@ -349,15 +358,6 @@ export default function SwasView({
                     onClick={() => onOps(server)}
                   >
                     <SlidersHorizontal size={12} /> 运维
-                  </button>
-                  <button
-                    type="button"
-                    className="btn ghost sm"
-                    disabled={!hasInstance || !running || busy}
-                    title={running ? '重启轻量实例' : '仅运行中的实例可重启'}
-                    onClick={() => onReboot(server)}
-                  >
-                    <RotateCw size={12} /> 重启
                   </button>
                   <button
                     type="button"
