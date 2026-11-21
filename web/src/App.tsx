@@ -2,7 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Activity,
   AlertTriangle,
+  ArrowLeft,
+  BarChart3,
   Cloud,
+  ExternalLink,
   Gauge,
   Globe2,
   HeartPulse,
@@ -27,6 +30,8 @@ import type {
 } from './types'
 import Auth from './components/Auth'
 import DashboardView from './components/DashboardView'
+import PublicHomeView from './components/PublicHomeView'
+import TelemetryDashboardView from './components/TelemetryDashboardView'
 import KeepaliveView from './components/KeepaliveView'
 import KeepaliveDialog from './components/KeepaliveDialog'
 import ServersView from './components/ServersView'
@@ -57,9 +62,13 @@ import { Badge, Modal } from './components/ui'
 import { ownerLabel } from './owners'
 import { syncClock } from './time'
 
-type Phase = 'loading' | 'setup' | 'login' | 'ready' | 'fatal'
-type View = 'dashboard' | 'keepalive' | 'shift' | 'servers' | 'swas' | 'dns'
+type Phase = 'loading' | 'public' | 'setup' | 'login' | 'ready' | 'fatal'
+type View = 'dashboard' | 'telemetry' | 'keepalive' | 'shift' | 'servers' | 'swas' | 'dns'
 type Toast = { id: number; tone: 'success' | 'error' | 'info'; message: string }
+
+function isAdminPath(pathname: string = window.location.pathname): boolean {
+  return pathname === '/admin' || pathname.startsWith('/admin/')
+}
 
 /** 删除这类不可撤销的操作，统一走应用内二次确认（window.confirm 在桌面壳里可能被吞掉） */
 type ConfirmRequest = {
@@ -93,6 +102,7 @@ const NAV_SECTIONS: NavSection[] = [
     key: 'dashboard',
     icon: Gauge,
     children: [
+      { key: 'telemetry', label: '仪表盘', icon: BarChart3 },
       { key: 'servers', label: '服务器', icon: ServerIcon },
       { key: 'swas', label: '轻量服务器', icon: Cloud },
     ],
@@ -220,11 +230,44 @@ export default function App() {
     if (settingsResult.status === 'fulfilled') {
       settingsRef.current = settingsResult.value
       setSettings(settingsResult.value)
+      setMeta((prev) => ({
+        ...prev,
+        authenticated: true,
+        public_home_enabled: settingsResult.value.public_home_enabled,
+        public_site_title: settingsResult.value.public_site_title,
+        public_site_subtitle: settingsResult.value.public_site_subtitle,
+      }))
     } else if (!settingsRef.current) {
       // 一次都没成功过：页脚的同步间隔、SDK 状态都没有来源，这时报错比空着诚实
       throw settingsResult.reason
     }
     setPhase('ready')
+  }, [])
+
+  const goAdmin = useCallback(() => {
+    if (!isAdminPath()) {
+      window.history.pushState({}, '', '/admin')
+    }
+    if (overview && settingsRef.current) {
+      setPhase('ready')
+      return
+    }
+    setPhase('loading')
+    void loadAll().catch((error) => {
+      if (error instanceof APIError && error.status === 401) {
+        setPhase('login')
+        return
+      }
+      setFatal(error instanceof Error ? error.message : '无法连接后端')
+      setPhase('fatal')
+    })
+  }, [loadAll, overview])
+
+  const goPublic = useCallback(() => {
+    if (isAdminPath()) {
+      window.history.pushState({}, '', '/')
+    }
+    setPhase('public')
   }, [])
 
   /** 弹窗保存成功后统一刷新：刷新失败也要给用户一句提示，不能吞成 unhandled rejection */
@@ -252,6 +295,15 @@ export default function App() {
           setPhase('setup')
           return
         }
+        const wantAdmin = isAdminPath()
+        const publicEnabled = init.public_home_enabled !== false
+        if (!wantAdmin && publicEnabled) {
+          setPhase('public')
+          return
+        }
+        if (!wantAdmin && !publicEnabled) {
+          window.history.replaceState({}, '', '/admin')
+        }
         await loadAll()
       } catch (error) {
         if (error instanceof APIError && error.status === 401) {
@@ -263,6 +315,26 @@ export default function App() {
       }
     })()
   }, [loadAll])
+
+  useEffect(() => {
+    const onPopState = () => {
+      if (!meta.initialized) return
+      if (isAdminPath()) {
+        if (overview && settingsRef.current) {
+          setPhase('ready')
+        } else {
+          setPhase('loading')
+          void loadAll().catch(() => setPhase('login'))
+        }
+      } else if (meta.public_home_enabled !== false) {
+        setPhase('public')
+      } else {
+        window.history.replaceState({}, '', '/admin')
+      }
+    }
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [meta.initialized, meta.public_home_enabled, overview, loadAll])
 
   useEffect(() => {
     if (phase !== 'ready') {
@@ -704,6 +776,7 @@ export default function App() {
     try {
       await post('/api/v1/auth/logout')
     } finally {
+      setMeta((prev) => ({ ...prev, authenticated: false }))
       setPhase('login')
       setOverview(null)
     }
@@ -715,6 +788,21 @@ export default function App() {
         <div className="spinner" />
         正在连接…
       </div>
+    )
+  }
+
+  if (phase === 'public') {
+    return (
+      <PublicHomeView
+        authenticated={Boolean(meta.authenticated)}
+        brand={meta.brand || 'CDT-Management'}
+        version={meta.version || ''}
+        onEnterAdmin={goAdmin}
+        onDisabled={() => {
+          setMeta((prev) => ({ ...prev, public_home_enabled: false }))
+          goAdmin()
+        }}
+      />
     )
   }
 
@@ -732,14 +820,29 @@ export default function App() {
 
   if (phase === 'setup' || phase === 'login') {
     return (
-      <Auth
-        mode={phase}
-        brand={meta.brand || 'CDT-Management'}
-        onDone={() => {
-          setPhase('loading')
-          void loadAll().catch(() => setPhase('login'))
-        }}
-      />
+      <>
+        {phase === 'login' && meta.public_home_enabled !== false && (
+          <button
+            type="button"
+            className="btn ghost sm auth-public-back"
+            onClick={goPublic}
+          >
+            <ArrowLeft size={13} /> 返回公开首页
+          </button>
+        )}
+        <Auth
+          mode={phase}
+          brand={meta.brand || 'CDT-Management'}
+          onDone={() => {
+            if (!isAdminPath()) {
+              window.history.replaceState({}, '', '/admin')
+            }
+            setMeta((prev) => ({ ...prev, initialized: true, authenticated: true }))
+            setPhase('loading')
+            void loadAll().catch(() => setPhase('login'))
+          }}
+        />
+      </>
     )
   }
 
@@ -840,6 +943,12 @@ export default function App() {
         </nav>
 
         <div className="sidebar-foot">
+          {settings.public_home_enabled && (
+            <button className="nav-item" onClick={goPublic} title="打开免登录公开首页">
+              <ExternalLink size={15} />
+              <span className="nav-text">公开首页</span>
+            </button>
+          )}
           <button className="nav-item" onClick={() => setSettingsOpen(true)}>
             <SettingsIcon size={15} />
             <span className="nav-text">设置</span>
@@ -859,6 +968,14 @@ export default function App() {
           <DashboardView
             overview={overview}
             onNavigate={(target) => setView(target)}
+          />
+        )}
+
+        {view === 'telemetry' && (
+          <TelemetryDashboardView
+            onNavigate={(target) => setView(target)}
+            onOpenPublicHome={goPublic}
+            publicHomeEnabled={settings.public_home_enabled}
           />
         )}
 

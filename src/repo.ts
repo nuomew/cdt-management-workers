@@ -820,6 +820,42 @@ export async function latestSamples(
   return row ? { used: asNum(row["used"]), ts: asInt(row["ts"]) } : null;
 }
 
+export interface ServerTrafficSample {
+  server_id: number;
+  ts: number;
+  used: number;
+  status: string;
+}
+
+/**
+ * Fetch traffic samples across all (or one specific) ECS servers since `sinceTs`,
+ * ordered chronologically so callers can aggregate daily increments and trends.
+ */
+export async function listAllSamplesSince(
+  env: Env,
+  sinceTs: number,
+  serverId = 0,
+): Promise<ServerTrafficSample[]> {
+  const rows =
+    serverId > 0
+      ? await query<Row>(
+          env.DB,
+          "SELECT server_id, ts, used, status FROM traffic_samples WHERE server_id=? AND ts>=? ORDER BY ts ASC",
+          [serverId, sinceTs],
+        )
+      : await query<Row>(
+          env.DB,
+          "SELECT server_id, ts, used, status FROM traffic_samples WHERE ts>=? ORDER BY ts ASC",
+          [sinceTs],
+        );
+  return rows.map((row) => ({
+    server_id: asInt(row["server_id"]),
+    ts: asInt(row["ts"]),
+    used: asNum(row["used"]),
+    status: asStr(row["status"]),
+  }));
+}
+
 // ---------------------------------------------------------------------------
 // keepalives (single-instance keepalive)
 // ---------------------------------------------------------------------------
@@ -2252,7 +2288,8 @@ export async function pruneEvents(env: Env, days: number): Promise<void> {
   await execute(env.DB, "DELETE FROM shift_runs WHERE updated_at<?", [
     now - 30 * 86400,
   ]);
-  await execute(env.DB, "DELETE FROM traffic_samples WHERE ts<?", [now - 7 * 86400]);
+  // Retain 45 days of samples so 30-day charts and previous-month comparisons stay populated.
+  await execute(env.DB, "DELETE FROM traffic_samples WHERE ts<?", [now - 45 * 86400]);
 }
 
 // ---------------------------------------------------------------------------

@@ -56,6 +56,7 @@ import * as messages from "./messages";
 import * as billing from "./billing";
 import * as aliyun from "./aliyun";
 import * as swas from "./swas";
+import * as analytics from "./analytics";
 import {
   BRAND,
   CSRF_COOKIE,
@@ -349,6 +350,9 @@ function asInt(value: unknown, label: string): number {
 
 const SETTING_LABELS: Record<string, string> = {
   timezone: "时区",
+  public_home_enabled: "公开首页开关",
+  public_site_title: "公开首页标题",
+  public_site_subtitle: "公开首页简介",
   traffic_threshold_pct: "流量阈值",
   reconcile_interval: "同步间隔",
   reconcile_offset: "巡检起始秒",
@@ -862,12 +866,52 @@ app.use("/api/v1/*", async (c, next) => {
 });
 
 app.get("/api/v1/system/init-status", async (c) => {
+  const initialized = await isInitialized(c.env);
+  const config = initialized ? await repo.getSettings(c.env) : {};
+  let authenticated = false;
+  if (initialized) {
+    try {
+      authenticated = Boolean(await currentUser(c));
+    } catch {
+      authenticated = false;
+    }
+  }
   return c.json({
-    initialized: await isInitialized(c.env),
+    initialized,
+    authenticated,
+    public_home_enabled: (config["public_home_enabled"] ?? "1") !== "0",
+    public_site_title: (config["public_site_title"] || "").trim() || "CDT 云节点流量遥测",
+    public_site_subtitle:
+      (config["public_site_subtitle"] || "").trim() ||
+      "阿里云 ECS · 轻量应用服务器实时在线状态与月度流量配额观察站",
     brand: BRAND,
     version: VERSION,
     repo: REPO,
   });
+});
+
+app.get("/api/v1/public/home", async (c) => {
+  if (!(await isInitialized(c.env))) {
+    throw httpErr(404, "not_initialized", "系统尚未初始化");
+  }
+  const enabled = (await repo.getSetting(c.env, "public_home_enabled")) ?? "1";
+  if (enabled === "0") {
+    throw httpErr(403, "public_disabled", "管理员已关闭公开首页，请登录管理后台查看");
+  }
+  const payload = await analytics.buildPublicHomePayload(c.env);
+  c.header("Cache-Control", "no-store");
+  return c.json(payload);
+});
+
+app.get("/api/v1/dashboard/analytics", async (c) => {
+  await requireAdmin(c);
+  const daysRaw = Number(c.req.query("days") ?? 7);
+  const days = daysRaw === 30 ? 30 : daysRaw === 14 ? 14 : 7;
+  const serverIdRaw = Number(c.req.query("server_id") ?? 0);
+  const serverId = Number.isInteger(serverIdRaw) && serverIdRaw > 0 ? serverIdRaw : 0;
+  const payload = await analytics.buildAdminDashboardPayload(c.env, { days, serverId });
+  c.header("Cache-Control", "no-store");
+  return c.json(payload);
 });
 
 app.post("/api/v1/setup", async (c) => {
@@ -3408,6 +3452,11 @@ app.get("/api/v1/settings", async (c) => {
   return c.json({
     admin_username: config["admin_username"] || "",
     timezone: config["timezone"],
+    public_home_enabled: (config["public_home_enabled"] ?? "1") !== "0",
+    public_site_title: (config["public_site_title"] || "").trim() || "CDT 云节点流量遥测",
+    public_site_subtitle:
+      (config["public_site_subtitle"] || "").trim() ||
+      "阿里云 ECS · 轻量应用服务器实时在线状态与月度流量配额观察站",
     traffic_threshold_pct: config["traffic_threshold_pct"],
     reconcile_interval: config["reconcile_interval"],
     reconcile_offset: config["reconcile_offset"] || "0",
@@ -3484,6 +3533,13 @@ app.post("/api/v1/settings", async (c) => {
   };
 
   putStr("timezone", payload["timezone"]);
+  putBool("public_home_enabled", payload["public_home_enabled"]);
+  if (payload["public_site_title"] !== null && payload["public_site_title"] !== undefined) {
+    updates["public_site_title"] = String(payload["public_site_title"]).trim().slice(0, 80);
+  }
+  if (payload["public_site_subtitle"] !== null && payload["public_site_subtitle"] !== undefined) {
+    updates["public_site_subtitle"] = String(payload["public_site_subtitle"]).trim().slice(0, 160);
+  }
   if (payload["traffic_threshold_pct"] !== null && payload["traffic_threshold_pct"] !== undefined) {
     const percent = asInt(payload["traffic_threshold_pct"], "流量阈值百分比");
     if (percent < 50 || percent > 100) throw invalid("流量阈值百分比应在 50–100 之间");

@@ -71,6 +71,9 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
     try {
       await post('/api/v1/settings', {
         timezone: form.timezone,
+        public_home_enabled: form.public_home_enabled,
+        public_site_title: form.public_site_title,
+        public_site_subtitle: form.public_site_subtitle,
         traffic_threshold_pct: Number(form.traffic_threshold_pct),
         reconcile_interval: Number(form.reconcile_interval),
         reconcile_offset: Number(form.reconcile_offset),
@@ -350,6 +353,51 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
                         patch((draft) => (draft.daily_report_time = event.target.value))
                       }
                     />
+                  </div>
+                )}
+              </div>
+
+              <div className="section-head" style={{ marginTop: 18 }}>
+                <h2>
+                  <Globe2 size={14} /> 公开首页（免登录）
+                </h2>
+                <span className="section-sub">访问根目录 / 时对外展示的脱敏状态与流量页</span>
+              </div>
+              <div>
+                <Switch
+                  label="启用免登录公开首页"
+                  hint="仅展示 ECS 与轻量节点的名称、地域、在线状态与流量进度；严格隐藏 IP、实例 ID、账单余额与密钥。关闭后访问 / 自动跳转至 /admin 登录"
+                  checked={form.public_home_enabled}
+                  onChange={(value) => patch((draft) => (draft.public_home_enabled = value))}
+                />
+                {form.public_home_enabled && (
+                  <div className="grid-2" style={{ marginTop: 10 }}>
+                    <div className="field">
+                      <label htmlFor="pubTitle">首页主标题</label>
+                      <input
+                        id="pubTitle"
+                        className="input"
+                        maxLength={80}
+                        value={form.public_site_title}
+                        onChange={(event) =>
+                          patch((draft) => (draft.public_site_title = event.target.value))
+                        }
+                        placeholder="CDT 云节点流量遥测"
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="pubSubtitle">首页副标题</label>
+                      <input
+                        id="pubSubtitle"
+                        className="input"
+                        maxLength={160}
+                        value={form.public_site_subtitle}
+                        onChange={(event) =>
+                          patch((draft) => (draft.public_site_subtitle = event.target.value))
+                        }
+                        placeholder="阿里云 ECS · 轻量应用服务器实时在线状态与月度流量配额观察站"
+                      />
+                    </div>
                   </div>
                 )}
               </div>

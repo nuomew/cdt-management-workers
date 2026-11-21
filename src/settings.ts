@@ -90,6 +90,9 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   // Incremented on password change to invalidate all issued session tokens.
   session_epoch: "0",
   timezone: "Asia/Shanghai",
+  public_home_enabled: "1",
+  public_site_title: "CDT 云节点流量遥测",
+  public_site_subtitle: "阿里云 ECS · 轻量应用服务器实时在线状态与月度流量配额观察站",
   traffic_threshold_pct: "90",
   reconcile_interval: String(RECONCILE_INTERVAL_DEFAULT_SECONDS),
   // Which second of each N-second grid a reconcile round fires on (0–59).

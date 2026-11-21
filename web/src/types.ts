@@ -205,6 +205,9 @@ export type Overview = {
 export type Settings = {
   admin_username: string
   timezone: string
+  public_home_enabled: boolean
+  public_site_title: string
+  public_site_subtitle: string
   traffic_threshold_pct: string
   reconcile_interval: string
   reconcile_offset: string
@@ -267,6 +270,10 @@ export type Settings = {
 
 export type InitStatus = {
   initialized: boolean
+  authenticated?: boolean
+  public_home_enabled?: boolean
+  public_site_title?: string
+  public_site_subtitle?: string
   brand: string
   version: string
   repo: string
@@ -635,4 +642,133 @@ export type SwasPlan = {
   currency: string
   support_platform: string[]
 }
+
+export type TelemetryHealth = 'safe' | 'warning' | 'critical' | 'stopped'
+
+export type TrendPoint = {
+  date: string
+  short_date: string
+  daily_gb: number
+  cumulative_gb: number
+}
+
+export type PublicNodeItem = {
+  kind: 'ecs' | 'swas'
+  name: string
+  region_id: string
+  status: string
+  used_gb: number
+  quota_gb: number
+  threshold_gb: number
+  percent: number
+  today_gb: number
+  health: TelemetryHealth
+  spec_summary: string
+}
+
+export type PublicHomeSummary = {
+  total_nodes: number
+  online_nodes: number
+  ecs_total: number
+  ecs_online: number
+  swas_total: number
+  swas_online: number
+  total_used_gb: number
+  total_quota_gb: number
+  total_percent: number
+  ecs_used_gb: number
+  ecs_quota_gb: number
+  swas_used_gb: number
+  swas_quota_gb: number
+  today_gb: number
+  yesterday_gb: number
+  day_delta_pct: number | null
+  month_gb: number
+  last_month_gb: number
+  month_delta_pct: number | null
+  avg_daily_gb: number
+  projected_month_gb: number
+  remaining_days: number
+}
+
+export type PublicHomePayload = {
+  brand: string
+  site_title: string
+  site_subtitle: string
+  timezone: string
+  updated_at: number
+  updated_label: string
+  summary: PublicHomeSummary
+  health: {
+    safe: number
+    warning: number
+    critical: number
+    stopped: number
+  }
+  trend: TrendPoint[]
+  nodes: PublicNodeItem[]
+  ranking: {
+    kind: 'ecs' | 'swas'
+    name: string
+    region_id: string
+    used_gb: number
+    quota_gb: number
+    percent: number
+    status: string
+  }[]
+}
+
+export type AdminNodeMetric = {
+  id: number
+  kind: 'ecs' | 'swas'
+  label: string
+  instance_id: string
+  region_id: string
+  public_ip: string
+  status: string
+  used_gb: number
+  quota_gb: number
+  threshold_gb: number
+  percent: number
+  today_gb: number
+  avg_daily_gb: number
+  projected_gb: number
+  days_to_threshold: number | null
+  health: TelemetryHealth
+  spec_summary: string
+  expired_time: string
+}
+
+export type AdminDashboardPayload = {
+  timezone: string
+  updated_at: number
+  updated_label: string
+  days: number
+  server_id: number
+  filter_servers: { id: number; label: string; region_id: string }[]
+  summary: PublicHomeSummary & {
+    costs: { currency: string; monthly_cost: number; balance: number }[]
+  }
+  health: {
+    safe: number
+    warning: number
+    critical: number
+    stopped: number
+  }
+  trend: TrendPoint[]
+  ecs_nodes: AdminNodeMetric[]
+  swas_nodes: AdminNodeMetric[]
+  ranking: {
+    id: number
+    kind: 'ecs' | 'swas'
+    name: string
+    region_id: string
+    used_gb: number
+    quota_gb: number
+    today_gb: number
+    percent: number
+    status: string
+  }[]
+}
+
 
