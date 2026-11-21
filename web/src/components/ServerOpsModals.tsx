@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from 'react'
 import {
   CalendarClock,
   CheckCircle2,
+  Copy,
+  ExternalLink,
   Flame,
   KeyRound,
   LoaderCircle,
@@ -11,6 +13,7 @@ import {
   SlidersHorizontal,
   Trash2,
   TriangleAlert,
+  Wallet,
 } from 'lucide-react'
 import { SLOW_TIMEOUT_MS, api, del, post } from '../api'
 import { regionLabel } from '../regions'
@@ -18,6 +21,7 @@ import type {
   AutoRenewInfo,
   InstanceDetail,
   PriceQuote,
+  RenewalBalance,
   RenewalState,
   SecurityGroupDetail,
   Server,
@@ -60,6 +64,8 @@ const RENEW_MONTH_OPTIONS = [
   { value: 12, label: '1 年' },
   { value: 24, label: '2 年' },
   { value: 36, label: '3 年' },
+  { value: 48, label: '4 年' },
+  { value: 60, label: '5 年' },
 ]
 
 const AUTORENEW_STATUS_OPTIONS: { value: 'AutoRenewal' | 'Normal' | 'NotRenewal'; label: string }[] = [
@@ -99,12 +105,29 @@ export function ServerRenewModal({
   const [confirmPay, setConfirmPay] = useState(false)
   const [payBusy, setPayBusy] = useState(false)
   const [clientToken, setClientToken] = useState(() => makeClientToken('renew'))
+  const [lastOrder, setLastOrder] = useState<{
+    order_id: string
+    period_label: string
+    orders_url: string
+  } | null>(null)
 
   // Auto-renewal settings
   const [autoStatus, setAutoStatus] = useState<'AutoRenewal' | 'Normal' | 'NotRenewal'>('Normal')
   const [autoDuration, setAutoDuration] = useState(1)
   const [autoBusy, setAutoBusy] = useState(false)
   const [autoError, setAutoError] = useState('')
+
+  const copyText = useCallback(
+    async (text: string, successMsg: string) => {
+      try {
+        await navigator.clipboard.writeText(text)
+        onToast(successMsg, 'success')
+      } catch {
+        onToast(`复制失败，请手动复制：${text}`, 'info')
+      }
+    },
+    [onToast],
+  )
 
   const loadState = useCallback(async () => {
     setLoading(true)
@@ -161,12 +184,32 @@ export function ServerRenewModal({
     }
   }, [state?.supported, periodMonths, fetchPrice])
 
+  const periodLabel =
+    periodMonths >= 12 && periodMonths % 12 === 0
+      ? `${periodMonths / 12} 年`
+      : `${periodMonths} 个月`
+  const balance = state?.balance ?? null
+  const sameCurrency =
+    balance != null &&
+    quote != null &&
+    balance.currency.toUpperCase() === quote.currency.toUpperCase()
+  const shortfall =
+    sameCurrency && balance && quote && balance.amount < quote.trade_price
+      ? Number((quote.trade_price - balance.amount).toFixed(2))
+      : 0
+
   async function handleRenewPay() {
     if (!quote || !confirmPay) return
     setPayBusy(true)
     setQuoteError('')
     try {
-      const res = await post<{ ok: boolean; order_id: string; expired_time: string }>(
+      const res = await post<{
+        ok: boolean
+        order_id: string
+        expired_time: string
+        balance?: RenewalBalance | null
+        orders_url?: string
+      }>(
         `/api/v1/servers/${server.id}/renewal/pay`,
         {
           period_months: periodMonths,
@@ -179,11 +222,23 @@ export function ServerRenewModal({
         `续费下单成功${res.order_id ? `（订单 ${res.order_id}）` : ''}`,
         'success',
       )
+      setLastOrder({
+        order_id: res.order_id || '',
+        period_label: periodLabel,
+        orders_url: res.orders_url || state?.console_urls?.orders_url || '',
+      })
       setConfirmPay(false)
       setClientToken(makeClientToken('renew'))
-      if (res.expired_time) {
-        setState((prev) => (prev ? { ...prev, expired_time: res.expired_time } : prev))
-      } else {
+      setState((prev) =>
+        prev
+          ? {
+              ...prev,
+              expired_time: res.expired_time || prev.expired_time,
+              balance: res.balance !== undefined ? res.balance : prev.balance,
+            }
+          : prev,
+      )
+      if (!res.expired_time) {
         void loadState()
       }
       onUpdated?.()
@@ -281,6 +336,11 @@ export function ServerRenewModal({
               <span>
                 到期时间：<strong>{formatIsoTime(state.expired_time)}</strong>
               </span>
+              {balance && (
+                <span>
+                  账户余额：<strong>{formatPrice(balance.amount, balance.currency)}</strong>
+                </span>
+              )}
             </div>
             {state.auto_renew && (
               <Badge
@@ -306,7 +366,7 @@ export function ServerRenewModal({
             <div className="ops-card-head">
               <strong>手动续费（实时询价）</strong>
               <span className="hint" style={{ margin: 0 }}>
-                扣款将直接从阿里云账户余额 / 信用额度扣除
+                API 续费直扣阿里云账户余额 / 信用额度；扫码支付请前往官方收银台
               </span>
             </div>
             <div className="ops-period-grid">
@@ -348,14 +408,71 @@ export function ServerRenewModal({
                   </div>
                 )}
                 <div className="price-quote-row total">
-                  <span>实付续费金额</span>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    实付续费金额
+                    {quote.estimated && <Badge tone="blue">参考估算</Badge>}
+                  </span>
                   <strong>{formatPrice(quote.trade_price, quote.currency)}</strong>
                 </div>
+                {balance && sameCurrency && (
+                  <div className={`price-quote-balance${shortfall > 0 ? ' warn' : ' ok'}`}>
+                    <Wallet size={12} style={{ flexShrink: 0 }} />
+                    {shortfall > 0 ? (
+                      <span>
+                        当前账户余额 {formatPrice(balance.amount, balance.currency)}，差额{' '}
+                        <strong>{formatPrice(shortfall, balance.currency)}</strong>
+                        （若无代金券/信用额度，建议前往阿里云收银台支付或先充值）
+                      </span>
+                    ) : (
+                      <span>
+                        当前账户余额 {formatPrice(balance.amount, balance.currency)}，余额充足可直接扣费续费
+                      </span>
+                    )}
+                  </div>
+                )}
                 {quote.rules.length > 0 && (
                   <div className="price-quote-rules">{quote.rules.join('；')}</div>
                 )}
+                {quote.note && <div className="price-quote-rules">{quote.note}</div>}
               </div>
             ) : null}
+
+            {lastOrder && (
+              <div className="renew-order-ok">
+                <CheckCircle2 size={14} style={{ flexShrink: 0 }} />
+                <div className="renew-order-ok-body">
+                  <span>
+                    已提交 <strong>{lastOrder.period_label}</strong> 续费订单
+                    {lastOrder.order_id ? (
+                      <>
+                        ：<code className="mono">{lastOrder.order_id}</code>
+                      </>
+                    ) : null}
+                  </span>
+                </div>
+                <div className="renew-pay-links">
+                  {lastOrder.order_id && (
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      onClick={() => void copyText(lastOrder.order_id, '已复制订单号')}
+                    >
+                      <Copy size={12} /> 复制单号
+                    </button>
+                  )}
+                  {lastOrder.orders_url && (
+                    <a
+                      className="btn ghost sm"
+                      href={lastOrder.orders_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      <ExternalLink size={12} /> 订单中心
+                    </a>
+                  )}
+                </div>
+              </div>
+            )}
 
             <label className="img-delete-force" style={{ marginTop: 0 }}>
               <input
@@ -365,9 +482,11 @@ export function ServerRenewModal({
                 onChange={(event) => setConfirmPay(event.target.checked)}
               />
               <span>
-                我已核对以上续费时长与实付金额
-                {quote ? `（${formatPrice(quote.trade_price, quote.currency)}）` : ''}
-                ，确认从阿里云账户扣费执行续费
+                我已核对以上续费时长（{periodLabel}）与金额
+                {quote
+                  ? `（${quote.estimated ? '约 ' : ''}${formatPrice(quote.trade_price, quote.currency)}）`
+                  : ''}
+                ，确认从阿里云账户余额 / 信用额度直接扣费续费
               </span>
             </label>
 
@@ -387,9 +506,55 @@ export function ServerRenewModal({
                 onClick={() => void handleRenewPay()}
               >
                 {payBusy ? <LoaderCircle size={12} className="spin" /> : <CheckCircle2 size={12} />}
-                确认扣费续费
+                确认余额扣费续费
               </button>
             </div>
+
+            {state.console_urls && (
+              <div className="renew-pay-bar">
+                <span className="renew-pay-note">
+                  需要支付宝 / 微信扫码付款？阿里云 ECS 续费 API 不支持直接生成待支付付款码，可跳转官方收银台完成支付：
+                </span>
+                <div className="renew-pay-links">
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    onClick={() =>
+                      void copyText(
+                        state.instance_id,
+                        '已复制实例 ID，可在阿里云续费页面粘贴搜索',
+                      )
+                    }
+                  >
+                    <Copy size={12} /> 复制实例 ID
+                  </button>
+                  <a
+                    className="btn ghost sm"
+                    href={state.console_urls.renew_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <ExternalLink size={12} /> 阿里云续费收银台
+                  </a>
+                  <a
+                    className="btn ghost sm"
+                    href={state.console_urls.recharge_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <Wallet size={12} /> 账户充值
+                  </a>
+                  <a
+                    className="btn ghost sm"
+                    href={state.console_urls.orders_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <ExternalLink size={12} /> 我的订单
+                  </a>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* 自动续费设置 */}

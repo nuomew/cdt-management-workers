@@ -4189,6 +4189,72 @@ input[type='number']::-webkit-inner-spin-button {
   color: var(--muted-soft);
 }
 
+.price-quote-balance {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: var(--radius-xs, 6px);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.price-quote-balance.ok {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 10%, transparent);
+}
+
+.price-quote-balance.warn {
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 12%, transparent);
+}
+
+.renew-order-ok {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--green) 35%, var(--line));
+  background: color-mix(in srgb, var(--green) 10%, var(--panel-solid));
+  color: var(--green);
+  font-size: 12px;
+}
+
+.renew-order-ok-body {
+  flex: 1 1 auto;
+  min-width: 180px;
+  color: var(--ink);
+}
+
+.renew-pay-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
+
+.renew-pay-note {
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.renew-pay-links {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.renew-pay-links a.btn,
+.renew-pay-links a.btn:hover {
+  text-decoration: none;
+}
+
 .ops-auto-row {
   display: flex;
   align-items: center;

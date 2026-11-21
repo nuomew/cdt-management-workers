@@ -410,6 +410,19 @@ export type AutoRenewInfo = {
   period_unit: string
 }
 
+export type RenewalBalance = {
+  amount: number
+  currency: string
+  site: string
+}
+
+export type RenewalConsoleUrls = {
+  renew_url: string
+  instance_url: string
+  recharge_url: string
+  orders_url: string
+}
+
 export type RenewalState = {
   supported: boolean
   instance_id: string
@@ -418,6 +431,8 @@ export type RenewalState = {
   instance_charge_type: string
   expired_time: string
   auto_renew: AutoRenewInfo | null
+  balance?: RenewalBalance | null
+  console_urls?: RenewalConsoleUrls
   reason: string
 }
 
@@ -429,6 +444,8 @@ export type PriceQuote = {
   period: number
   price_unit: string
   rules: string[]
+  estimated?: boolean
+  note?: string
 }
 
 export type SecurityGroupRule = {

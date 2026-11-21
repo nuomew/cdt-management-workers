@@ -1729,7 +1729,7 @@ app.post("/api/v1/servers/:serverId/reinstall-progress", async (c) => {
 
 // -- Renewal & Auto-Renew -----------------------------------------------------
 
-const VALID_RENEW_MONTHS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 24, 36]);
+const VALID_RENEW_MONTHS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 24, 36, 48, 60]);
 const VALID_AUTORENEW_MONTHS = new Set([1, 2, 3, 6, 12, 24, 36]);
 const VALID_AUTORENEW_YEARS = new Set([1, 2, 3, 4, 5]);
 const VALID_AUTORENEW_WEEKS = new Set([1, 2, 3, 4]);
@@ -1775,12 +1775,15 @@ app.get("/api/v1/servers/:serverId/renewal", async (c) => {
       instance_charge_type: detail.instance_charge_type,
       expired_time: detail.expired_time,
       auto_renew: null,
+      balance: null,
+      console_urls: aliyun.buildRenewalConsoleUrls(account),
       reason: "当前实例为按量付费（PostPaid），按使用时长实时计费，无需也不支持续费。",
     });
   }
-  const autoRenew = await aliyun
-    .getInstanceAutoRenewAttribute(c.env, account)
-    .catch(() => null);
+  const [autoRenew, balance] = await Promise.all([
+    aliyun.getInstanceAutoRenewAttribute(c.env, account).catch(() => null),
+    aliyun.getAccountBalance(c.env, account, true).catch(() => null),
+  ]);
   return c.json({
     supported: true,
     instance_id: detail.instance_id,
@@ -1789,6 +1792,8 @@ app.get("/api/v1/servers/:serverId/renewal", async (c) => {
     instance_charge_type: detail.instance_charge_type,
     expired_time: detail.expired_time,
     auto_renew: autoRenew,
+    balance,
+    console_urls: aliyun.buildRenewalConsoleUrls(account, balance?.site),
     reason: "",
   });
 });
@@ -1800,7 +1805,7 @@ app.post("/api/v1/servers/:serverId/renewal/price", async (c) => {
   const payload = await jsonBody(c);
   const months = Math.trunc(numOf(payload["period_months"], 1));
   if (!VALID_RENEW_MONTHS.has(months)) {
-    throw invalid("续费时长仅支持 1–9 个月或 1–3 年（12 / 24 / 36 个月）");
+    throw invalid("续费时长仅支持 1–9 个月或 1–5 年（12 / 24 / 36 / 48 / 60 个月）");
   }
   const quote = await aliyun.describeRenewalPrice(c.env, account, {
     period: months >= 12 && months % 12 === 0 ? months / 12 : months,
@@ -1817,7 +1822,7 @@ app.post("/api/v1/servers/:serverId/renewal/pay", async (c) => {
   const payload = await jsonBody(c);
   const months = Math.trunc(numOf(payload["period_months"], 0));
   if (!VALID_RENEW_MONTHS.has(months)) {
-    throw invalid("续费时长仅支持 1–9 个月或 1–3 年（12 / 24 / 36 个月）");
+    throw invalid("续费时长仅支持 1–9 个月或 1–5 年（12 / 24 / 36 / 48 / 60 个月）");
   }
   if (!boolOf(payload["confirm_pay"])) {
     throw invalid("请先确认续费价格并勾选扣费确认后再提交");
@@ -1827,7 +1832,11 @@ app.post("/api/v1/servers/:serverId/renewal/pay", async (c) => {
     periodMonths: months,
     clientToken: clientToken || undefined,
   });
-  const detail = await aliyun.getInstanceDetail(c.env, account).catch(() => null);
+  const [detail, balance] = await Promise.all([
+    aliyun.getInstanceDetail(c.env, account).catch(() => null),
+    aliyun.getAccountBalance(c.env, account, true).catch(() => null),
+  ]);
+  const consoleUrls = aliyun.buildRenewalConsoleUrls(account, balance?.site);
   const periodLabel = months >= 12 && months % 12 === 0 ? `${months / 12} 年` : `${months} 个月`;
   await repo.addEvent(
     c.env,
@@ -1843,6 +1852,8 @@ app.post("/api/v1/servers/:serverId/renewal/pay", async (c) => {
     ok: true,
     order_id: res.order_id,
     expired_time: detail?.expired_time ?? "",
+    balance,
+    orders_url: consoleUrls.orders_url,
   });
 });
 

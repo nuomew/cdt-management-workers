@@ -783,6 +783,15 @@ export interface PriceQuote {
   period: number;
   price_unit: string;
   rules: string[];
+  estimated?: boolean;
+  note?: string;
+}
+
+export interface RenewalConsoleUrls {
+  renew_url: string;
+  instance_url: string;
+  recharge_url: string;
+  orders_url: string;
 }
 
 export interface SecurityGroupRule {
@@ -1798,9 +1807,35 @@ export async function getInstanceAutoRenewAttribute(
 }
 
 /**
+ * Build verified official Aliyun console URLs for manual renewal checkout,
+ * instance management, account top-up, and order payment.
+ */
+export function buildRenewalConsoleUrls(
+  account: AliyunAccount,
+  detectedSite?: string,
+): RenewalConsoleUrls {
+  const isIntl = (detectedSite || account.site || "china") === "international";
+  const region = encodeURIComponent(account.region_id);
+  return {
+    renew_url: isIntl
+      ? "https://usercenter2-intl.aliyun.com/renew/manual?commodityCode=ecs"
+      : "https://renew.console.aliyun.com/center#/renew",
+    instance_url: `https://ecs.console.aliyun.com/server/region/${region}`,
+    recharge_url: isIntl
+      ? "https://usercenter2-intl.aliyun.com/billing/#/account/overview"
+      : "https://usercenter2.aliyun.com/finance/fund-management/recharge",
+    orders_url: isIntl
+      ? "https://usercenter2-intl.aliyun.com/order/list"
+      : "https://usercenter2.aliyun.com/order/list",
+  };
+}
+
+/**
  * Query renewal price for a PrePaid ECS instance.
- * Aliyun DescribeRenewalPrice accepts Month (1..9) or Year (1..3), so multiples
- * of 12 months are automatically converted to Year units.
+ * Multiples of 12 months are converted to Year units. Aliyun's
+ * DescribeRenewalPrice docs cap Year at 1..3 even though RenewInstance accepts
+ * 48/60 months (4/5 years), so we query directly first and fall back to a
+ * scaled reference estimate if Aliyun rejects Period=4/5 with InvalidPeriod.
  */
 export async function describeRenewalPrice(
   env: Env,
@@ -1831,21 +1866,49 @@ export async function describeRenewalPrice(
       rules: disc > 0 ? ["年付 8.5 折优惠"] : [],
     };
   }
-  let data: Record<string, unknown>;
-  try {
-    data = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
+  const queryQuote = async (p: number, unit: "Month" | "Year"): Promise<PriceQuote> => {
+    const raw = await rpcCall<Record<string, unknown>>(ecsDomain(account.region_id), account, {
       Action: "DescribeRenewalPrice",
       Version: ECS_VERSION,
       RegionId: account.region_id,
       ResourceType: "instance",
       ResourceId: account.instance_id,
-      Period: String(period),
-      PriceUnit: priceUnit,
+      Period: String(p),
+      PriceUnit: unit,
     });
+    return parsePriceQuote(raw, p, unit);
+  };
+  try {
+    return await queryQuote(period, priceUnit);
   } catch (exc) {
-    throw new AliyunError(`查询续费价格失败：${briefError(exc)}`);
+    const detail = briefError(exc);
+    const canEstimateLongYear =
+      priceUnit === "Year" &&
+      period > 3 &&
+      detail.includes("InvalidPeriod") &&
+      !detail.includes("ExceededMaximumExpirationDate");
+    if (canEstimateLongYear) {
+      for (const baseYears of [3, 1]) {
+        try {
+          const base = await queryQuote(baseYears, "Year");
+          const factor = period / baseYears;
+          return {
+            ...base,
+            original_price: Number((base.original_price * factor).toFixed(2)),
+            discount_price: Number((base.discount_price * factor).toFixed(2)),
+            trade_price: Number((base.trade_price * factor).toFixed(2)),
+            period,
+            price_unit: "Year",
+            estimated: true,
+            note: `阿里云实时询价接口暂仅支持 1–3 年，此处按 ${baseYears} 年价格折算参考；实际扣款以阿里云结算为准。`,
+          };
+        } catch {
+          // Try next shorter baseline period.
+        }
+      }
+    }
+    throw new AliyunError(`查询续费价格失败：${detail}`);
   }
-  return parsePriceQuote(data, period, priceUnit);
 }
 
 function parsePriceQuote(
