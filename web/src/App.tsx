@@ -548,10 +548,11 @@ export default function App() {
   }
 
   function deleteSwas(server: SwasServer) {
+    const vendor = server.provider === 'tencent' ? '腾讯云' : '阿里云'
     setConfirmBox({
       title: '移除轻量服务器',
       message: `确定从面板移除「${server.label || server.instance_id}」？`,
-      hint: '仅删除本面板保存的账号配置与密钥；阿里云上的包年包月轻量实例本身不受影响，不会被关机或销毁。',
+      hint: `仅删除本面板保存的账号配置与密钥；${vendor}上的包年包月轻量实例本身不受影响，不会被关机或销毁。`,
       confirmText: '从面板移除',
       failText: '移除失败',
       run: async () => {

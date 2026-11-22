@@ -46,13 +46,24 @@ const DISK_CATEGORY_LABELS: Record<string, string> = {
   cloud_essd: 'ESSD 云盘',
   cloud_ssd: 'SSD 云盘',
   cloud_efficiency: '高效云盘',
+  CLOUD_PREMIUM: '高性能云硬盘',
+  CLOUD_SSD: 'SSD 云硬盘',
+  CLOUD_BASIC: '普通云硬盘',
+  CLOUD_BSSD: '通用型 SSD 云硬盘',
 }
 
 const BUSINESS_STATUS_LABELS: Record<string, string> = {
   Normal: '正常',
   Expired: '已到期',
   Overdue: '欠费停服',
+  Restricted: '已限制 / 隔离',
   Deleted: '已释放',
+}
+
+const RENEW_FLAG_LABELS: Record<string, string> = {
+  NOTIFY_AND_AUTO_RENEW: '通知过期且自动续费',
+  NOTIFY_AND_MANUAL_RENEW: '通知过期不自动续费',
+  DISABLE_NOTIFY_AND_MANUAL_RENEW: '不通知且不自动续费',
 }
 
 function formatIso(iso?: string): string {
@@ -101,6 +112,8 @@ export function SwasDetailModal({
   onOpenRenew: (server: SwasServer) => void
   onOpenOps: (server: SwasServer) => void
 }) {
+  const isTencent = server.provider === 'tencent'
+  const vendorName = isTencent ? '腾讯云' : '阿里云'
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [detail, setDetail] = useState<SwasInstanceDetail | null>(null)
@@ -199,7 +212,7 @@ export function SwasDetailModal({
       {loading && !detail ? (
         <div className="manage-center">
           <LoaderCircle size={20} className="spin" />
-          <span>正在从阿里云拉取轻量服务器详情、流量包与磁盘列表…</span>
+          <span>正在从{vendorName}拉取轻量服务器详情、流量包与磁盘列表…</span>
         </div>
       ) : error ? (
         <div className="auth-error">
@@ -211,6 +224,12 @@ export function SwasDetailModal({
           <div className="detail-panel">
             <div className="detail-panel-head">基本信息</div>
             <div className="detail-rows">
+              <div className="detail-row">
+                <span>云厂商</span>
+                <span className={`provider-tag ${isTencent ? 'tencent' : 'aliyun'}`}>
+                  {isTencent ? '腾讯云轻量 (Lighthouse)' : '阿里云轻量 (SWAS)'}
+                </span>
+              </div>
               <div className="detail-row">
                 <span>实例 ID</span>
                 <code className="mono">{detail.instance_id}</code>
@@ -258,6 +277,12 @@ export function SwasDetailModal({
                   {expiring ? '（注意到期）' : ''}
                 </span>
               </div>
+              {detail.renew_flag && (
+                <div className="detail-row">
+                  <span>续费策略</span>
+                  <span>{RENEW_FLAG_LABELS[detail.renew_flag] ?? detail.renew_flag}</span>
+                </div>
+              )}
             </div>
           </div>
 
@@ -373,6 +398,7 @@ export function SwasVncOverlay({
   onClose: () => void
   onToast: (message: string, tone?: 'success' | 'error' | 'info') => void
 }) {
+  const isTencent = server.provider === 'tencent'
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [iframeSrc, setIframeSrc] = useState('')
@@ -389,6 +415,7 @@ export function SwasVncOverlay({
     setIframeSrc('')
     try {
       const res = await post<{
+        provider?: string
         vnc_url: string
         console_url: string
         instance_id: string
@@ -396,22 +423,26 @@ export function SwasVncOverlay({
         image_name?: string
       }>(`/api/v1/swas/${server.id}/vnc`, undefined, SLOW_TIMEOUT_MS)
       setConsoleUrl(res.console_url || '')
-      const isWindows =
-        (res.os_type || '').toLowerCase() === 'windows' ||
-        (res.image_name || '').toLowerCase().includes('windows')
-      // Aliyun SWAS DescribeInstanceVncUrl returns an already percent-encoded
-      // wss%3A%2F%2F... URL; only encode when raw wss:// is returned.
-      const encodedVncUrl = res.vnc_url.includes('://')
-        ? encodeURIComponent(res.vnc_url)
-        : res.vnc_url
-      const fullUrl =
-        'https://g.alicdn.com/aliyun/ecs-console-vnc2/0.0.8/index.html?vncUrl=' +
-        encodedVncUrl +
-        '&instanceId=' +
-        encodeURIComponent(res.instance_id) +
-        '&isWindows=' +
-        String(isWindows)
-      setIframeSrc(fullUrl)
+      // Tencent Cloud Lighthouse returns a full https://img.qcloud.com/... URL
+      // ready to embed directly; Aliyun SWAS returns a percent-encoded wss URL.
+      if (/^https?:\/\//i.test(res.vnc_url)) {
+        setIframeSrc(res.vnc_url)
+      } else {
+        const isWindows =
+          (res.os_type || '').toLowerCase() === 'windows' ||
+          (res.image_name || '').toLowerCase().includes('windows')
+        const encodedVncUrl = res.vnc_url.includes('://')
+          ? encodeURIComponent(res.vnc_url)
+          : res.vnc_url
+        const fullUrl =
+          'https://g.alicdn.com/aliyun/ecs-console-vnc2/0.0.8/index.html?vncUrl=' +
+          encodedVncUrl +
+          '&instanceId=' +
+          encodeURIComponent(res.instance_id) +
+          '&isWindows=' +
+          String(isWindows)
+        setIframeSrc(fullUrl)
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : '获取轻量 VNC 连接地址失败')
       setLoading(false)
@@ -479,57 +510,69 @@ export function SwasVncOverlay({
       <div className="vnc-bar">
         <div className="vnc-bar-info">
           <Monitor size={15} style={{ color: 'var(--accent)' }} />
+          <span className={`provider-tag ${isTencent ? 'tencent' : 'aliyun'}`}>
+            {isTencent ? '腾讯云' : '阿里云'}
+          </span>
           <strong>{server.label || server.instance_id}</strong>
           <code className="mono">{server.instance_id}</code>
         </div>
         <div className="vnc-bar-actions">
-          {pwdOpen ? (
-            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-              <input
-                type="password"
-                className="input mono"
-                style={{ width: 140, height: 28, fontSize: 12 }}
-                maxLength={6}
-                placeholder="6位字母/数字"
-                value={vncPassword}
-                disabled={pwdBusy}
-                onChange={(event) => setVncPassword(event.target.value)}
-              />
-              <button
-                type="button"
-                className="btn primary sm"
-                disabled={pwdBusy}
-                onClick={() => void submitVncPassword()}
-              >
-                {pwdBusy ? <LoaderCircle size={12} className="spin" /> : '保存'}
-              </button>
+          {!isTencent && (
+            <>
+              {pwdOpen ? (
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                  <input
+                    type="password"
+                    className="input mono"
+                    style={{ width: 140, height: 28, fontSize: 12 }}
+                    maxLength={6}
+                    placeholder="6位字母/数字"
+                    value={vncPassword}
+                    disabled={pwdBusy}
+                    onChange={(event) => setVncPassword(event.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="btn primary sm"
+                    disabled={pwdBusy}
+                    onClick={() => void submitVncPassword()}
+                  >
+                    {pwdBusy ? <LoaderCircle size={12} className="spin" /> : '保存'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    disabled={pwdBusy}
+                    onClick={() => {
+                      setPwdOpen(false)
+                      setVncPassword('')
+                    }}
+                  >
+                    取消
+                  </button>
+                </div>
+              ) : (
+                <button type="button" className="btn ghost sm" onClick={() => setPwdOpen(true)}>
+                  <KeyRound size={12} /> 改 VNC 密码
+                </button>
+              )}
               <button
                 type="button"
                 className="btn ghost sm"
-                disabled={pwdBusy}
-                onClick={() => {
-                  setPwdOpen(false)
-                  setVncPassword('')
-                }}
+                disabled={wbBusy}
+                onClick={() => void openWorkbench()}
+                title="使用阿里云 Workbench 在新窗口免密/SSH 登录"
               >
-                取消
+                {wbBusy ? <LoaderCircle size={12} className="spin" /> : <Terminal size={12} />} Workbench
               </button>
-            </div>
-          ) : (
-            <button type="button" className="btn ghost sm" onClick={() => setPwdOpen(true)}>
-              <KeyRound size={12} /> 改 VNC 密码
-            </button>
+            </>
           )}
           <button
             type="button"
             className="btn ghost sm"
-            disabled={wbBusy}
-            onClick={() => void openWorkbench()}
-            title="使用阿里云 Workbench 在新窗口免密/SSH 登录"
+            title={isTencent ? '腾讯云 VNC 链接单次有效 15 秒，超时可点击重新连接' : '重新获取 VNC 令牌并连接'}
+            onClick={() => void connect()}
           >
-            {wbBusy ? <LoaderCircle size={12} className="spin" /> : <Terminal size={12} />} Workbench
-          </button>
-          <button type="button" className="btn ghost sm" onClick={() => void connect()}>
             <RefreshCw size={12} /> 重新连接
           </button>
           {consoleUrl && (
@@ -538,9 +581,9 @@ export function SwasVncOverlay({
               href={consoleUrl}
               target="_blank"
               rel="noreferrer"
-              title="若内置终端无法加载，可跳转到阿里云轻量控制台打开"
+              title={`若内置终端无法加载，可跳转到${isTencent ? '腾讯云' : '阿里云'}轻量控制台打开`}
             >
-              <ExternalLink size={12} /> 阿里云控制台
+              <ExternalLink size={12} /> {isTencent ? '腾讯云控制台' : '阿里云控制台'}
             </a>
           )}
           <button type="button" className="btn sm danger" onClick={onClose}>
@@ -571,7 +614,9 @@ export function SwasVncOverlay({
             ) : (
               <>
                 <LoaderCircle size={22} className="spin" />
-                <span>正在建立轻量服务器 VNC 远程连接…</span>
+                <span>
+                  正在建立{isTencent ? '腾讯云' : '阿里云'}轻量服务器 VNC 远程连接…
+                </span>
               </>
             )}
           </div>
@@ -615,6 +660,8 @@ export function SwasResetModal({
   onClose: () => void
   onCompleted: (message: string) => void
 }) {
+  const isTencent = server.provider === 'tencent'
+  const vendorName = isTencent ? '腾讯云' : '阿里云'
   const [mode, setMode] = useState<ResetMode>('change')
   const [category, setCategory] = useState<SwasImageCategory>('system')
   const [keyword, setKeyword] = useState('')
@@ -694,7 +741,7 @@ export function SwasResetModal({
         return
       }
     } else if (authMode === 'keypair' && !keyPairName.trim()) {
-      setError('请选择或输入 SSH 密钥对名称')
+      setError(isTencent ? '请选择或输入 SSH 密钥对 ID（lhkp-...）' : '请选择或输入 SSH 密钥对名称')
       return
     }
     if (!ackDanger) {
@@ -760,7 +807,7 @@ export function SwasResetModal({
       <div className="reinstall-warn">
         <TriangleAlert size={15} style={{ flexShrink: 0, marginTop: 1 }} />
         <div>
-          <strong>高风险操作：</strong>重置系统将<strong>彻底清空原系统盘所有数据</strong>，数据盘不受影响。阿里云轻量服务器重置过程约需 1–3 分钟，期间实例会短暂离线并自动重启。
+          <strong>高风险操作：</strong>重置系统将<strong>彻底清空原系统盘所有数据</strong>，数据盘不受影响。{vendorName}轻量服务器重置过程约需 1–3 分钟，期间实例会短暂离线并自动重启。
         </div>
       </div>
 
@@ -880,7 +927,9 @@ export function SwasResetModal({
 
       {authMode === 'keypair' && (
         <div className="field">
-          <label htmlFor="swas-reset-kp">SSH 密钥对名称（仅 Linux 镜像生效）</label>
+          <label htmlFor="swas-reset-kp">
+            {isTencent ? 'SSH 密钥对 ID（仅 Linux 镜像生效）' : 'SSH 密钥对名称（仅 Linux 镜像生效）'}
+          </label>
           {keyPairs.length > 0 ? (
             <select
               id="swas-reset-kp"
@@ -901,7 +950,7 @@ export function SwasResetModal({
               className="input mono"
               value={keyPairName}
               onChange={(event) => setKeyPairName(event.target.value)}
-              placeholder="输入轻量控制台已创建的密钥对名称"
+              placeholder={isTencent ? '输入腾讯云密钥对 ID（如 lhkp-...）' : '输入轻量控制台已创建的密钥对名称'}
             />
           )}
         </div>
@@ -943,11 +992,11 @@ function snapshotStatusBadge(status: string, progress?: string): {
   label: string
 } {
   const s = status.toLowerCase()
-  if (s === 'accomplished' || s === 'available') return { tone: 'green', label: '可用' }
-  if (s === 'progressing' || s === 'creating') {
-    return { tone: 'amber', label: progress ? `创建中 ${progress}` : '创建中' }
+  if (s === 'accomplished' || s === 'available' || s === 'normal') return { tone: 'green', label: '可用' }
+  if (s === 'progressing' || s === 'creating' || s === 'rollbacking' || s === 'copying') {
+    return { tone: 'amber', label: progress ? `处理中 ${progress}` : '处理中' }
   }
-  if (s === 'failed') return { tone: 'red', label: '失败' }
+  if (s === 'failed' || s === 'createfailed') return { tone: 'red', label: '失败' }
   return { tone: 'gray', label: status || '未知' }
 }
 
@@ -964,6 +1013,10 @@ export function SwasImagesModal({
   onClose: () => void
   onToast: (message: string, tone?: 'success' | 'error' | 'info') => void
 }) {
+  const isTencent = server.provider === 'tencent'
+  const vendorName = isTencent ? '腾讯云' : '阿里云'
+  const uidTerm = isTencent ? 'UIN' : 'UID'
+
   const [tab, setTab] = useState<SwasImgTab>('images')
   const [accountId, setAccountId] = useState('')
   const [accountLoading, setAccountLoading] = useState(true)
@@ -978,16 +1031,18 @@ export function SwasImagesModal({
   const [snapDiskId, setSnapDiskId] = useState('')
   const [snapName, setSnapName] = useState(() => defaultTimestampName('snap'))
   const [snapBusy, setSnapBusy] = useState('')
+  const [confirmRollbackId, setConfirmRollbackId] = useState('')
 
   // Custom images state
   const [images, setImages] = useState<SwasCustomImage[]>([])
   const [imgLoading, setImgLoading] = useState(true)
   const [imgError, setImgError] = useState('')
   const [imgCreateOpen, setImgCreateOpen] = useState(false)
-  const [imgName, setImgName] = useState(() => defaultTimestampName('swas-img'))
+  const [imgName, setImgName] = useState(() => defaultTimestampName(isTencent ? 'lh-img' : 'swas-img'))
   const [imgDesc, setImgDesc] = useState('')
   const [imgSysSnapId, setImgSysSnapId] = useState('')
   const [imgDataSnapId, setImgDataSnapId] = useState('')
+  const [imgForcePowerOff, setImgForcePowerOff] = useState(true)
   const [imgBusy, setImgBusy] = useState('')
 
   // Cross-account share panel
@@ -1001,19 +1056,21 @@ export function SwasImagesModal({
 
   const shareTargets = [
     ...swasServers
-      .filter((s) => s.id !== server.id)
+      .filter((s) => s.id !== server.id && (s.provider || 'aliyun') === (server.provider || 'aliyun'))
       .map((s) => ({
         key: `swas:${s.id}`,
-        label: `[轻量] ${s.label || s.instance_id}（${s.region_id === server.region_id ? '同地域' : regionLabel(s.region_id)}）`,
+        label: `[${isTencent ? '腾讯轻量' : '阿里轻量'}] ${s.label || s.instance_id}（${s.region_id === server.region_id ? '同地域' : regionLabel(s.region_id)}）`,
         target_swas_id: s.id,
         target_server_id: 0,
       })),
-    ...ecsServers.map((s) => ({
-      key: `ecs:${s.id}`,
-      label: `[ECS] ${s.label || s.instance_id}（${s.region_id === server.region_id ? '同地域' : regionLabel(s.region_id)}）`,
-      target_swas_id: 0,
-      target_server_id: s.id,
-    })),
+    ...(!isTencent
+      ? ecsServers.map((s) => ({
+          key: `ecs:${s.id}`,
+          label: `[ECS] ${s.label || s.instance_id}（${s.region_id === server.region_id ? '同地域' : regionLabel(s.region_id)}）`,
+          target_swas_id: 0,
+          target_server_id: s.id,
+        }))
+      : []),
   ]
 
   const loadAccountId = useCallback(async () => {
@@ -1101,7 +1158,7 @@ export function SwasImagesModal({
     try {
       await navigator.clipboard.writeText(accountId)
       setCopiedUid(true)
-      onToast('已复制阿里云主账号 UID', 'success')
+      onToast(`已复制${vendorName}主账号 ${uidTerm}`, 'success')
       window.setTimeout(() => setCopiedUid(false), 1800)
     } catch {
       onToast('复制失败，请手动选中复制', 'info')
@@ -1110,7 +1167,7 @@ export function SwasImagesModal({
 
   async function submitCreateSnapshot() {
     const name = snapName.trim()
-    if (!snapDiskId) {
+    if (!isTencent && !snapDiskId) {
       setSnapError('请选择要创建快照的磁盘')
       return
     }
@@ -1123,7 +1180,7 @@ export function SwasImagesModal({
     try {
       const res = await post<{ ok: boolean; snapshot_id: string }>(
         `/api/v1/swas/${server.id}/snapshots`,
-        { disk_id: snapDiskId, snapshot_name: name },
+        { disk_id: isTencent ? undefined : snapDiskId, snapshot_name: name },
         SLOW_TIMEOUT_MS,
       )
       onToast(`快照创建已提交（${res.snapshot_id}）`, 'success')
@@ -1137,12 +1194,32 @@ export function SwasImagesModal({
     }
   }
 
+  async function handleRollbackSnapshot(snapshotId: string) {
+    setSnapBusy(`apply:${snapshotId}`)
+    setSnapError('')
+    try {
+      await post(
+        `/api/v1/swas/${server.id}/snapshots/${encodeURIComponent(snapshotId)}/apply`,
+        {},
+        SLOW_TIMEOUT_MS,
+      )
+      setConfirmRollbackId('')
+      onToast(`已提交快照回滚任务（${snapshotId}），实例将短暂离线恢复`, 'success')
+      await loadSnapshots()
+    } catch (err) {
+      setSnapError(err instanceof Error ? err.message : '回滚快照失败')
+    } finally {
+      setSnapBusy('')
+    }
+  }
+
   async function handleDeleteSnapshot(snapshotId: string) {
     setSnapBusy(`del:${snapshotId}`)
     setSnapError('')
     try {
       await del(`/api/v1/swas/${server.id}/snapshots/${encodeURIComponent(snapshotId)}`, SLOW_TIMEOUT_MS)
       setSnapshots((prev) => prev.filter((s) => s.snapshot_id !== snapshotId))
+      if (confirmRollbackId === snapshotId) setConfirmRollbackId('')
       onToast(`已删除快照 ${snapshotId}`, 'success')
     } catch (err) {
       setSnapError(err instanceof Error ? err.message : '删除快照失败')
@@ -1153,12 +1230,13 @@ export function SwasImagesModal({
 
   async function submitCreateCustomImage() {
     const name = imgName.trim()
-    if (name.length < 2 || name.length > 128) {
-      setImgError('自定义镜像名称长度须为 2–128 个字符')
+    const maxLen = isTencent ? 60 : 128
+    if (name.length < 2 || name.length > maxLen) {
+      setImgError(`自定义镜像名称长度须为 2–${maxLen} 个字符`)
       return
     }
-    if (!imgSysSnapId) {
-      setImgError('请先选择一个系统盘快照（轻量制作镜像需基于已有系统盘快照）')
+    if (!isTencent && !imgSysSnapId) {
+      setImgError('请先选择一个系统盘快照（阿里云轻量制作镜像需基于已有系统盘快照）')
       return
     }
     setImgBusy('create')
@@ -1168,15 +1246,16 @@ export function SwasImagesModal({
         `/api/v1/swas/${server.id}/custom-images`,
         {
           image_name: name,
-          system_snapshot_id: imgSysSnapId,
-          data_snapshot_id: imgDataSnapId || undefined,
+          system_snapshot_id: isTencent ? undefined : imgSysSnapId,
+          data_snapshot_id: isTencent ? undefined : imgDataSnapId || undefined,
           description: imgDesc.trim() || undefined,
+          force_power_off: isTencent ? imgForcePowerOff : undefined,
         },
         SLOW_TIMEOUT_MS,
       )
       onToast(`自定义镜像已提交创建（${res.image_id}）`, 'success')
       setImgCreateOpen(false)
-      setImgName(defaultTimestampName('swas-img'))
+      setImgName(defaultTimestampName(isTencent ? 'lh-img' : 'swas-img'))
       setImgDesc('')
       await loadCustomImages()
     } catch (err) {
@@ -1291,7 +1370,9 @@ export function SwasImagesModal({
       footer={
         <>
           <span className="hint" style={{ margin: 0 }}>
-            轻量自定义镜像需先创建系统盘快照，支持共享给同账号 ECS 及其他阿里云主账号
+            {isTencent
+              ? '腾讯云轻量可直接从实例制作自定义镜像，支持快照一键回滚与跨账号 UIN 镜像共享'
+              : '轻量自定义镜像需先创建系统盘快照，支持共享给同账号 ECS 及其他阿里云主账号'}
           </span>
           <span className="spacer" />
           <button type="button" className="btn primary sm" onClick={onClose}>
@@ -1303,11 +1384,14 @@ export function SwasImagesModal({
       <div className="img-account-bar">
         <div className="img-account-meta">
           <span>
+            <span className={`provider-tag ${isTencent ? 'tencent' : 'aliyun'}`}>{vendorName}</span>
+          </span>
+          <span>
             当前地域：<strong>{regionLabel(server.region_id)}</strong>{' '}
             <code className="mono">{server.region_id}</code>
           </span>
           <span>
-            主账号 UID：
+            主账号 {uidTerm}：
             {accountLoading ? (
               <LoaderCircle size={12} className="spin" style={{ verticalAlign: 'middle' }} />
             ) : accountId ? (
@@ -1320,7 +1404,7 @@ export function SwasImagesModal({
         {accountId && (
           <button type="button" className="btn ghost sm" onClick={() => void copyAccountId()}>
             {copiedUid ? <Check size={12} /> : <Copy size={12} />}
-            {copiedUid ? '已复制 UID' : '复制 UID'}
+            {copiedUid ? `已复制 ${uidTerm}` : `复制 ${uidTerm}`}
           </button>
         )}
       </div>
@@ -1347,11 +1431,12 @@ export function SwasImagesModal({
               className={`btn sm${imgCreateOpen ? '' : ' primary'}`}
               onClick={() => {
                 setImgError('')
-                if (!imgCreateOpen) setImgName(defaultTimestampName('swas-img'))
+                if (!imgCreateOpen) setImgName(defaultTimestampName(isTencent ? 'lh-img' : 'swas-img'))
                 setImgCreateOpen((prev) => !prev)
               }}
             >
-              <Plus size={12} /> {imgCreateOpen ? '收起表单' : '从快照制作镜像'}
+              <Plus size={12} />{' '}
+              {imgCreateOpen ? '收起表单' : isTencent ? '制作自定义镜像' : '从快照制作镜像'}
             </button>
           ) : (
             <button
@@ -1375,78 +1460,126 @@ export function SwasImagesModal({
             {imgCreateOpen && (
               <div className="img-create-box">
                 <div className="img-create-head">
-                  <span>基于系统盘快照制作自定义镜像</span>
-                  <span className="hint" style={{ margin: 0 }}>
-                    {systemSnapshots.length === 0
-                      ? '当前尚无系统盘快照，请先切到「磁盘快照」创建'
-                      : `已发现 ${systemSnapshots.length} 个系统盘快照`}
+                  <span>
+                    {isTencent
+                      ? `直接从实例 ${server.instance_id} 制作自定义镜像`
+                      : '基于系统盘快照制作自定义镜像'}
                   </span>
+                  {!isTencent && (
+                    <span className="hint" style={{ margin: 0 }}>
+                      {systemSnapshots.length === 0
+                        ? '当前尚无系统盘快照，请先切到「磁盘快照」创建'
+                        : `已发现 ${systemSnapshots.length} 个系统盘快照`}
+                    </span>
+                  )}
                 </div>
-                <div className="grid-2">
-                  <div className="field" style={{ marginBottom: 0 }}>
-                    <label htmlFor="swas-img-name">镜像名称（必填）</label>
-                    <input
-                      id="swas-img-name"
-                      className="input"
-                      value={imgName}
-                      disabled={Boolean(imgBusy)}
-                      onChange={(event) => setImgName(event.target.value)}
-                      placeholder="例如 swas-prod-20261120"
-                    />
-                  </div>
-                  <div className="field" style={{ marginBottom: 0 }}>
-                    <label htmlFor="swas-img-sys-snap">系统盘快照（必填）</label>
-                    <select
-                      id="swas-img-sys-snap"
-                      className="select"
-                      value={imgSysSnapId}
-                      disabled={Boolean(imgBusy) || systemSnapshots.length === 0}
-                      onChange={(event) => setImgSysSnapId(event.target.value)}
-                    >
-                      {systemSnapshots.length === 0 ? (
-                        <option value="">请先创建系统盘快照</option>
-                      ) : (
-                        systemSnapshots.map((s) => (
-                          <option key={s.snapshot_id} value={s.snapshot_id}>
-                            {s.snapshot_name || s.snapshot_id} ({s.snapshot_id})
-                          </option>
-                        ))
-                      )}
-                    </select>
-                  </div>
-                </div>
-                <div className="grid-2" style={{ marginTop: 10 }}>
-                  <div className="field" style={{ marginBottom: 0 }}>
-                    <label htmlFor="swas-img-data-snap">数据盘快照（可选）</label>
-                    <select
-                      id="swas-img-data-snap"
-                      className="select"
-                      value={imgDataSnapId}
-                      disabled={Boolean(imgBusy)}
-                      onChange={(event) => setImgDataSnapId(event.target.value)}
-                    >
-                      <option value="">不附加数据盘快照</option>
-                      {dataSnapshots.map((s) => (
-                        <option key={s.snapshot_id} value={s.snapshot_id}>
-                          {s.snapshot_name || s.snapshot_id} ({s.snapshot_id})
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="field" style={{ marginBottom: 0 }}>
-                    <label htmlFor="swas-img-desc">镜像描述（可选）</label>
-                    <input
-                      id="swas-img-desc"
-                      className="input"
-                      value={imgDesc}
-                      disabled={Boolean(imgBusy)}
-                      onChange={(event) => setImgDesc(event.target.value)}
-                      placeholder="备注环境、应用或用途"
-                    />
-                  </div>
-                </div>
+
+                {isTencent ? (
+                  <>
+                    <div className="grid-2">
+                      <div className="field" style={{ marginBottom: 0 }}>
+                        <label htmlFor="swas-img-name">镜像名称（2–60 字符，必填）</label>
+                        <input
+                          id="swas-img-name"
+                          className="input"
+                          value={imgName}
+                          disabled={Boolean(imgBusy)}
+                          onChange={(event) => setImgName(event.target.value)}
+                          placeholder="例如 lh-prod-20261122"
+                        />
+                      </div>
+                      <div className="field" style={{ marginBottom: 0 }}>
+                        <label htmlFor="swas-img-desc">镜像描述（可选）</label>
+                        <input
+                          id="swas-img-desc"
+                          className="input"
+                          value={imgDesc}
+                          disabled={Boolean(imgBusy)}
+                          onChange={(event) => setImgDesc(event.target.value)}
+                          placeholder="备注环境、应用或用途"
+                        />
+                      </div>
+                    </div>
+                    <label className="img-delete-force" style={{ marginTop: 8 }}>
+                      <input
+                        type="checkbox"
+                        checked={imgForcePowerOff}
+                        disabled={Boolean(imgBusy)}
+                        onChange={(event) => setImgForcePowerOff(event.target.checked)}
+                      />
+                      <span>先强制关机再制作镜像（推荐，避免运行时文件不一致）</span>
+                    </label>
+                  </>
+                ) : (
+                  <>
+                    <div className="grid-2">
+                      <div className="field" style={{ marginBottom: 0 }}>
+                        <label htmlFor="swas-img-name">镜像名称（必填）</label>
+                        <input
+                          id="swas-img-name"
+                          className="input"
+                          value={imgName}
+                          disabled={Boolean(imgBusy)}
+                          onChange={(event) => setImgName(event.target.value)}
+                          placeholder="例如 swas-prod-20261120"
+                        />
+                      </div>
+                      <div className="field" style={{ marginBottom: 0 }}>
+                        <label htmlFor="swas-img-sys-snap">系统盘快照（必填）</label>
+                        <select
+                          id="swas-img-sys-snap"
+                          className="select"
+                          value={imgSysSnapId}
+                          disabled={Boolean(imgBusy) || systemSnapshots.length === 0}
+                          onChange={(event) => setImgSysSnapId(event.target.value)}
+                        >
+                          {systemSnapshots.length === 0 ? (
+                            <option value="">请先创建系统盘快照</option>
+                          ) : (
+                            systemSnapshots.map((s) => (
+                              <option key={s.snapshot_id} value={s.snapshot_id}>
+                                {s.snapshot_name || s.snapshot_id} ({s.snapshot_id})
+                              </option>
+                            ))
+                          )}
+                        </select>
+                      </div>
+                    </div>
+                    <div className="grid-2" style={{ marginTop: 10 }}>
+                      <div className="field" style={{ marginBottom: 0 }}>
+                        <label htmlFor="swas-img-data-snap">数据盘快照（可选）</label>
+                        <select
+                          id="swas-img-data-snap"
+                          className="select"
+                          value={imgDataSnapId}
+                          disabled={Boolean(imgBusy)}
+                          onChange={(event) => setImgDataSnapId(event.target.value)}
+                        >
+                          <option value="">不附加数据盘快照</option>
+                          {dataSnapshots.map((s) => (
+                            <option key={s.snapshot_id} value={s.snapshot_id}>
+                              {s.snapshot_name || s.snapshot_id} ({s.snapshot_id})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="field" style={{ marginBottom: 0 }}>
+                        <label htmlFor="swas-img-desc">镜像描述（可选）</label>
+                        <input
+                          id="swas-img-desc"
+                          className="input"
+                          value={imgDesc}
+                          disabled={Boolean(imgBusy)}
+                          onChange={(event) => setImgDesc(event.target.value)}
+                          placeholder="备注环境、应用或用途"
+                        />
+                      </div>
+                    </div>
+                  </>
+                )}
+
                 <div className="img-create-actions">
-                  {systemSnapshots.length === 0 && (
+                  {!isTencent && systemSnapshots.length === 0 && (
                     <button
                       type="button"
                       className="btn sm"
@@ -1470,7 +1603,7 @@ export function SwasImagesModal({
                   <button
                     type="button"
                     className="btn primary sm"
-                    disabled={Boolean(imgBusy) || !imgSysSnapId}
+                    disabled={Boolean(imgBusy) || (!isTencent && !imgSysSnapId)}
                     onClick={() => void submitCreateCustomImage()}
                   >
                     {imgBusy === 'create' ? <LoaderCircle size={12} className="spin" /> : <Plus size={12} />}
@@ -1496,7 +1629,9 @@ export function SwasImagesModal({
               <div className="manage-center">
                 <Layers size={20} style={{ opacity: 0.45 }} />
                 <span>
-                  当前地域暂无轻量自定义镜像。可先在「磁盘快照」中创建系统盘快照，再一键制作自定义镜像。
+                  {isTencent
+                    ? '当前地域暂无腾讯云轻量自定义镜像，点击上方「制作自定义镜像」可直接从实例创建。'
+                    : '当前地域暂无轻量自定义镜像。可先在「磁盘快照」中创建系统盘快照，再一键制作自定义镜像。'}
                 </span>
               </div>
             ) : (
@@ -1512,7 +1647,7 @@ export function SwasImagesModal({
                           <div className="img-card-title">
                             <strong>{img.name || img.image_id}</strong>
                             <Badge tone={st.tone}>{st.label}</Badge>
-                            {img.in_share_ecs && <Badge tone="blue">已共享至 ECS</Badge>}
+                            {!isTencent && img.in_share_ecs && <Badge tone="blue">已共享至 ECS</Badge>}
                             {img.in_share_user && <Badge tone="green">已跨账号共享</Badge>}
                           </div>
                           <div className="img-card-meta">
@@ -1530,24 +1665,26 @@ export function SwasImagesModal({
                         </div>
 
                         <div className="img-card-actions">
-                          <button
-                            type="button"
-                            className={`btn sm${img.in_share_ecs ? '' : ' ghost'}`}
-                            disabled={Boolean(imgBusy)}
-                            title={
-                              img.in_share_ecs
-                                ? '取消共享到同账号同地域的 ECS 服务'
-                                : '将轻量自定义镜像共享到同账号同地域的 ECS 使用'
-                            }
-                            onClick={() => void handleToggleShareEcs(img)}
-                          >
-                            {imgBusy === `ecs:${img.image_id}` ? (
-                              <LoaderCircle size={12} className="spin" />
-                            ) : (
-                              <Share2 size={12} />
-                            )}
-                            {img.in_share_ecs ? '取消 ECS 共享' : '共享到 ECS'}
-                          </button>
+                          {!isTencent && (
+                            <button
+                              type="button"
+                              className={`btn sm${img.in_share_ecs ? '' : ' ghost'}`}
+                              disabled={Boolean(imgBusy)}
+                              title={
+                                img.in_share_ecs
+                                  ? '取消共享到同账号同地域的 ECS 服务'
+                                  : '将轻量自定义镜像共享到同账号同地域的 ECS 使用'
+                              }
+                              onClick={() => void handleToggleShareEcs(img)}
+                            >
+                              {imgBusy === `ecs:${img.image_id}` ? (
+                                <LoaderCircle size={12} className="spin" />
+                              ) : (
+                                <Share2 size={12} />
+                              )}
+                              {img.in_share_ecs ? '取消 ECS 共享' : '共享到 ECS'}
+                            </button>
+                          )}
                           <button
                             type="button"
                             className={`btn sm${expanded ? ' primary' : ''}`}
@@ -1574,7 +1711,7 @@ export function SwasImagesModal({
                       {expanded && (
                         <div className="img-share-box">
                           <div className="img-share-section-title">
-                            <span>已共享阿里云账号（{shares.length}）</span>
+                            <span>已共享{vendorName}账号（{shares.length}）</span>
                             <button
                               type="button"
                               className="btn ghost sm"
@@ -1604,7 +1741,7 @@ export function SwasImagesModal({
                             </div>
                           ) : shares.length === 0 ? (
                             <div className="hint" style={{ margin: 0 }}>
-                              尚未共享给其他阿里云账号。可在下方选择面板中的服务器或输入对方主账号 UID 添加。
+                              尚未共享给其他{vendorName}账号。可在下方选择面板中的同厂商服务器或输入对方主账号 {uidTerm} 添加。
                             </div>
                           ) : (
                             <div className="img-share-list">
@@ -1649,11 +1786,11 @@ export function SwasImagesModal({
                           <div className="img-share-controls">
                             <div className="img-share-panel">
                               <label htmlFor={`swas-share-srv-${img.image_id}`}>
-                                方式一：共享给面板中另一台服务器所属账号
+                                方式一：共享给面板中另一台{vendorName}服务器所属账号
                               </label>
                               {shareTargets.length === 0 ? (
                                 <div className="hint" style={{ margin: 0 }}>
-                                  面板中暂无其他服务器，请使用右侧 UID 手动共享。
+                                  面板中暂无其他{vendorName}服务器，请使用右侧 {uidTerm} 手动共享。
                                 </div>
                               ) : (
                                 <div className="img-share-inline">
@@ -1702,7 +1839,7 @@ export function SwasImagesModal({
 
                             <div className="img-share-panel">
                               <label htmlFor={`swas-share-uid-${img.image_id}`}>
-                                方式二：输入目标阿里云主账号 UID
+                                方式二：输入目标{vendorName}主账号 {uidTerm}
                               </label>
                               <div className="img-share-inline">
                                 <input
@@ -1711,7 +1848,11 @@ export function SwasImagesModal({
                                   value={manualUid}
                                   disabled={Boolean(shareBusyKey)}
                                   onChange={(event) => setManualUid(event.target.value)}
-                                  placeholder="纯数字主账号 UID，如 1234567890123456"
+                                  placeholder={
+                                    isTencent
+                                      ? '纯数字主账号 UIN，如 100012345678'
+                                      : '纯数字主账号 UID，如 1234567890123456'
+                                  }
                                 />
                                 <button
                                   type="button"
@@ -1720,7 +1861,7 @@ export function SwasImagesModal({
                                   onClick={() => {
                                     const uid = manualUid.trim()
                                     if (!/^\d{6,24}$/.test(uid)) {
-                                      setSharesError('请输入 6–24 位纯数字阿里云主账号 UID')
+                                      setSharesError(`请输入 6–24 位纯数字${vendorName}主账号 ${uidTerm}`)
                                       return
                                     }
                                     void applyCrossShare(
@@ -1736,7 +1877,7 @@ export function SwasImagesModal({
                                   ) : (
                                     <UserPlus size={12} />
                                   )}
-                                  添加 UID
+                                  添加 {uidTerm}
                                 </button>
                               </div>
                             </div>
@@ -1754,33 +1895,18 @@ export function SwasImagesModal({
             {snapCreateOpen && (
               <div className="img-create-box">
                 <div className="img-create-head">
-                  <span>为实例 {server.instance_id} 的磁盘创建快照</span>
+                  <span>
+                    {isTencent
+                      ? `为实例 ${server.instance_id} 系统盘创建快照`
+                      : `为实例 ${server.instance_id} 的磁盘创建快照`}
+                  </span>
                   <span className="hint" style={{ margin: 0 }}>
-                    系统盘快照可用于制作轻量自定义镜像与跨账号共享
+                    {isTencent
+                      ? '腾讯云轻量支持一键回滚到已创建的系统盘快照'
+                      : '系统盘快照可用于制作轻量自定义镜像与跨账号共享'}
                   </span>
                 </div>
-                <div className="grid-2">
-                  <div className="field" style={{ marginBottom: 0 }}>
-                    <label htmlFor="swas-snap-disk">选择磁盘</label>
-                    <select
-                      id="swas-snap-disk"
-                      className="select"
-                      value={snapDiskId}
-                      disabled={Boolean(snapBusy) || disks.length === 0}
-                      onChange={(event) => setSnapDiskId(event.target.value)}
-                    >
-                      {disks.length === 0 ? (
-                        <option value="">暂无磁盘</option>
-                      ) : (
-                        disks.map((d) => (
-                          <option key={d.disk_id} value={d.disk_id}>
-                            {d.disk_type.toLowerCase() === 'system' ? '系统盘' : '数据盘'} ·{' '}
-                            {d.size} GiB ({d.disk_id})
-                          </option>
-                        ))
-                      )}
-                    </select>
-                  </div>
+                {isTencent ? (
                   <div className="field" style={{ marginBottom: 0 }}>
                     <label htmlFor="swas-snap-name">快照名称（2–50 字符）</label>
                     <input
@@ -1789,10 +1915,45 @@ export function SwasImagesModal({
                       value={snapName}
                       disabled={Boolean(snapBusy)}
                       onChange={(event) => setSnapName(event.target.value)}
-                      placeholder="例如 snap-20261120"
+                      placeholder="例如 snap-20261122"
                     />
                   </div>
-                </div>
+                ) : (
+                  <div className="grid-2">
+                    <div className="field" style={{ marginBottom: 0 }}>
+                      <label htmlFor="swas-snap-disk">选择磁盘</label>
+                      <select
+                        id="swas-snap-disk"
+                        className="select"
+                        value={snapDiskId}
+                        disabled={Boolean(snapBusy) || disks.length === 0}
+                        onChange={(event) => setSnapDiskId(event.target.value)}
+                      >
+                        {disks.length === 0 ? (
+                          <option value="">暂无磁盘</option>
+                        ) : (
+                          disks.map((d) => (
+                            <option key={d.disk_id} value={d.disk_id}>
+                              {d.disk_type.toLowerCase() === 'system' ? '系统盘' : '数据盘'} ·{' '}
+                              {d.size} GiB ({d.disk_id})
+                            </option>
+                          ))
+                        )}
+                      </select>
+                    </div>
+                    <div className="field" style={{ marginBottom: 0 }}>
+                      <label htmlFor="swas-snap-name">快照名称（2–50 字符）</label>
+                      <input
+                        id="swas-snap-name"
+                        className="input"
+                        value={snapName}
+                        disabled={Boolean(snapBusy)}
+                        onChange={(event) => setSnapName(event.target.value)}
+                        placeholder="例如 snap-20261120"
+                      />
+                    </div>
+                  </div>
+                )}
                 <div className="img-create-actions">
                   <button
                     type="button"
@@ -1805,7 +1966,7 @@ export function SwasImagesModal({
                   <button
                     type="button"
                     className="btn primary sm"
-                    disabled={Boolean(snapBusy) || !snapDiskId}
+                    disabled={Boolean(snapBusy) || (!isTencent && !snapDiskId)}
                     onClick={() => void submitCreateSnapshot()}
                   >
                     {snapBusy === 'create' ? <LoaderCircle size={12} className="spin" /> : <Camera size={12} />}
@@ -1830,13 +1991,14 @@ export function SwasImagesModal({
             ) : snapshots.length === 0 ? (
               <div className="manage-center">
                 <Camera size={20} style={{ opacity: 0.45 }} />
-                <span>当前实例暂无磁盘快照，点击上方「创建磁盘快照」即可备份系统盘或数据盘。</span>
+                <span>当前实例暂无磁盘快照，点击上方「创建磁盘快照」即可备份系统盘。</span>
               </div>
             ) : (
               <div className="img-cards">
                 {snapshots.map((snap) => {
                   const st = snapshotStatusBadge(snap.status, snap.progress)
                   const isSystem = snap.source_disk_type.toLowerCase() === 'system'
+                  const confirming = confirmRollbackId === snap.snapshot_id
                   return (
                     <div className="img-card" key={snap.snapshot_id}>
                       <div className="img-card-head">
@@ -1855,19 +2017,57 @@ export function SwasImagesModal({
                           </div>
                         </div>
                         <div className="img-card-actions">
-                          {isSystem && (
-                            <button
-                              type="button"
-                              className="btn sm"
-                              onClick={() => {
-                                setImgSysSnapId(snap.snapshot_id)
-                                setImgName(defaultTimestampName('swas-img'))
-                                setImgCreateOpen(true)
-                                setTab('images')
-                              }}
-                            >
-                              <Layers size={12} /> 制作镜像
-                            </button>
+                          {isTencent ? (
+                            confirming ? (
+                              <>
+                                <button
+                                  type="button"
+                                  className="btn danger sm"
+                                  disabled={Boolean(snapBusy)}
+                                  onClick={() => void handleRollbackSnapshot(snap.snapshot_id)}
+                                >
+                                  {snapBusy === `apply:${snap.snapshot_id}` ? (
+                                    <LoaderCircle size={12} className="spin" />
+                                  ) : (
+                                    <RotateCcw size={12} />
+                                  )}
+                                  确认覆盖回滚
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn ghost sm"
+                                  disabled={Boolean(snapBusy)}
+                                  onClick={() => setConfirmRollbackId('')}
+                                >
+                                  取消
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                type="button"
+                                className="btn sm"
+                                disabled={Boolean(snapBusy)}
+                                title="将系统盘数据回滚到该快照时间点（当前系统盘改动将被覆盖）"
+                                onClick={() => setConfirmRollbackId(snap.snapshot_id)}
+                              >
+                                <RotateCcw size={12} /> 回滚快照
+                              </button>
+                            )
+                          ) : (
+                            isSystem && (
+                              <button
+                                type="button"
+                                className="btn sm"
+                                onClick={() => {
+                                  setImgSysSnapId(snap.snapshot_id)
+                                  setImgName(defaultTimestampName('swas-img'))
+                                  setImgCreateOpen(true)
+                                  setTab('images')
+                                }}
+                              >
+                                <Layers size={12} /> 制作镜像
+                              </button>
+                            )
                           )}
                           <button
                             type="button"

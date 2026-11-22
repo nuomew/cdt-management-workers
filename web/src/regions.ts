@@ -1,4 +1,4 @@
-import type { SiteType } from './types'
+import type { SiteType, SwasProvider } from './types'
 
 /**
  * 地域候选。group 只用来在 <select> 里分组显示。
@@ -52,11 +52,34 @@ export const REGIONS: RegionOption[] = [
   { value: 'me-central-1', label: '沙特阿拉伯（利雅得）', group: '中东', sites: ['international'] },
 ]
 
+export const TENCENT_REGIONS: RegionOption[] = [
+  { value: 'ap-guangzhou', label: '华南地区（广州）', group: '中国大陆', sites: ['china'] },
+  { value: 'ap-shanghai', label: '华东地区（上海）', group: '中国大陆', sites: ['china'] },
+  { value: 'ap-beijing', label: '华北地区（北京）', group: '中国大陆', sites: ['china'] },
+  { value: 'ap-nanjing', label: '华东地区（南京）', group: '中国大陆', sites: ['china'] },
+  { value: 'ap-chengdu', label: '西南地区（成都）', group: '中国大陆', sites: ['china'] },
+  { value: 'ap-chongqing', label: '西南地区（重庆）', group: '中国大陆', sites: ['china'] },
+  { value: 'ap-hongkong', label: '中国香港', group: '港澳与海外', sites: ['china', 'international'] },
+  { value: 'ap-singapore', label: '亚太东南（新加坡）', group: '亚太', sites: ['china', 'international'] },
+  { value: 'ap-tokyo', label: '亚太东北（东京）', group: '亚太', sites: ['china', 'international'] },
+  { value: 'ap-seoul', label: '亚太东北（首尔）', group: '亚太', sites: ['china', 'international'] },
+  { value: 'ap-bangkok', label: '亚太东南（曼谷）', group: '亚太', sites: ['china', 'international'] },
+  { value: 'ap-jakarta', label: '亚太东南（雅加达）', group: '亚太', sites: ['china', 'international'] },
+  { value: 'na-siliconvalley', label: '美国西部（硅谷）', group: '北美', sites: ['china', 'international'] },
+  { value: 'na-ashburn', label: '美国东部（弗吉尼亚）', group: '北美', sites: ['china', 'international'] },
+  { value: 'sa-saopaulo', label: '南美地区（圣保罗）', group: '南美', sites: ['china', 'international'] },
+  { value: 'eu-frankfurt', label: '欧洲地区（法兰克福）', group: '欧洲', sites: ['china', 'international'] },
+]
+
 export const GROUP_ORDER = ['中国大陆', '港澳与海外', '亚太', '北美', '南美', '欧洲', '中东']
 
 export const DEFAULT_REGION = 'cn-hongkong'
+export const DEFAULT_TENCENT_REGION = 'ap-guangzhou'
 
-const LABELS = new Map(REGIONS.map((region) => [region.value, region.label]))
+const LABELS = new Map<string, string>([
+  ...REGIONS.map((region): [string, string] => [region.value, region.label]),
+  ...TENCENT_REGIONS.map((region): [string, string] => [region.value, region.label]),
+])
 
 /** 地域代码 → 中文名。清单外的代码原样返回，不做猜测。 */
 export function regionLabel(regionId?: string | null): string {
@@ -67,4 +90,9 @@ export function regionLabel(regionId?: string | null): string {
 
 export function regionsFor(site: SiteType): RegionOption[] {
   return REGIONS.filter((region) => region.sites.includes(site))
+}
+
+export function regionsForProvider(provider: SwasProvider, site: SiteType): RegionOption[] {
+  const list = provider === 'tencent' ? TENCENT_REGIONS : REGIONS
+  return list.filter((region) => region.sites.includes(site))
 }

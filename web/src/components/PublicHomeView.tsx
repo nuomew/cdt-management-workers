@@ -361,12 +361,13 @@ export default function PublicHomeView({
                 <div className="tele-node-grid">
                   {filteredNodes.map((node, idx) => {
                     const unlimitedSwas = node.kind === 'swas' && node.quota_gb <= 0
+                    const isTencent = node.kind === 'swas' && node.provider === 'tencent'
                     return (
                       <div className={`card tele-node-card health-${node.health}`} key={`${node.kind}-${node.name}-${idx}`}>
                         <div className="tele-node-top">
                           <div className="tele-node-title">
-                            <span className={`tele-kind-chip ${node.kind}`}>
-                              {node.kind === 'ecs' ? 'ECS' : '轻量'}
+                            <span className={`tele-kind-chip ${node.kind}${isTencent ? ' tencent' : ''}`}>
+                              {node.kind === 'ecs' ? 'ECS' : isTencent ? '腾讯轻量' : '阿里轻量'}
                             </span>
                             <strong title={node.name}>{node.name}</strong>
                           </div>
@@ -459,6 +460,7 @@ export default function PublicHomeView({
                     <div className="tele-rank-list">
                       {data.ranking.map((item, idx) => {
                         const unlimitedSwas = item.kind === 'swas' && item.quota_gb <= 0
+                        const isTencent = item.kind === 'swas' && item.provider === 'tencent'
                         const widthPct = Math.max(4, (item.used_gb / maxRankUsed) * 100)
                         return (
                           <div className="tele-rank-row" key={`${item.kind}-${item.name}-${idx}`}>
@@ -466,8 +468,8 @@ export default function PublicHomeView({
                               <span className={`tele-rank-idx top-${idx < 3 ? idx + 1 : 'n'}`}>
                                 {idx + 1}
                               </span>
-                              <span className={`tele-kind-chip ${item.kind}`}>
-                                {item.kind === 'ecs' ? 'ECS' : '轻量'}
+                              <span className={`tele-kind-chip ${item.kind}${isTencent ? ' tencent' : ''}`}>
+                                {item.kind === 'ecs' ? 'ECS' : isTencent ? '腾讯轻量' : '阿里轻量'}
                               </span>
                               <strong className="tele-rank-name">{item.name}</strong>
                               <span className="tele-rank-region">{regionLabel(item.region_id)}</span>
@@ -477,7 +479,7 @@ export default function PublicHomeView({
                             </div>
                             <div className="tele-rank-track">
                               <div
-                                className={`tele-rank-fill ${item.kind}`}
+                                className={`tele-rank-fill ${item.kind}${isTencent ? ' tencent' : ''}`}
                                 style={{ width: `${widthPct}%` }}
                               />
                             </div>

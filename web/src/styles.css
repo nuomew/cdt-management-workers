@@ -928,6 +928,31 @@ input[type='number']::-webkit-inner-spin-button {
   border-color: color-mix(in srgb, var(--blue) 22%, transparent);
 }
 
+/* 云厂商标记（阿里云 / 腾讯云） */
+.provider-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.provider-tag.aliyun {
+  color: #c2571a;
+  background: color-mix(in srgb, #f97316 13%, transparent);
+  border: 1px solid color-mix(in srgb, #f97316 26%, transparent);
+}
+
+.provider-tag.tencent {
+  color: #0277bd;
+  background: color-mix(in srgb, #0288d1 13%, transparent);
+  border: 1px solid color-mix(in srgb, #0288d1 28%, transparent);
+}
+
 /* -------------------------------------------------------------- 环形进度 */
 
 .ring {
@@ -5017,6 +5042,11 @@ input[type='number']::-webkit-inner-spin-button {
   background: color-mix(in srgb, var(--blue) 14%, transparent);
 }
 
+.tele-kind-chip.swas.tencent {
+  color: #0277bd;
+  background: color-mix(in srgb, #0288d1 15%, transparent);
+}
+
 .tele-node-meta {
   display: flex;
   align-items: center;
@@ -5191,6 +5221,10 @@ input[type='number']::-webkit-inner-spin-button {
 
 .tele-rank-fill.swas {
   background: linear-gradient(90deg, #d8b4fe, #a855f7);
+}
+
+.tele-rank-fill.swas.tencent {
+  background: linear-gradient(90deg, #7dd3fc, #0284c7);
 }
 
 @media (max-width: 1060px) {

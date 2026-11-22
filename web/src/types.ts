@@ -529,8 +529,11 @@ export type SwasTrafficPackage = {
   overflow_gb: number
 }
 
+export type SwasProvider = 'aliyun' | 'tencent'
+
 export type SwasServer = {
   id: number
+  provider: SwasProvider
   label: string
   access_key_id: string
   access_key_masked: string
@@ -571,6 +574,7 @@ export type SwasInstanceDetail = {
   ddos_status: string
   disable_reason: string
   charge_type: string
+  renew_flag?: string
   plan_id: string
   plan_type: string
   public_ip: string
@@ -671,6 +675,7 @@ export type TrendPoint = {
 
 export type PublicNodeItem = {
   kind: 'ecs' | 'swas'
+  provider?: SwasProvider
   name: string
   region_id: string
   status: string
@@ -727,6 +732,7 @@ export type PublicHomePayload = {
   nodes: PublicNodeItem[]
   ranking: {
     kind: 'ecs' | 'swas'
+    provider?: SwasProvider
     name: string
     region_id: string
     used_gb: number
@@ -740,6 +746,7 @@ export type PublicHomePayload = {
 export type AdminNodeMetric = {
   id: number
   kind: 'ecs' | 'swas'
+  provider?: SwasProvider
   label: string
   instance_id: string
   region_id: string
@@ -781,6 +788,7 @@ export type AdminDashboardPayload = {
   ranking: {
     id: number
     kind: 'ecs' | 'swas'
+    provider?: SwasProvider
     name: string
     region_id: string
     used_gb: number

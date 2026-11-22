@@ -2296,8 +2296,15 @@ export async function pruneEvents(env: Env, days: number): Promise<void> {
 // swas_servers (Aliyun Lightweight Application Server — independent registry)
 // ---------------------------------------------------------------------------
 
+export type SwasProvider = "aliyun" | "tencent";
+
+export function normalizeProvider(value: unknown): SwasProvider {
+  const s = asStr(value).trim().toLowerCase();
+  return s === "tencent" ? "tencent" : "aliyun";
+}
+
 export const SWAS_COLUMNS =
-  "id, label, access_key_id, access_key_secret, region_id, site, instance_id, remark, " +
+  "id, provider, label, access_key_id, access_key_secret, region_id, site, instance_id, remark, " +
   "instance_status, public_ip, inner_ip, plan_id, plan_type, cpu, memory_gb, disk_size_gb, " +
   "bandwidth_mbps, image_name, os_type, expired_time, business_status, " +
   "traffic_used_gb, traffic_total_gb, traffic_overflow_gb, status_checked_at, traffic_checked_at, " +
@@ -2306,6 +2313,7 @@ export const SWAS_COLUMNS =
 
 export interface SwasServerView {
   id: number;
+  provider: SwasProvider;
   label: string;
   access_key_id: string;
   region_id: string;
@@ -2348,6 +2356,7 @@ export interface SwasServerView {
 async function swasRow(env: Env, row: Row, decryptSecret = false): Promise<SwasServerView> {
   const item: SwasServerView = {
     id: asInt(row["id"]),
+    provider: normalizeProvider(row["provider"]),
     label: asStr(row["label"]),
     access_key_id: asStr(row["access_key_id"]),
     region_id: asStr(row["region_id"]),
@@ -2392,7 +2401,7 @@ async function swasRow(env: Env, row: Row, decryptSecret = false): Promise<SwasS
         item.access_key_secret = await decrypt(secret, env.ENCRYPTION_KEY);
       } catch {
         throw new Error(
-          `${item.label || "该轻量服务器"} 的 AccessKey Secret 解密失败，请重新填写一遍 Secret`,
+          `${item.label || "该轻量服务器"} 的密钥解密失败，请重新填写一遍 Secret`,
         );
       }
     }
@@ -2436,6 +2445,7 @@ export async function getSwasServer(
 
 export interface SwasServerPayload {
   id?: unknown;
+  provider?: unknown;
   label?: unknown;
   access_key_id?: unknown;
   access_key_secret?: unknown;
@@ -2451,6 +2461,7 @@ export async function upsertSwasServer(
   payload: SwasServerPayload,
 ): Promise<number> {
   const swasId = asInt(payload["id"], 0);
+  let provider = normalizeProvider(payload["provider"]);
   const label = asStr(payload["label"]).trim();
   let ak = asStr(payload["access_key_id"]).trim();
   const sk = asStr(payload["access_key_secret"]).trim();
@@ -2465,10 +2476,13 @@ export async function upsertSwasServer(
   if (swasId) {
     const existing = await queryOne<Row>(
       env.DB,
-      "SELECT access_key_id, access_key_secret, site, instance_id FROM swas_servers WHERE id=?",
+      "SELECT provider, access_key_id, access_key_secret, site, instance_id FROM swas_servers WHERE id=?",
       [swasId],
     );
     if (existing === null) throw new Error("轻量服务器不存在");
+    if (payload["provider"] === null || payload["provider"] === undefined || asStr(payload["provider"]).trim() === "") {
+      provider = normalizeProvider(existing["provider"]);
+    }
     if (!ak) ak = asStr(existing["access_key_id"]);
     if (payload["site"] === null || payload["site"] === undefined) {
       site = normalizeSite(existing["site"]);
@@ -2477,6 +2491,7 @@ export async function upsertSwasServer(
       ? await encrypt(sk, env.ENCRYPTION_KEY)
       : asStr(existing["access_key_secret"]);
     const billingChanged =
+      provider !== normalizeProvider(existing["provider"]) ||
       ak !== asStr(existing["access_key_id"]) ||
       instance !== asStr(existing["instance_id"]) ||
       site !== normalizeSite(existing["site"]);
@@ -2486,22 +2501,29 @@ export async function upsertSwasServer(
       : "";
     await execute(
       env.DB,
-      "UPDATE swas_servers SET label=?, access_key_id=?, access_key_secret=?, region_id=?, " +
+      "UPDATE swas_servers SET provider=?, label=?, access_key_id=?, access_key_secret=?, region_id=?, " +
         "site=?, instance_id=?, remark=?" +
         resetBilling +
         " WHERE id=?",
-      [label || instance.slice(0, 12), ak, encrypted, region, site, instance, remark, swasId],
+      [provider, label || instance.slice(0, 12), ak, encrypted, region, site, instance, remark, swasId],
     );
     return swasId;
   }
 
-  if (!ak) throw new Error("AccessKey ID 不能为空");
-  if (!sk) throw new Error("新建轻量服务器必须填写 AccessKey Secret（或复用已有服务器账号）");
+  if (!ak) throw new Error(provider === "tencent" ? "SecretId 不能为空" : "AccessKey ID 不能为空");
+  if (!sk) {
+    throw new Error(
+      provider === "tencent"
+        ? "新建腾讯云轻量服务器必须填写 SecretKey（或复用已有腾讯云账号）"
+        : "新建轻量服务器必须填写 AccessKey Secret（或复用已有服务器账号）",
+    );
+  }
   const result = await execute(
     env.DB,
-    "INSERT INTO swas_servers(label, access_key_id, access_key_secret, region_id, site, " +
-      "instance_id, remark, created_at) VALUES(?,?,?,?,?,?,?,?)",
+    "INSERT INTO swas_servers(provider, label, access_key_id, access_key_secret, region_id, site, " +
+      "instance_id, remark, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
     [
+      provider,
       label || instance.slice(0, 12),
       ak,
       await encrypt(sk, env.ENCRYPTION_KEY),

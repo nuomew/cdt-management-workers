@@ -11,13 +11,24 @@
 
 import type { Env } from "./env";
 import * as repo from "./repo";
+import * as tencent from "./tencent_lighthouse";
 import {
   AliyunError,
   briefError,
+  buildRenewalConsoleUrls as buildAliyunRenewalConsoleUrls,
+  getCallerAccountId as getAliyunCallerAccountId,
   signRpcUrl,
   type AliyunAccount,
   type PriceQuote,
 } from "./aliyun";
+
+export interface SwasAccount extends AliyunAccount {
+  provider?: repo.SwasProvider;
+}
+
+function isTencent(account: SwasAccount): boolean {
+  return account.provider === "tencent";
+}
 
 export const SWAS_VERSION = "2020-06-01";
 const HTTP_TIMEOUT_MS = 12_000;
@@ -104,7 +115,7 @@ export interface SwasDisk {
   disk_id: string;
   disk_name: string;
   disk_type: string; // system | data
-  category: string; // ESSD | SSD | CLOUD_EFFICIENCY
+  category: string; // ESSD | SSD | CLOUD_EFFICIENCY | CLOUD_PREMIUM | CLOUD_SSD
   size: number;
   device: string;
   status: string;
@@ -150,6 +161,7 @@ export interface SwasInstanceDetail {
   os_type: string;
   creation_time: string;
   expired_time: string;
+  renew_flag?: string;
   disks: SwasDisk[];
   traffic?: SwasTrafficPackage | null;
 }
@@ -434,12 +446,13 @@ function parseTraffic(raw: Record<string, unknown>): SwasTrafficPackage {
 // Instances & traffic packages
 // ---------------------------------------------------------------------------
 
-/** List all SWAS instances in `account.region_id` (optionally filtered by instanceIds). */
+/** List all lightweight instances in `account.region_id` (optionally filtered by instanceIds). */
 export async function listInstances(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   instanceIds?: string[],
 ): Promise<SwasInstanceDetail[]> {
+  if (isTencent(account)) return tencent.listInstances(env, account, instanceIds);
   if (isDryRun(env)) {
     if (instanceIds && instanceIds.length > 0) {
       return instanceIds.map((id) => {
@@ -495,9 +508,10 @@ export async function listInstances(
 
 export async function listTrafficPackages(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   instanceIds: string[],
 ): Promise<Map<string, SwasTrafficPackage>> {
+  if (isTencent(account)) return tencent.listTrafficPackages(env, account, instanceIds);
   const result = new Map<string, SwasTrafficPackage>();
   if (instanceIds.length === 0) return result;
 
@@ -533,8 +547,9 @@ export async function listTrafficPackages(
 
 export async function listDisks(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
 ): Promise<SwasDisk[]> {
+  if (isTencent(account)) return tencent.listDisks(env, account);
   if (isDryRun(env)) {
     return getOrSeedMockInstance(account).detail.disks;
   }
@@ -558,8 +573,9 @@ export async function listDisks(
 /** Fetch full instance detail + traffic package + disks (with ListDisks fallback if empty). */
 export async function getInstanceDetail(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
 ): Promise<SwasInstanceDetail> {
+  if (isTencent(account)) return tencent.getInstanceDetail(env, account);
   const list = await listInstances(env, account, [account.instance_id]);
   const detail = list.find((item) => item.instance_id === account.instance_id) ?? list[0];
   if (!detail) {
@@ -579,7 +595,8 @@ export async function getInstanceDetail(
 // Power operations
 // ---------------------------------------------------------------------------
 
-export async function startInstance(env: Env, account: AliyunAccount): Promise<void> {
+export async function startInstance(env: Env, account: SwasAccount): Promise<void> {
+  if (isTencent(account)) return tencent.startInstance(env, account);
   if (isDryRun(env)) {
     getOrSeedMockInstance(account).detail.status = "Running";
     return;
@@ -597,9 +614,10 @@ export async function startInstance(env: Env, account: AliyunAccount): Promise<v
 
 export async function stopInstance(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   forceStop = false,
 ): Promise<void> {
+  if (isTencent(account)) return tencent.stopInstance(env, account, forceStop);
   if (isDryRun(env)) {
     getOrSeedMockInstance(account).detail.status = "Stopped";
     return;
@@ -619,9 +637,10 @@ export async function stopInstance(
 
 export async function rebootInstance(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   forceReboot = false,
 ): Promise<void> {
+  if (isTencent(account)) return tencent.rebootInstance(env, account, forceReboot);
   if (isDryRun(env)) {
     getOrSeedMockInstance(account).detail.status = "Running";
     return;
@@ -645,8 +664,9 @@ export async function rebootInstance(
 
 export async function describeInstanceVncUrl(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
 ): Promise<string> {
+  if (isTencent(account)) return tencent.describeInstanceVncUrl(env, account);
   if (isDryRun(env)) {
     return `wss%3A%2F%2Fmock-vnc.aliyun.com%2Fwebsockify%2F%3Fs%3Dswas-${encodeURIComponent(account.instance_id)}`;
   }
@@ -667,9 +687,12 @@ export async function describeInstanceVncUrl(
 
 export async function modifyInstanceVncPassword(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   vncPassword: string,
 ): Promise<void> {
+  if (isTencent(account)) {
+    throw new AliyunError("腾讯云轻量 VNC 无需单独设置 VNC 密码，请直接打开 VNC 终端登录");
+  }
   if (isDryRun(env)) {
     getOrSeedMockInstance(account).vncPassword = vncPassword;
     return;
@@ -688,9 +711,10 @@ export async function modifyInstanceVncPassword(
 
 export async function loginInstanceWorkbench(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   opts?: { username?: string; password?: string; port?: number },
 ): Promise<string> {
+  if (isTencent(account)) return tencent.buildConsoleUrl(account);
   if (isDryRun(env)) {
     return `https://ecs-workbench.aliyun.com/view/instance/single/mock-${encodeURIComponent(account.instance_id)}`;
   }
@@ -719,9 +743,10 @@ export async function loginInstanceWorkbench(
 
 export async function updateInstanceAttribute(
   env: Env,
-  account: AliyunAccount,
-  opts: { instanceName?: string; password?: string },
+  account: SwasAccount,
+  opts: { instanceName?: string; password?: string; userName?: string },
 ): Promise<void> {
+  if (isTencent(account)) return tencent.updateInstanceAttribute(env, account, opts);
   if (isDryRun(env)) {
     const entry = getOrSeedMockInstance(account);
     if (opts.instanceName) entry.detail.instance_name = opts.instanceName;
@@ -747,9 +772,10 @@ export async function updateInstanceAttribute(
 
 export async function listImages(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   imageType?: "system" | "app" | "custom",
 ): Promise<SwasImageItem[]> {
+  if (isTencent(account)) return tencent.listImages(env, account, imageType);
   if (isDryRun(env)) {
     const all: SwasImageItem[] = [
       {
@@ -831,8 +857,9 @@ export async function listImages(
 
 export async function listKeyPairs(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
 ): Promise<string[]> {
+  if (isTencent(account)) return tencent.listKeyPairs(env, account);
   if (isDryRun(env)) {
     return ["swas-default-key"];
   }
@@ -855,7 +882,7 @@ export async function listKeyPairs(
 
 export async function resetSystem(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   opts: {
     imageId?: string;
     password?: string;
@@ -863,6 +890,7 @@ export async function resetSystem(
     clientToken?: string;
   },
 ): Promise<void> {
+  if (isTencent(account)) return tencent.resetSystem(env, account, opts);
   if (isDryRun(env)) {
     const entry = getOrSeedMockInstance(account);
     if (opts.imageId) {
@@ -901,8 +929,9 @@ export async function resetSystem(
 
 export async function listFirewallRules(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
 ): Promise<SwasFirewallRule[]> {
+  if (isTencent(account)) return tencent.listFirewallRules(env, account);
   if (isDryRun(env)) {
     return [...getOrSeedMockFirewall(account)];
   }
@@ -945,14 +974,19 @@ export async function listFirewallRules(
 
 export async function createFirewallRule(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   opts: {
-    ruleProtocol: "TCP" | "UDP" | "TCP+UDP" | "ICMP";
+    ruleProtocol: "TCP" | "UDP" | "TCP+UDP" | "ICMP" | "ALL";
     port: string;
     sourceCidrIp?: string;
+    policy?: string;
     remark?: string;
   },
 ): Promise<string> {
+  if (isTencent(account)) return tencent.createFirewallRule(env, account, opts);
+  if (opts.ruleProtocol === "ALL") {
+    throw new AliyunError("阿里云轻量防火墙仅支持 TCP、UDP、TCP+UDP 或 ICMP");
+  }
   if (isDryRun(env)) {
     const rules = getOrSeedMockFirewall(account);
     const id = `fw-mock-${Date.now().toString(36).slice(-6)}`;
@@ -990,10 +1024,11 @@ export async function createFirewallRule(
 
 export async function toggleFirewallRule(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   ruleId: string,
   enable: boolean,
 ): Promise<void> {
+  if (isTencent(account)) return tencent.toggleFirewallRule(env, account, ruleId, enable);
   if (isDryRun(env)) {
     const rules = getOrSeedMockFirewall(account);
     const found = rules.find((r) => r.rule_id === ruleId);
@@ -1014,9 +1049,10 @@ export async function toggleFirewallRule(
 
 export async function deleteFirewallRule(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   ruleId: string,
 ): Promise<void> {
+  if (isTencent(account)) return tencent.deleteFirewallRule(env, account, ruleId);
   if (isDryRun(env)) {
     const rules = getOrSeedMockFirewall(account);
     const idx = rules.findIndex((r) => r.rule_id === ruleId);
@@ -1041,9 +1077,10 @@ export async function deleteFirewallRule(
 
 export async function listSnapshots(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   instanceId?: string,
 ): Promise<SwasSnapshot[]> {
+  if (isTencent(account)) return tencent.listSnapshots(env, account);
   if (isDryRun(env)) {
     const list = mockSnapshots.get(mockAcctRegionKey(account)) ?? [];
     return instanceId ? list.filter((s) => !s.instance_id || s.instance_id === instanceId) : [...list];
@@ -1078,9 +1115,12 @@ export async function listSnapshots(
 
 export async function createSnapshot(
   env: Env,
-  account: AliyunAccount,
-  opts: { diskId: string; snapshotName: string },
+  account: SwasAccount,
+  opts: { diskId?: string; snapshotName: string },
 ): Promise<string> {
+  if (isTencent(account)) return tencent.createSnapshot(env, account, { snapshotName: opts.snapshotName });
+  const diskId = (opts.diskId || "").trim();
+  if (!diskId) throw new AliyunError("请选择要创建快照的磁盘");
   if (isDryRun(env)) {
     const key = mockAcctRegionKey(account);
     const list = mockSnapshots.get(key) ?? [];
@@ -1090,7 +1130,7 @@ export async function createSnapshot(
       snapshot_name: opts.snapshotName,
       status: "Accomplished",
       progress: "100%",
-      source_disk_id: opts.diskId,
+      source_disk_id: diskId,
       source_disk_type: "System",
       instance_id: account.instance_id,
       creation_time: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
@@ -1104,7 +1144,7 @@ export async function createSnapshot(
     data = await swasCall<Record<string, unknown>>(account, {
       Action: "CreateSnapshot",
       RegionId: account.region_id,
-      DiskId: opts.diskId,
+      DiskId: diskId,
       SnapshotName: opts.snapshotName,
     });
   } catch (exc) {
@@ -1115,9 +1155,10 @@ export async function createSnapshot(
 
 export async function deleteSnapshot(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   snapshotId: string,
 ): Promise<void> {
+  if (isTencent(account)) return tencent.deleteSnapshot(env, account, snapshotId);
   if (isDryRun(env)) {
     const key = mockAcctRegionKey(account);
     const list = mockSnapshots.get(key) ?? [];
@@ -1157,9 +1198,10 @@ function mapCustomImageStatus(raw: string): string {
 
 export async function listCustomImages(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   shareFilter?: boolean,
 ): Promise<SwasCustomImage[]> {
+  if (isTencent(account)) return tencent.listCustomImages(env, account);
   if (isDryRun(env)) {
     const list = mockCustomImages.get(mockAcctRegionKey(account)) ?? [];
     if (shareFilter === true) return list.filter((i) => i.in_share_user);
@@ -1203,14 +1245,24 @@ export async function listCustomImages(
 
 export async function createCustomImage(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   opts: {
     imageName: string;
-    systemSnapshotId: string;
+    systemSnapshotId?: string;
     dataSnapshotId?: string;
     description?: string;
+    forcePowerOff?: boolean;
   },
 ): Promise<string> {
+  if (isTencent(account)) {
+    return tencent.createCustomImage(env, account, {
+      imageName: opts.imageName,
+      description: opts.description,
+      forcePowerOff: opts.forcePowerOff,
+    });
+  }
+  const systemSnapshotId = (opts.systemSnapshotId || "").trim();
+  if (!systemSnapshotId) throw new AliyunError("请选择一个系统盘快照作为镜像来源");
   if (isDryRun(env)) {
     const key = mockAcctRegionKey(account);
     const list = mockCustomImages.get(key) ?? [];
@@ -1224,8 +1276,8 @@ export async function createCustomImage(
       os_type: inst.detail.os_type || "Linux",
       instance_id: account.instance_id,
       instance_name: inst.detail.instance_name,
-      system_snapshot_id: opts.systemSnapshotId,
-      system_snapshot_name: opts.systemSnapshotId,
+      system_snapshot_id: systemSnapshotId,
+      system_snapshot_name: systemSnapshotId,
       data_snapshot_id: opts.dataSnapshotId || "",
       in_share_ecs: false,
       in_share_user: false,
@@ -1242,7 +1294,7 @@ export async function createCustomImage(
     RegionId: account.region_id,
     InstanceId: account.instance_id,
     ImageName: opts.imageName,
-    SystemSnapshotId: opts.systemSnapshotId,
+    SystemSnapshotId: systemSnapshotId,
   };
   if (opts.dataSnapshotId) params["DataSnapshotId"] = opts.dataSnapshotId;
   if (opts.description) params["Description"] = opts.description;
@@ -1257,9 +1309,10 @@ export async function createCustomImage(
 
 export async function deleteCustomImage(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   imageId: string,
 ): Promise<void> {
+  if (isTencent(account)) return tencent.deleteCustomImage(env, account, imageId);
   if (isDryRun(env)) {
     const key = mockAcctRegionKey(account);
     const list = mockCustomImages.get(key) ?? [];
@@ -1283,10 +1336,13 @@ export async function deleteCustomImage(
 
 export async function modifyImageShareStatus(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   imageId: string,
   shareToEcs: boolean,
 ): Promise<void> {
+  if (isTencent(account)) {
+    throw new AliyunError("腾讯云轻量自定义镜像支持跨账号共享，暂不支持共享到 CVM");
+  }
   if (isDryRun(env)) {
     const list = mockCustomImages.get(mockAcctRegionKey(account)) ?? [];
     const found = list.find((i) => i.image_id === imageId);
@@ -1309,9 +1365,10 @@ export async function modifyImageShareStatus(
 
 export async function listCustomImageShareAccounts(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   imageId: string,
 ): Promise<SwasShareAccount[]> {
+  if (isTencent(account)) return tencent.listCustomImageShareAccounts(env, account, imageId);
   if (isDryRun(env)) {
     return [...(mockImageShares.get(`${mockAcctRegionKey(account)}:${imageId}`) ?? [])];
   }
@@ -1338,12 +1395,15 @@ export async function listCustomImageShareAccounts(
 
 export async function updateCustomImageShareAccounts(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   imageId: string,
   action: "add" | "remove",
   accountIds: string[],
 ): Promise<void> {
   if (accountIds.length === 0) return;
+  if (isTencent(account)) {
+    return tencent.updateCustomImageShareAccounts(env, account, imageId, action, accountIds);
+  }
   if (isDryRun(env)) {
     const shareKey = `${mockAcctRegionKey(account)}:${imageId}`;
     const current = mockImageShares.get(shareKey) ?? [];
@@ -1391,8 +1451,9 @@ export async function updateCustomImageShareAccounts(
 
 export async function listPlans(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
 ): Promise<SwasPlan[]> {
+  if (isTencent(account)) return tencent.listPlans(env, account);
   if (isDryRun(env)) {
     const currency = account.site === "international" ? "USD" : "CNY";
     const factor = currency === "USD" ? 0.14 : 1;
@@ -1507,15 +1568,24 @@ export async function listPlans(
  */
 export async function describePrice(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   opts: {
     planId: string;
     periodMonths: number;
     dataDiskSize?: number;
     instanceId?: string;
     amount?: number;
+    autoRenew?: boolean;
   },
 ): Promise<PriceQuote> {
+  if (isTencent(account)) {
+    return tencent.describePrice(env, account, {
+      planId: opts.planId,
+      periodMonths: opts.periodMonths,
+      instanceId: opts.instanceId,
+      autoRenew: opts.autoRenew,
+    });
+  }
   const months = Math.max(1, Math.trunc(opts.periodMonths));
   const useYear = months >= 12 && months % 12 === 0;
   const period = useYear ? months / 12 : months;
@@ -1590,12 +1660,19 @@ export async function describePrice(
 
 export async function renewInstance(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   opts: { periodMonths: number; clientToken?: string },
 ): Promise<{ request_id: string; expired_time?: string }> {
-  const validPeriods = new Set([1, 3, 6, 12, 24, 36]);
+  const validPeriods = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 24, 36]);
   const months = Math.trunc(opts.periodMonths);
-  if (!validPeriods.has(months)) {
+  if (isTencent(account)) {
+    if (!validPeriods.has(months)) {
+      throw new AliyunError("腾讯云轻量续费时长支持 1–12 个月、24 或 36 个月");
+    }
+    return tencent.renewInstance(env, account, { periodMonths: months });
+  }
+  const aliyunPeriods = new Set([1, 3, 6, 12, 24, 36]);
+  if (!aliyunPeriods.has(months)) {
     throw new AliyunError("轻量续费时长仅支持 1、3、6、12、24 或 36 个月");
   }
 
@@ -1629,9 +1706,20 @@ export async function renewInstance(
   };
 }
 
+export async function modifyAutoRenew(
+  env: Env,
+  account: SwasAccount,
+  renewFlag: tencent.TencentRenewFlag,
+): Promise<void> {
+  if (!isTencent(account)) {
+    throw new AliyunError("阿里云轻量自动续费请前往阿里云控制台调整");
+  }
+  return tencent.modifyAutoRenew(env, account, renewFlag);
+}
+
 export async function createInstances(
   env: Env,
-  account: AliyunAccount,
+  account: SwasAccount,
   opts: {
     planId: string;
     imageId: string;
@@ -1639,11 +1727,27 @@ export async function createInstances(
     dataDiskSize?: number;
     autoRenew?: boolean;
     autoRenewPeriod?: number;
+    instanceName?: string;
     clientToken?: string;
   },
 ): Promise<{ instance_ids: string[]; request_id: string }> {
-  const validPeriods = new Set([1, 3, 6, 12, 24, 36]);
   const months = Math.trunc(opts.periodMonths);
+  if (isTencent(account)) {
+    const tencentPeriods = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 24, 36, 48, 60]);
+    if (!tencentPeriods.has(months)) {
+      throw new AliyunError("腾讯云轻量购买时长支持 1–12 个月或 2、3、4、5 年");
+    }
+    return tencent.createInstances(env, account, {
+      planId: opts.planId,
+      imageId: opts.imageId,
+      periodMonths: months,
+      autoRenew: opts.autoRenew,
+      instanceName: opts.instanceName,
+      clientToken: opts.clientToken,
+    });
+  }
+
+  const validPeriods = new Set([1, 3, 6, 12, 24, 36]);
   if (!validPeriods.has(months)) {
     throw new AliyunError("轻量购买时长仅支持 1、3、6、12、24 或 36 个月");
   }
@@ -1769,12 +1873,101 @@ export async function createInstances(
   return { instance_ids: ids, request_id: strOf(data["RequestId"]) };
 }
 
+export async function applySnapshot(
+  env: Env,
+  account: SwasAccount,
+  snapshotId: string,
+): Promise<void> {
+  if (!isTencent(account)) {
+    throw new AliyunError("阿里云轻量暂未接入快照直接回滚，请通过自定义镜像或控制台恢复");
+  }
+  return tencent.applySnapshot(env, account, snapshotId);
+}
+
+export function getConsoleUrl(account: SwasAccount): string {
+  if (isTencent(account)) {
+    return tencent.buildConsoleUrl(account);
+  }
+  return `https://swasnext.console.aliyun.com/servers/${encodeURIComponent(account.region_id)}/${encodeURIComponent(account.instance_id)}/overview`;
+}
+
+export function getRenewalConsoleUrls(account: SwasAccount): {
+  renew_url: string;
+  instance_url: string;
+  recharge_url: string;
+  orders_url: string;
+} {
+  if (isTencent(account)) {
+    return tencent.buildRenewalConsoleUrls(account);
+  }
+  return buildAliyunRenewalConsoleUrls(account);
+}
+
+export async function getCallerAccountId(
+  env: Env,
+  account: SwasAccount,
+): Promise<string> {
+  if (isTencent(account)) {
+    return tencent.getCallerAccountId(env, account);
+  }
+  return getAliyunCallerAccountId(env, account);
+}
+
+/**
+ * Discover lightweight instances in a single region, or across all available
+ * Tencent Cloud Lighthouse regions when `scanAllRegions` is enabled.
+ */
+export async function discoverInstances(
+  env: Env,
+  account: SwasAccount,
+  scanAllRegions = false,
+): Promise<SwasInstanceDetail[]> {
+  if (!scanAllRegions || !isTencent(account)) {
+    const instances = await listInstances(env, account);
+    const ids = instances.map((i) => i.instance_id).filter(Boolean);
+    const trafficMap = ids.length
+      ? await listTrafficPackages(env, account, ids).catch(() => new Map<string, SwasTrafficPackage>())
+      : new Map<string, SwasTrafficPackage>();
+    return instances.map((inst) => ({
+      ...inst,
+      traffic: trafficMap.get(inst.instance_id) ?? inst.traffic ?? null,
+    }));
+  }
+
+  const regions = await tencent.listRegions(env, account);
+  const scanList = isDryRun(env)
+    ? [account.region_id || "ap-guangzhou", "ap-hongkong"].filter((r, i, arr) => arr.indexOf(r) === i)
+    : regions;
+
+  const perRegion = await Promise.all(
+    scanList.map(async (reg) => {
+      const regAcct: SwasAccount = { ...account, region_id: reg };
+      try {
+        const list = await tencent.listInstances(env, regAcct);
+        if (list.length === 0) return [] as SwasInstanceDetail[];
+        const ids = list.map((i) => i.instance_id).filter(Boolean);
+        const trafficMap = await tencent
+          .listTrafficPackages(env, regAcct, ids)
+          .catch(() => new Map<string, SwasTrafficPackage>());
+        return list.map((inst) => ({
+          ...inst,
+          traffic: trafficMap.get(inst.instance_id) ?? inst.traffic ?? null,
+        }));
+      } catch {
+        return [] as SwasInstanceDetail[];
+      }
+    }),
+  );
+  return perRegion.flat();
+}
+
 // ---------------------------------------------------------------------------
 // Runtime state + traffic sync (persisted to swas_servers)
 // ---------------------------------------------------------------------------
 
-export function toAccount(server: repo.SwasServerView): AliyunAccount {
+export function toAccount(server: repo.SwasServerView): SwasAccount {
   return {
+    provider: server.provider,
     access_key_id: server.access_key_id,
     access_key_secret: server.access_key_secret ?? "",
     region_id: server.region_id,
@@ -1784,8 +1977,8 @@ export function toAccount(server: repo.SwasServerView): AliyunAccount {
 }
 
 /**
- * Fetch live instance info + traffic package for one SWAS server and persist
- * the snapshot to D1. Throws if the server does not exist or Aliyun fails.
+ * Fetch live instance info + traffic package for one lightweight server and persist
+ * the snapshot to D1. Throws if the server does not exist or the cloud API fails.
  */
 export async function refreshSwasServer(
   env: Env,
@@ -1793,7 +1986,9 @@ export async function refreshSwasServer(
 ): Promise<SwasInstanceDetail> {
   const row = await repo.getSwasServer(env, swasId, true);
   if (!row) throw new AliyunError("轻量服务器不存在");
-  if (!row.access_key_secret) throw new AliyunError("未配置 AccessKey Secret");
+  if (!row.access_key_secret) {
+    throw new AliyunError(row.provider === "tencent" ? "未配置 SecretKey" : "未配置 AccessKey Secret");
+  }
   const detail = await getInstanceDetail(env, toAccount(row));
   const traffic = detail.traffic;
   await repo.updateSwasRuntime(env, swasId, {
@@ -1818,7 +2013,7 @@ export async function refreshSwasServer(
 }
 
 /**
- * Best-effort read-only refresh for every registered SWAS server. Never
+ * Best-effort read-only refresh for every registered lightweight server. Never
  * triggers power operations and never throws.
  */
 export async function refreshAllSwasServers(env: Env): Promise<number> {

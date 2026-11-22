@@ -4,6 +4,7 @@ import {
   CalendarClock,
   CheckCircle2,
   Cpu,
+  ExternalLink,
   HardDrive,
   Info,
   KeyRound,
@@ -21,15 +22,23 @@ import {
   TriangleAlert,
 } from 'lucide-react'
 import { SLOW_TIMEOUT_MS, api, del, post } from '../api'
-import { DEFAULT_REGION, GROUP_ORDER, regionLabel, regionsFor } from '../regions'
+import {
+  DEFAULT_REGION,
+  DEFAULT_TENCENT_REGION,
+  GROUP_ORDER,
+  regionLabel,
+  regionsForProvider,
+} from '../regions'
 import type {
   PriceQuote,
+  RenewalConsoleUrls,
   Server,
   SiteType,
   SwasFirewallRule,
   SwasImageItem,
   SwasInstanceDetail,
   SwasPlan,
+  SwasProvider,
   SwasServer,
 } from '../types'
 import { Badge, Modal, Segmented } from './ui'
@@ -58,7 +67,7 @@ function makeClientToken(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
-const SWAS_PERIOD_OPTIONS = [
+const ALIYUN_SWAS_PERIOD_OPTIONS = [
   { value: 1, label: '1 个月' },
   { value: 3, label: '3 个月' },
   { value: 6, label: '6 个月' },
@@ -67,12 +76,40 @@ const SWAS_PERIOD_OPTIONS = [
   { value: 36, label: '3 年' },
 ]
 
+const TENCENT_RENEW_PERIOD_OPTIONS = [
+  { value: 1, label: '1 个月' },
+  { value: 2, label: '2 个月' },
+  { value: 3, label: '3 个月' },
+  { value: 6, label: '6 个月' },
+  { value: 12, label: '1 年' },
+  { value: 24, label: '2 年' },
+  { value: 36, label: '3 年' },
+]
+
+const TENCENT_PROVISION_PERIOD_OPTIONS = [
+  { value: 1, label: '1 个月' },
+  { value: 2, label: '2 个月' },
+  { value: 3, label: '3 个月' },
+  { value: 6, label: '6 个月' },
+  { value: 12, label: '1 年' },
+  { value: 24, label: '2 年' },
+  { value: 36, label: '3 年' },
+  { value: 48, label: '4 年' },
+  { value: 60, label: '5 年' },
+]
+
 const SWAS_AUTORENEW_OPTIONS = [
   { value: 1, label: '每次续 1 个月' },
   { value: 3, label: '每次续 3 个月' },
   { value: 6, label: '每次续 6 个月' },
   { value: 12, label: '每次续 1 年' },
 ]
+
+const TENCENT_RENEW_FLAG_OPTIONS = [
+  { value: 'NOTIFY_AND_AUTO_RENEW', label: '通知并自动续费' },
+  { value: 'NOTIFY_AND_MANUAL_RENEW', label: '通知不自动续费' },
+  { value: 'DISABLE_NOTIFY_AND_MANUAL_RENEW', label: '不通知不自动续费' },
+] as const
 
 /* ============================================================================
    1. SWAS Renewal Modal (PrePaid real-time price quote + confirm pay)
@@ -89,9 +126,16 @@ export function SwasRenewModal({
   onToast: (message: string, tone?: 'success' | 'error' | 'info') => void
   onUpdated: () => void
 }) {
+  const isTencent = server.provider === 'tencent'
+  const vendorName = isTencent ? '腾讯云' : '阿里云'
+  const periodOptions = isTencent ? TENCENT_RENEW_PERIOD_OPTIONS : ALIYUN_SWAS_PERIOD_OPTIONS
+
   const [periodMonths, setPeriodMonths] = useState(1)
   const [expiredTime, setExpiredTime] = useState(server.expired_time || '')
   const [planId, setPlanId] = useState(server.plan_id || '')
+  const [renewFlag, setRenewFlag] = useState('')
+  const [consoleUrls, setConsoleUrls] = useState<RenewalConsoleUrls | null>(null)
+  const [autoBusy, setAutoBusy] = useState(false)
 
   const [quote, setQuote] = useState<PriceQuote | null>(null)
   const [quoteLoading, setQuoteLoading] = useState(true)
@@ -112,6 +156,8 @@ export function SwasRenewModal({
           quote: PriceQuote
           expired_time?: string
           plan_id?: string
+          renew_flag?: string
+          console_urls?: RenewalConsoleUrls
         }>(
           `/api/v1/swas/${server.id}/renewal/price`,
           { period_months: months },
@@ -120,6 +166,8 @@ export function SwasRenewModal({
         setQuote(res.quote)
         if (res.expired_time) setExpiredTime(res.expired_time)
         if (res.plan_id) setPlanId(res.plan_id)
+        if (res.renew_flag) setRenewFlag(res.renew_flag)
+        if (res.console_urls) setConsoleUrls(res.console_urls)
       } catch (err) {
         setQuoteError(err instanceof Error ? err.message : '查询轻量续费价格失败')
       } finally {
@@ -162,6 +210,24 @@ export function SwasRenewModal({
     }
   }
 
+  async function handleSaveAutoRenew(nextFlag: string) {
+    setAutoBusy(true)
+    try {
+      await post(
+        `/api/v1/swas/${server.id}/renewal/auto`,
+        { renew_flag: nextFlag },
+        SLOW_TIMEOUT_MS,
+      )
+      setRenewFlag(nextFlag)
+      onToast('已更新腾讯云轻量自动续费策略', 'success')
+      onUpdated()
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : '更新自动续费策略失败', 'error')
+    } finally {
+      setAutoBusy(false)
+    }
+  }
+
   return (
     <Modal
       wide
@@ -178,6 +244,16 @@ export function SwasRenewModal({
           >
             {quoteLoading ? <LoaderCircle size={12} className="spin" /> : <RefreshCw size={12} />} 重新询价
           </button>
+          {consoleUrls?.renew_url && (
+            <a
+              className="btn ghost sm"
+              href={consoleUrls.renew_url}
+              target="_blank"
+              rel="noreferrer"
+            >
+              <ExternalLink size={12} /> 前往{vendorName}续费中心
+            </a>
+          )}
           <span className="spacer" />
           <button type="button" className="btn primary sm" disabled={payBusy} onClick={onClose}>
             关闭
@@ -188,6 +264,9 @@ export function SwasRenewModal({
       <div className="ops-stack">
         <div className="img-account-bar" style={{ marginBottom: 0 }}>
           <div className="img-account-meta">
+            <span>
+              <span className={`provider-tag ${isTencent ? 'tencent' : 'aliyun'}`}>{vendorName}</span>
+            </span>
             <span>
               实例：<code className="mono">{server.instance_id}</code>
             </span>
@@ -207,12 +286,12 @@ export function SwasRenewModal({
           <div className="ops-card-head">
             <strong>选择续费时长（实时询价）</strong>
             <span className="hint" style={{ margin: 0 }}>
-              扣款将从阿里云账户余额 / 信用额度自动扣除
+              扣款将从{vendorName}账户余额 / 信用额度自动扣除{isTencent ? '（自动抵扣可用代金券）' : ''}
             </span>
           </div>
 
           <div className="ops-period-grid">
-            {SWAS_PERIOD_OPTIONS.map((opt) => (
+            {periodOptions.map((opt) => (
               <button
                 type="button"
                 key={opt.value}
@@ -228,7 +307,7 @@ export function SwasRenewModal({
           {quoteLoading ? (
             <div className="manage-center compact">
               <LoaderCircle size={14} className="spin" />
-              <span>正在向阿里云查询实时续费价格…</span>
+              <span>正在向{vendorName}查询实时续费价格…</span>
             </div>
           ) : quoteError ? (
             <div className="auth-error">
@@ -269,13 +348,15 @@ export function SwasRenewModal({
             <span>
               我已核对续费时长与实付金额
               {quote ? `（${formatPrice(quote.trade_price, quote.currency)}）` : ''}
-              ，确认扣费执行续费
+              ，确认从{vendorName}账户扣费执行续费
             </span>
           </label>
 
           <div className="ops-card-foot">
             <span className="hint" style={{ margin: 0 }}>
-              自动续费策略可在新建开通时开启，或前往阿里云控制台调整
+              {isTencent
+                ? '如需支付宝/微信扫码付款，可点左下角跳转腾讯云续费中心'
+                : '自动续费策略可在新建开通时开启，或前往阿里云控制台调整'}
             </span>
             <button
               type="button"
@@ -288,6 +369,31 @@ export function SwasRenewModal({
             </button>
           </div>
         </div>
+
+        {isTencent && (
+          <div className="ops-card">
+            <div className="ops-card-head">
+              <strong>自动续费策略</strong>
+              {autoBusy && <LoaderCircle size={13} className="spin" />}
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {TENCENT_RENEW_FLAG_OPTIONS.map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  className={`ops-period-btn${renewFlag === opt.value ? ' active' : ''}`}
+                  disabled={autoBusy}
+                  onClick={() => void handleSaveAutoRenew(opt.value)}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+            <div className="hint" style={{ margin: 0 }}>
+              点击策略后将直接调用腾讯云 <code>ModifyInstancesRenewFlag</code> 生效。
+            </div>
+          </div>
+        )}
       </div>
     </Modal>
   )
@@ -298,6 +404,7 @@ export function SwasRenewModal({
    ========================================================================== */
 
 type SwasOpsTab = 'attr' | 'firewall'
+type SwasFwProto = 'TCP' | 'UDP' | 'TCP+UDP' | 'ICMP' | 'ALL'
 
 const SWAS_OPS_TABS: { value: SwasOpsTab; label: string }[] = [
   { value: 'attr', label: '改密 / 改名' },
@@ -331,6 +438,9 @@ export function SwasOpsModal({
   onToast: (message: string, tone?: 'success' | 'error' | 'info') => void
   onUpdated: () => void
 }) {
+  const isTencent = server.provider === 'tencent'
+  const vendorName = isTencent ? '腾讯云' : '阿里云'
+
   const [tab, setTab] = useState<SwasOpsTab>(initialTab)
   const [detail, setDetail] = useState<SwasInstanceDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(true)
@@ -339,6 +449,7 @@ export function SwasOpsModal({
   // Rename & password
   const [instanceName, setInstanceName] = useState('')
   const [syncLabel, setSyncLabel] = useState(true)
+  const [userName, setUserName] = useState('')
   const [password, setPassword] = useState('')
   const [passwordConfirm, setPasswordConfirm] = useState('')
   const [rebootAfter, setRebootAfter] = useState(true)
@@ -349,9 +460,10 @@ export function SwasOpsModal({
   const [rules, setRules] = useState<SwasFirewallRule[]>([])
   const [fwLoading, setFwLoading] = useState(false)
   const [fwError, setFwError] = useState('')
-  const [fwProtocol, setFwProtocol] = useState<'TCP' | 'UDP' | 'TCP+UDP' | 'ICMP'>('TCP')
+  const [fwProtocol, setFwProtocol] = useState<SwasFwProto>('TCP')
   const [fwPort, setFwPort] = useState('22')
   const [fwCidr, setFwCidr] = useState('0.0.0.0/0')
+  const [fwPolicy, setFwPolicy] = useState<'accept' | 'drop'>('accept')
   const [fwRemark, setFwRemark] = useState('')
   const [fwBusy, setFwBusy] = useState('')
 
@@ -432,7 +544,12 @@ export function SwasOpsModal({
       }
       if (pwdChanged) {
         payload['password'] = password
-        payload['reboot_after'] = rebootAfter
+        if (isTencent && userName.trim()) {
+          payload['user_name'] = userName.trim()
+        }
+        if (!isTencent) {
+          payload['reboot_after'] = rebootAfter
+        }
       }
       const res = await post<{ ok: boolean; rebooted: boolean }>(
         `/api/v1/swas/${server.id}/attribute`,
@@ -443,9 +560,11 @@ export function SwasOpsModal({
       setPasswordConfirm('')
       onToast(
         pwdChanged
-          ? res.rebooted
-            ? '属性已更新，并已自动重启实例使新密码生效'
-            : '属性已更新（新密码需重启实例后生效）'
+          ? isTencent
+            ? '属性已更新，腾讯云将自动重启实例使新密码生效'
+            : res.rebooted
+              ? '属性已更新，并已自动重启实例使新密码生效'
+              : '属性已更新（新密码需重启实例后生效）'
           : '轻量实例名称已更新',
         'success',
       )
@@ -463,13 +582,28 @@ export function SwasOpsModal({
     port: string
     remark: string
   }) {
-    const protocol = preset ? preset.protocol : fwProtocol
-    const port = preset ? preset.port : protocol === 'ICMP' ? '-1/-1' : fwPort.trim()
+    const protocol: SwasFwProto = preset ? preset.protocol : fwProtocol
+    const port = preset
+      ? isTencent
+        ? preset.protocol === 'ICMP'
+          ? 'ALL'
+          : preset.port.split('/')[0]
+        : preset.port
+      : protocol === 'ICMP' || protocol === 'ALL'
+        ? isTencent
+          ? 'ALL'
+          : '-1/-1'
+        : fwPort.trim()
     const cidr = preset ? '0.0.0.0/0' : fwCidr.trim() || '0.0.0.0/0'
     const remark = preset ? preset.remark : fwRemark.trim()
+    const policy = preset ? 'accept' : isTencent ? fwPolicy : 'accept'
 
-    if (protocol !== 'ICMP' && !port) {
-      setFwError('请填写端口号或端口范围（例如 80 或 8000/9000）')
+    if (protocol !== 'ICMP' && protocol !== 'ALL' && !port) {
+      setFwError(
+        isTencent
+          ? '请填写端口（例如 22、80,443、8000-9000 或 ALL）'
+          : '请填写端口号或端口范围（例如 80 或 8000/9000）',
+      )
       return
     }
 
@@ -482,13 +616,14 @@ export function SwasOpsModal({
           rule_protocol: protocol,
           port,
           source_cidr_ip: cidr,
+          policy,
           remark,
         },
         SLOW_TIMEOUT_MS,
       )
       setRules(res.rules ?? [])
       if (!preset) setFwRemark('')
-      onToast(`已放行防火墙规则（${protocol} ${port}）`, 'success')
+      onToast(`已添加防火墙规则（${protocol} ${port}${policy === 'drop' ? ' · 拒绝' : ''}）`, 'success')
     } catch (err) {
       setFwError(err instanceof Error ? err.message : '添加防火墙规则失败')
     } finally {
@@ -508,7 +643,16 @@ export function SwasOpsModal({
         SLOW_TIMEOUT_MS,
       )
       setRules(res.rules ?? [])
-      onToast(enable ? '已启用防火墙规则' : '已禁用防火墙规则', 'success')
+      onToast(
+        isTencent
+          ? enable
+            ? '已切换为放行（ACCEPT）'
+            : '已切换为拒绝（DROP）'
+          : enable
+            ? '已启用防火墙规则'
+            : '已禁用防火墙规则',
+        'success',
+      )
     } catch (err) {
       setFwError(err instanceof Error ? err.message : '切换防火墙规则状态失败')
     } finally {
@@ -533,6 +677,8 @@ export function SwasOpsModal({
     }
   }
 
+  const portDisabled = fwProtocol === 'ICMP' || fwProtocol === 'ALL'
+
   return (
     <Modal
       wide
@@ -542,6 +688,9 @@ export function SwasOpsModal({
       footer={
         <>
           <span className="hint" style={{ margin: 0 }}>
+            <span className={`provider-tag ${isTencent ? 'tencent' : 'aliyun'}`} style={{ marginRight: 6 }}>
+              {vendorName}
+            </span>
             {regionLabel(server.region_id)} · <code className="mono">{server.instance_id}</code>
           </span>
           <span className="spacer" />
@@ -615,12 +764,25 @@ export function SwasOpsModal({
                 <div className="ops-card-head">
                   <strong>
                     <KeyRound size={13} style={{ verticalAlign: -2, marginRight: 4 }} />
-                    重置登录密码（root / Administrator）
+                    重置登录密码（{isTencent ? 'root / ubuntu / Administrator' : 'root / Administrator'}）
                   </strong>
                   <span className="hint" style={{ margin: 0 }}>
                     留空则不修改密码
                   </span>
                 </div>
+                {isTencent && (
+                  <div className="field" style={{ marginBottom: 0 }}>
+                    <label htmlFor="swas-attr-user">目标用户名（可选）</label>
+                    <input
+                      id="swas-attr-user"
+                      className="input mono"
+                      value={userName}
+                      disabled={attrBusy}
+                      onChange={(event) => setUserName(event.target.value)}
+                      placeholder="留空重置系统默认管理员（如 root / lighthouse / ubuntu / Administrator）"
+                    />
+                  </div>
+                )}
                 <div className="grid-2">
                   <div className="field" style={{ marginBottom: 0 }}>
                     <label htmlFor="swas-attr-pwd">新登录密码（8–30 位）</label>
@@ -649,15 +811,21 @@ export function SwasOpsModal({
                     />
                   </div>
                 </div>
-                <label className="img-delete-force" style={{ marginTop: 0 }}>
-                  <input
-                    type="checkbox"
-                    checked={rebootAfter}
-                    disabled={attrBusy}
-                    onChange={(event) => setRebootAfter(event.target.checked)}
-                  />
-                  <span>修改密码后自动重启运行中的实例（阿里云要求重启后新密码才生效）</span>
-                </label>
+                {isTencent ? (
+                  <div className="hint" style={{ margin: 0 }}>
+                    腾讯云重置登录密码时会自动执行关机、改密并重启实例，期间服务会短暂中断。
+                  </div>
+                ) : (
+                  <label className="img-delete-force" style={{ marginTop: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={rebootAfter}
+                      disabled={attrBusy}
+                      onChange={(event) => setRebootAfter(event.target.checked)}
+                    />
+                    <span>修改密码后自动重启运行中的实例（阿里云要求重启后新密码才生效）</span>
+                  </label>
+                )}
 
                 {attrError && (
                   <div className="auth-error">
@@ -668,7 +836,7 @@ export function SwasOpsModal({
 
                 <div className="ops-card-foot">
                   <span className="hint" style={{ margin: 0 }}>
-                    密码仅直传阿里云接口，本系统不保存、不记录明文
+                    密码仅直传{vendorName}接口，本系统不保存、不记录明文
                   </span>
                   <button
                     type="button"
@@ -685,7 +853,7 @@ export function SwasOpsModal({
               <div className="img-notice info">
                 <Info size={14} style={{ flexShrink: 0, marginTop: 1 }} />
                 <span>
-                  阿里云轻量应用服务器均为包年包月制，官方未提供 API 直接销毁释放接口（到期不续费将自动停服回收）；若仅想停止面板管理，可在列表页点击「移除」按钮。
+                  {vendorName}轻量应用服务器均为包年包月制，面板不直接销毁释放云端实例（到期不续费将按云厂商策略隔离回收）；若仅想停止面板管理，可在列表页点击「移除」按钮。
                 </span>
               </div>
             </>
@@ -730,14 +898,13 @@ export function SwasOpsModal({
                   className="select"
                   value={fwProtocol}
                   disabled={Boolean(fwBusy)}
-                  onChange={(event) =>
-                    setFwProtocol(event.target.value as 'TCP' | 'UDP' | 'TCP+UDP' | 'ICMP')
-                  }
+                  onChange={(event) => setFwProtocol(event.target.value as SwasFwProto)}
                 >
                   <option value="TCP">TCP</option>
                   <option value="UDP">UDP</option>
                   <option value="TCP+UDP">TCP+UDP</option>
                   <option value="ICMP">ICMP</option>
+                  {isTencent && <option value="ALL">ALL（全部协议）</option>}
                 </select>
               </div>
               <div className="field" style={{ marginBottom: 0 }}>
@@ -745,10 +912,10 @@ export function SwasOpsModal({
                 <input
                   id="swas-fw-port"
                   className="input mono"
-                  value={fwProtocol === 'ICMP' ? '-1/-1' : fwPort}
-                  disabled={Boolean(fwBusy) || fwProtocol === 'ICMP'}
+                  value={portDisabled ? (isTencent ? 'ALL' : '-1/-1') : fwPort}
+                  disabled={Boolean(fwBusy) || portDisabled}
                   onChange={(event) => setFwPort(event.target.value)}
-                  placeholder="如 8080 或 8000/9000"
+                  placeholder={isTencent ? '如 80、80,443、8000-9000 或 ALL' : '如 8080 或 8000/9000'}
                 />
               </div>
               <div className="field" style={{ marginBottom: 0 }}>
@@ -762,6 +929,35 @@ export function SwasOpsModal({
                   placeholder="0.0.0.0/0 或 1.2.3.4/32"
                 />
               </div>
+              {isTencent ? (
+                <div className="field" style={{ marginBottom: 0 }}>
+                  <label htmlFor="swas-fw-policy">策略</label>
+                  <select
+                    id="swas-fw-policy"
+                    className="select"
+                    value={fwPolicy}
+                    disabled={Boolean(fwBusy)}
+                    onChange={(event) => setFwPolicy(event.target.value as 'accept' | 'drop')}
+                  >
+                    <option value="accept">放行（ACCEPT）</option>
+                    <option value="drop">拒绝（DROP）</option>
+                  </select>
+                </div>
+              ) : (
+                <div className="field" style={{ marginBottom: 0 }}>
+                  <label htmlFor="swas-fw-remark">备注（可选）</label>
+                  <input
+                    id="swas-fw-remark"
+                    className="input"
+                    value={fwRemark}
+                    disabled={Boolean(fwBusy)}
+                    onChange={(event) => setFwRemark(event.target.value)}
+                    placeholder="例如面板服务端口"
+                  />
+                </div>
+              )}
+            </div>
+            {isTencent && (
               <div className="field" style={{ marginBottom: 0 }}>
                 <label htmlFor="swas-fw-remark">备注（可选）</label>
                 <input
@@ -773,10 +969,12 @@ export function SwasOpsModal({
                   placeholder="例如面板服务端口"
                 />
               </div>
-            </div>
+            )}
             <div className="ops-card-foot">
               <span className="hint" style={{ margin: 0 }}>
-                支持单端口（80）或区间（8000/9000）
+                {isTencent
+                  ? '支持单端口（80）、逗号分隔（80,443）、区间（8000-9000）或 ALL'
+                  : '支持单端口（80）或区间（8000/9000）'}
               </span>
               <button
                 type="button"
@@ -808,7 +1006,7 @@ export function SwasOpsModal({
               </div>
             ) : rules.length === 0 ? (
               <div className="hint" style={{ margin: 0 }}>
-                当前实例暂无防火墙放行规则
+                当前实例暂无防火墙规则
               </div>
             ) : (
               <div className="disk-table-wrap">
@@ -818,7 +1016,7 @@ export function SwasOpsModal({
                       <th>协议</th>
                       <th>端口</th>
                       <th>源 IP / CIDR</th>
-                      <th>状态</th>
+                      <th>{isTencent ? '策略' : '状态'}</th>
                       <th>备注</th>
                       <th style={{ textAlign: 'right' }}>操作</th>
                     </tr>
@@ -835,7 +1033,7 @@ export function SwasOpsModal({
                           <td className="mono">{r.source_cidr_ip || '0.0.0.0/0'}</td>
                           <td>
                             <Badge tone={enabled ? 'green' : 'gray'}>
-                              {enabled ? '已启用' : '已禁用'}
+                              {isTencent ? (enabled ? '放行' : '拒绝') : enabled ? '已启用' : '已禁用'}
                             </Badge>
                           </td>
                           <td>{r.remark || '—'}</td>
@@ -853,7 +1051,7 @@ export function SwasOpsModal({
                               ) : (
                                 <Power size={11} />
                               )}
-                              {enabled ? '禁用' : '启用'}
+                              {isTencent ? (enabled ? '拒绝' : '放行') : enabled ? '禁用' : '启用'}
                             </button>
                             <button
                               type="button"
@@ -900,19 +1098,30 @@ export function SwasProvisionModal({
   onClose: () => void
   onProvisioned: (message: string) => void
 }) {
-  const reusableAccounts = useMemo(
+  const [provider, setProvider] = useState<SwasProvider>('aliyun')
+  const isTencent = provider === 'tencent'
+  const vendorName = isTencent ? '腾讯云' : '阿里云'
+  const idLabel = isTencent ? 'SecretId' : 'AccessKey ID'
+  const secretLabel = isTencent ? 'SecretKey' : 'AccessKey Secret'
+
+  const allReusable = useMemo(
     () => [
-      ...swasServers.map((s) => ({
-        key: `swas:${s.id}`,
-        label: `[轻量] ${s.label || s.instance_id}（${regionLabel(s.region_id)} · ${s.site === 'international' ? '国际站' : '中国站'}）`,
-        site: s.site,
-        region_id: s.region_id,
-        source_swas_id: s.id,
-        source_server_id: 0,
-      })),
+      ...swasServers.map((s) => {
+        const prov: SwasProvider = s.provider === 'tencent' ? 'tencent' : 'aliyun'
+        return {
+          key: `swas:${s.id}`,
+          provider: prov,
+          label: `[${prov === 'tencent' ? '腾讯轻量' : '阿里轻量'}] ${s.label || s.instance_id}（${regionLabel(s.region_id)} · ${s.site === 'international' ? '国际站' : '中国站'}）`,
+          site: s.site,
+          region_id: s.region_id,
+          source_swas_id: s.id,
+          source_server_id: 0,
+        }
+      }),
       ...ecsServers.map((s) => ({
         key: `ecs:${s.id}`,
-        label: `[ECS] ${s.label || s.instance_id}（${regionLabel(s.region_id)} · ${s.site === 'international' ? '国际站' : '中国站'}）`,
+        provider: 'aliyun' as const,
+        label: `[阿里云 ECS] ${s.label || s.instance_id}（${regionLabel(s.region_id)} · ${s.site === 'international' ? '国际站' : '中国站'}）`,
         site: s.site,
         region_id: s.region_id,
         source_swas_id: 0,
@@ -920,6 +1129,11 @@ export function SwasProvisionModal({
       })),
     ],
     [ecsServers, swasServers],
+  )
+
+  const reusableAccounts = useMemo(
+    () => allReusable.filter((a) => a.provider === provider),
+    [allReusable, provider],
   )
 
   const hasExisting = reusableAccounts.length > 0
@@ -958,7 +1172,8 @@ export function SwasProvisionModal({
   const [submitError, setSubmitError] = useState('')
   const [clientToken, setClientToken] = useState(() => makeClientToken('swas-create'))
 
-  const regionOptions = useMemo(() => regionsFor(site), [site])
+  const periodOptions = isTencent ? TENCENT_PROVISION_PERIOD_OPTIONS : ALIYUN_SWAS_PERIOD_OPTIONS
+  const regionOptions = useMemo(() => regionsForProvider(provider, site), [provider, site])
   const groupedRegions = useMemo(
     () =>
       GROUP_ORDER.map((group) => ({
@@ -977,9 +1192,45 @@ export function SwasProvisionModal({
 
   useEffect(() => {
     if (!regionOptions.some((r) => r.value === regionId)) {
-      setRegionId(regionOptions[0]?.value || DEFAULT_REGION)
+      const fallback = provider === 'tencent' ? DEFAULT_TENCENT_REGION : DEFAULT_REGION
+      setRegionId(
+        regionOptions.some((r) => r.value === fallback)
+          ? fallback
+          : regionOptions[0]?.value || fallback,
+      )
     }
-  }, [regionOptions, regionId])
+  }, [regionOptions, regionId, provider])
+
+  function handleChangeProvider(next: SwasProvider) {
+    if (next === provider) return
+    setProvider(next)
+    setPlans([])
+    setImages([])
+    setPlanId('')
+    setImageId('')
+    setOptsError('')
+    setSubmitError('')
+    setPeriodMonths(1)
+    setDataDiskSize('0')
+    invalidateQuote()
+    const matching = allReusable.filter((a) => a.provider === next)
+    if (matching.length > 0) {
+      setAccountMode('existing')
+      setReuseKey(matching[0].key)
+      setSite(matching[0].site)
+      setRegionId(matching[0].region_id || (next === 'tencent' ? DEFAULT_TENCENT_REGION : DEFAULT_REGION))
+    } else {
+      setAccountMode('new')
+      setReuseKey('')
+      const fallback = next === 'tencent' ? DEFAULT_TENCENT_REGION : DEFAULT_REGION
+      const nextRegions = regionsForProvider(next, site)
+      setRegionId(
+        nextRegions.some((r) => r.value === fallback)
+          ? fallback
+          : nextRegions[0]?.value || fallback,
+      )
+    }
+  }
 
   const selectedReuse = reusableAccounts.find((a) => a.key === reuseKey)
 
@@ -998,6 +1249,7 @@ export function SwasProvisionModal({
   function buildCredPayload() {
     if (accountMode === 'existing' && selectedReuse) {
       return {
+        provider,
         source_swas_id: selectedReuse.source_swas_id || undefined,
         source_server_id: selectedReuse.source_server_id || undefined,
         region_id: regionId,
@@ -1005,6 +1257,7 @@ export function SwasProvisionModal({
       }
     }
     return {
+      provider,
       access_key_id: accessKeyId.trim(),
       access_key_secret: accessKeySecret.trim(),
       region_id: regionId,
@@ -1018,7 +1271,7 @@ export function SwasProvisionModal({
       return
     }
     if (accountMode === 'new' && (!accessKeyId.trim() || !accessKeySecret.trim())) {
-      setOptsError('请先填写 AccessKey ID 与 AccessKey Secret')
+      setOptsError(`请先填写 ${idLabel} 与 ${secretLabel}`)
       return
     }
     setLoadingOpts(true)
@@ -1059,13 +1312,13 @@ export function SwasProvisionModal({
       setLoadingOpts(false)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accountMode, reuseKey, accessKeyId, accessKeySecret, regionId, site, imageType])
+  }, [provider, accountMode, reuseKey, accessKeyId, accessKeySecret, regionId, site, imageType])
 
   useEffect(() => {
     if (accountMode === 'existing' && selectedReuse) {
       void loadOptions()
     }
-  }, [accountMode, selectedReuse, regionId, imageType, loadOptions])
+  }, [provider, accountMode, selectedReuse, regionId, imageType, loadOptions])
 
   async function handleQueryPrice() {
     setQuoteError('')
@@ -1074,8 +1327,8 @@ export function SwasProvisionModal({
       setQuoteError('请先选择轻量服务器套餐')
       return
     }
-    const diskGb = Math.max(0, Math.trunc(Number(dataDiskSize) || 0))
-    if (diskGb > 0 && (diskGb % 20 !== 0 || diskGb > 16380)) {
+    const diskGb = isTencent ? 0 : Math.max(0, Math.trunc(Number(dataDiskSize) || 0))
+    if (!isTencent && diskGb > 0 && (diskGb % 20 !== 0 || diskGb > 16380)) {
       setQuoteError('附加数据盘容量须为 0 或 20 的整数倍（最大 16380 GB）')
       return
     }
@@ -1090,6 +1343,7 @@ export function SwasProvisionModal({
           plan_id: planId,
           period_months: periodMonths,
           data_disk_size: diskGb,
+          auto_renew: autoRenew,
         },
         SLOW_TIMEOUT_MS,
       )
@@ -1112,7 +1366,7 @@ export function SwasProvisionModal({
       setSubmitError('请确认已选择套餐与镜像')
       return
     }
-    const diskGb = Math.max(0, Math.trunc(Number(dataDiskSize) || 0))
+    const diskGb = isTencent ? 0 : Math.max(0, Math.trunc(Number(dataDiskSize) || 0))
     setSubmitting(true)
     try {
       const res = await post<{
@@ -1131,13 +1385,14 @@ export function SwasProvisionModal({
           auto_renew_period: autoRenewPeriod,
           add_to_panel: addToPanel,
           panel_label: panelLabel.trim(),
+          instance_name: panelLabel.trim(),
           confirm_pay: true,
           client_token: clientToken,
         },
         SLOW_TIMEOUT_MS,
       )
       onProvisioned(
-        `新轻量服务器开通成功（${res.instance_id || '已下单'}）${res.swas_id ? '，已自动加入轻量列表' : ''}`,
+        `新${vendorName}轻量服务器开通成功（${res.instance_id || '已下单'}）${res.swas_id ? '，已自动加入轻量列表' : ''}`,
       )
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : '开通轻量服务器失败')
@@ -1162,7 +1417,7 @@ export function SwasProvisionModal({
   return (
     <Modal
       wide
-      title="开通新阿里云轻量应用服务器"
+      title={`开通新${vendorName}轻量应用服务器`}
       icon={<Rocket size={16} style={{ color: 'var(--accent)' }} />}
       onClose={() => !submitting && onClose()}
       footer={
@@ -1193,15 +1448,30 @@ export function SwasProvisionModal({
       }
     >
       <div className="ops-stack">
+        {/* 0. Provider Selection */}
+        <div className="ops-card">
+          <div className="ops-card-head">
+            <strong>选择云厂商</strong>
+            <Segmented
+              value={provider}
+              onChange={handleChangeProvider}
+              options={[
+                { value: 'aliyun', label: '阿里云轻量 (SWAS)' },
+                { value: 'tencent', label: '腾讯云轻量 (Lighthouse)' },
+              ]}
+            />
+          </div>
+        </div>
+
         {/* 1. Account & Region */}
         <div className="ops-card">
           <div className="ops-card-head">
-            <strong>1. 选择阿里云账号与目标地域</strong>
+            <strong>1. 选择{vendorName}账号与目标地域</strong>
             <Segmented
               value={accountMode}
               options={[
                 { value: 'existing', label: '复用面板已有账号' },
-                { value: 'new', label: '填写新 AK / SK' },
+                { value: 'new', label: isTencent ? '填写新 SecretId / Key' : '填写新 AK / SK' },
               ]}
               onChange={(val) => {
                 setAccountMode(val)
@@ -1231,13 +1501,13 @@ export function SwasProvisionModal({
               </div>
             ) : (
               <div className="hint" style={{ margin: 0 }}>
-                当前面板还没有保存任何服务器账号，请切换到「填写新 AK / SK」。
+                当前面板还没有保存{vendorName}账号，请切换到「填写新{isTencent ? ' SecretId / Key' : ' AK / SK'}」。
               </div>
             )
           ) : (
             <div className="grid-2">
               <div className="field" style={{ marginBottom: 0 }}>
-                <label htmlFor="swas-prov-ak">AccessKey ID</label>
+                <label htmlFor="swas-prov-ak">{idLabel}</label>
                 <input
                   id="swas-prov-ak"
                   className="input mono"
@@ -1246,11 +1516,11 @@ export function SwasProvisionModal({
                     setAccessKeyId(event.target.value)
                     invalidateQuote()
                   }}
-                  placeholder="LTAI..."
+                  placeholder={isTencent ? 'AKID...' : 'LTAI...'}
                 />
               </div>
               <div className="field" style={{ marginBottom: 0 }}>
-                <label htmlFor="swas-prov-sk">AccessKey Secret</label>
+                <label htmlFor="swas-prov-sk">{secretLabel}</label>
                 <input
                   id="swas-prov-sk"
                   type="password"
@@ -1278,8 +1548,12 @@ export function SwasProvisionModal({
                   invalidateQuote()
                 }}
               >
-                <option value="china">中国站（aliyun.com）</option>
-                <option value="international">国际站（alibabacloud.com）</option>
+                <option value="china">
+                  {isTencent ? '中国站（cloud.tencent.com）' : '中国站（aliyun.com）'}
+                </option>
+                <option value="international">
+                  {isTencent ? '国际站（tencentcloud.com）' : '国际站（alibabacloud.com）'}
+                </option>
               </select>
             </div>
             <div className="field" style={{ marginBottom: 0 }}>
@@ -1372,7 +1646,7 @@ export function SwasProvisionModal({
                     </div>
                     <div className="image-item-meta">
                       <code className="mono">{p.plan_id}</code>
-                      <span>{p.flow > 0 ? `流量包 ${p.flow} GB/月` : '不限流量'}</span>
+                      <span>{p.flow > 0 ? `流量包 ${p.flow} GB/月` : `${p.bandwidth}M无限制`}</span>
                       {p.isp_type && <span>{p.isp_type}</span>}
                     </div>
                   </button>
@@ -1387,7 +1661,7 @@ export function SwasProvisionModal({
           <div className="ops-card-head">
             <strong>
               <Package size={13} style={{ verticalAlign: -2, marginRight: 4 }} />
-              3. 选择镜像与附加数据盘
+              {isTencent ? '3. 选择系统 / 应用镜像' : '3. 选择镜像与附加数据盘'}
             </strong>
             <Segmented
               value={imageType}
@@ -1442,27 +1716,9 @@ export function SwasProvisionModal({
             )}
           </div>
 
-          <div className="grid-2">
+          {isTencent ? (
             <div className="field" style={{ marginBottom: 0 }}>
-              <label htmlFor="swas-prov-disk">
-                <HardDrive size={11} /> 附加数据盘容量（GB，可选）
-              </label>
-              <input
-                id="swas-prov-disk"
-                type="number"
-                min={0}
-                step={20}
-                className="input mono"
-                value={dataDiskSize}
-                onChange={(event) => {
-                  setDataDiskSize(event.target.value)
-                  invalidateQuote()
-                }}
-                placeholder="0（不挂载）或 20 的整数倍"
-              />
-            </div>
-            <div className="field" style={{ marginBottom: 0 }}>
-              <label htmlFor="swas-prov-label">面板显示名称（可选）</label>
+              <label htmlFor="swas-prov-label">实例与面板名称（可选）</label>
               <input
                 id="swas-prov-label"
                 className="input"
@@ -1471,7 +1727,38 @@ export function SwasProvisionModal({
                 placeholder="留空则按实例 ID 自动命名"
               />
             </div>
-          </div>
+          ) : (
+            <div className="grid-2">
+              <div className="field" style={{ marginBottom: 0 }}>
+                <label htmlFor="swas-prov-disk">
+                  <HardDrive size={11} /> 附加数据盘容量（GB，可选）
+                </label>
+                <input
+                  id="swas-prov-disk"
+                  type="number"
+                  min={0}
+                  step={20}
+                  className="input mono"
+                  value={dataDiskSize}
+                  onChange={(event) => {
+                    setDataDiskSize(event.target.value)
+                    invalidateQuote()
+                  }}
+                  placeholder="0（不挂载）或 20 的整数倍"
+                />
+              </div>
+              <div className="field" style={{ marginBottom: 0 }}>
+                <label htmlFor="swas-prov-label">面板显示名称（可选）</label>
+                <input
+                  id="swas-prov-label"
+                  className="input"
+                  value={panelLabel}
+                  onChange={(event) => setPanelLabel(event.target.value)}
+                  placeholder="留空则按实例 ID 自动命名"
+                />
+              </div>
+            </div>
+          )}
         </div>
 
         {/* 4. Duration, Auto-Renew & Price Confirmation */}
@@ -1482,7 +1769,7 @@ export function SwasProvisionModal({
           </div>
 
           <div className="ops-period-grid">
-            {SWAS_PERIOD_OPTIONS.map((opt) => (
+            {periodOptions.map((opt) => (
               <button
                 type="button"
                 key={opt.value}
@@ -1508,7 +1795,7 @@ export function SwasProvisionModal({
               />
               <span>到期自动续费</span>
             </label>
-            {autoRenew && (
+            {autoRenew && !isTencent && (
               <select
                 className="select"
                 style={{ maxWidth: 170 }}
@@ -1537,7 +1824,7 @@ export function SwasProvisionModal({
           {quoteLoading ? (
             <div className="manage-center compact">
               <LoaderCircle size={14} className="spin" />
-              <span>正在向阿里云查询实时开通价格…</span>
+              <span>正在向{vendorName}查询实时开通价格…</span>
             </div>
           ) : quoteError ? (
             <div className="auth-error">
@@ -1568,7 +1855,7 @@ export function SwasProvisionModal({
             </div>
           ) : (
             <div className="hint" style={{ margin: 0 }}>
-              请点击左下角「立即询价」查看阿里云实时价格，确认后再勾选扣费并开通。
+              请点击左下角「立即询价」查看{vendorName}实时价格，确认后再勾选扣费并开通。
             </div>
           )}
 
@@ -1582,7 +1869,7 @@ export function SwasProvisionModal({
             <span>
               我已核对地域、套餐、镜像、时长及实付金额
               {quote ? `（${formatPrice(quote.trade_price, quote.currency)}）` : ''}
-              ，确认从阿里云账户扣费开通
+              ，确认从{vendorName}账户扣费开通
             </span>
           </label>
 

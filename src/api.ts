@@ -997,6 +997,7 @@ function swasSummary(
 ): Record<string, unknown> {
   return {
     id: item.id,
+    provider: item.provider,
     label: item.label,
     access_key_id: item.access_key_id,
     access_key_masked: item.access_key_masked ?? "",
@@ -2428,31 +2429,40 @@ app.post("/api/v1/aliyun/provision/create", async (c) => {
   });
 });
 
-// -- Lightweight Application Server (Aliyun SWAS) -----------------------------
+// -- Lightweight Application Server (Aliyun SWAS & Tencent Lighthouse) --------
 
 async function loadSwasAccount(
   env: Env,
   swasId: number,
-): Promise<{ server: repo.SwasServerView; account: aliyun.AliyunAccount }> {
+): Promise<{ server: repo.SwasServerView; account: swas.SwasAccount }> {
   const server = await repo.getSwasServer(env, swasId, true);
   if (!server) throw httpErr(404, "not_found", "轻量服务器不存在");
   if (!server.access_key_secret) {
-    throw invalid("这台轻量服务器还没有配置 AccessKey Secret，请先编辑补全");
+    throw invalid(
+      server.provider === "tencent"
+        ? "这台腾讯云轻量服务器还没有配置 SecretKey，请先编辑补全"
+        : "这台轻量服务器还没有配置 AccessKey Secret，请先编辑补全",
+    );
   }
   return { server, account: swas.toAccount(server) };
 }
 
 /**
- * Resolve Aliyun credentials for SWAS discover / import / provision.
- * Supports reusing an existing ECS server (`source_server_id`), an existing
- * SWAS server (`source_swas_id`), or explicit AK/SK in the request payload.
+ * Resolve cloud credentials for lightweight discover / import / provision.
+ * Supports reusing an existing ECS server (`source_server_id`, Aliyun only),
+ * an existing lightweight server (`source_swas_id`), or explicit AK/SK.
  */
 async function resolveSwasSourceAccount(
   env: Env,
   payload: AnyRow,
-): Promise<{ account: aliyun.AliyunAccount; site: string }> {
+  opts?: { allowEmptyRegion?: boolean },
+): Promise<{ account: swas.SwasAccount; site: string; provider: repo.SwasProvider }> {
   const sourceServerId = numOf(payload["source_server_id"], 0);
   const sourceSwasId = numOf(payload["source_swas_id"], 0);
+  const explicitProvider = strOf(payload["provider"]).trim();
+  let provider: repo.SwasProvider = explicitProvider
+    ? repo.normalizeProvider(explicitProvider)
+    : "aliyun";
   let ak = strOf(payload["access_key_id"]).trim();
   let sk = strOf(payload["access_key_secret"]).trim();
   let site = strOf(payload["site"]).trim();
@@ -2461,10 +2471,19 @@ async function resolveSwasSourceAccount(
   if (sourceSwasId > 0) {
     const existing = await repo.getSwasServer(env, sourceSwasId, true);
     if (!existing) throw httpErr(404, "not_found", "所选来源轻量服务器不存在");
+    if (explicitProvider && existing.provider !== provider) {
+      throw invalid(
+        `所选来源轻量服务器属于${existing.provider === "tencent" ? "腾讯云" : "阿里云"}，与当前所选云厂商不一致`,
+      );
+    }
+    provider = existing.provider;
     ak = strOf(existing.access_key_id).trim();
     sk = strOf(existing.access_key_secret).trim();
     if (!site) site = repo.normalizeSite(existing.site);
   } else if (sourceServerId > 0) {
+    if (provider === "tencent") {
+      throw invalid("ECS 账号为阿里云凭证，不能复用到腾讯云轻量；请选择腾讯云轻量账号或手动填写 SecretId / SecretKey");
+    }
     const existing = await repo.getServer(env, sourceServerId, true);
     if (!existing) throw httpErr(404, "not_found", "所选来源服务器不存在");
     ak = strOf(existing.access_key_id).trim();
@@ -2473,18 +2492,24 @@ async function resolveSwasSourceAccount(
   }
 
   if (!ak || !sk) {
-    throw invalid("请选择已有服务器账号，或填写完整的 AccessKey ID 与 AccessKey Secret");
+    throw invalid(
+      provider === "tencent"
+        ? "请选择已有腾讯云轻量账号，或填写完整的 SecretId 与 SecretKey"
+        : "请选择已有服务器账号，或填写完整的 AccessKey ID 与 AccessKey Secret",
+    );
   }
-  if (!regionId) {
+  if (!regionId && !opts?.allowEmptyRegion) {
     throw invalid("请选择目标地域");
   }
   const normalizedSite = repo.normalizeSite(site);
   return {
+    provider,
     site: normalizedSite,
     account: {
+      provider,
       access_key_id: ak,
       access_key_secret: sk,
-      region_id: regionId,
+      region_id: regionId || (provider === "tencent" ? "ap-guangzhou" : "cn-hongkong"),
       site: normalizedSite,
       instance_id: "",
     },
@@ -2504,22 +2529,31 @@ app.post("/api/v1/swas", async (c) => {
   const payload = await jsonBody(c);
   const swasId = numOf(payload["id"], 0);
 
-  // Allow creating a SWAS record by reusing an existing ECS or SWAS account's AK/SK.
+  // Allow creating a lightweight record by reusing an existing ECS or lightweight account's keys.
   let ak = strOf(payload["access_key_id"]).trim();
   let sk = strOf(payload["access_key_secret"]).trim();
   let site = strOf(payload["site"]).trim();
+  let provider = strOf(payload["provider"]).trim();
   const sourceServerId = numOf(payload["source_server_id"], 0);
   const sourceSwasId = numOf(payload["source_swas_id"], 0);
   if (!swasId && (!ak || !sk)) {
     if (sourceSwasId > 0) {
       const src = await repo.getSwasServer(c.env, sourceSwasId, true);
       if (!src) throw httpErr(404, "not_found", "所选来源轻量服务器不存在");
+      if (provider && repo.normalizeProvider(provider) !== src.provider) {
+        throw invalid("所选来源轻量服务器的云厂商与当前所选厂商不一致");
+      }
+      provider = src.provider;
       ak = src.access_key_id;
       sk = src.access_key_secret ?? "";
       if (!site) site = src.site;
     } else if (sourceServerId > 0) {
+      if (provider && repo.normalizeProvider(provider) === "tencent") {
+        throw invalid("不能复用阿里云 ECS 密钥来添加腾讯云轻量服务器");
+      }
       const src = await repo.getServer(c.env, sourceServerId, true);
       if (!src) throw httpErr(404, "not_found", "所选来源服务器不存在");
+      provider = "aliyun";
       ak = src.access_key_id;
       sk = src.access_key_secret ?? "";
       if (!site) site = src.site;
@@ -2530,6 +2564,7 @@ app.post("/api/v1/swas", async (c) => {
   try {
     savedId = await repo.upsertSwasServer(c.env, {
       ...payload,
+      provider: provider || payload["provider"],
       access_key_id: ak,
       access_key_secret: sk,
       site: site || payload["site"],
@@ -2560,27 +2595,25 @@ app.post("/api/v1/swas/discover", async (c) => {
   await requireAdmin(c);
   requireCsrf(c);
   const payload = await jsonBody(c);
-  const { account } = await resolveSwasSourceAccount(c.env, payload);
-  const instances = await swas.listInstances(c.env, account);
-  const ids = instances.map((i) => i.instance_id).filter(Boolean);
-  const trafficMap = ids.length
-    ? await swas.listTrafficPackages(c.env, account, ids).catch(() => new Map())
-    : new Map();
-  return c.json({
-    items: instances.map((inst) => ({
-      ...inst,
-      traffic: trafficMap.get(inst.instance_id) ?? inst.traffic ?? null,
-    })),
+  const scanAllRegions = boolOf(payload["scan_all_regions"]);
+  const { account, provider } = await resolveSwasSourceAccount(c.env, payload, {
+    allowEmptyRegion: scanAllRegions,
   });
+  const items = await swas.discoverInstances(
+    c.env,
+    account,
+    scanAllRegions && provider === "tencent",
+  );
+  return c.json({ provider, items });
 });
 
-// -- SWAS Provisioning (must come before /:swasId) ----------------------------
+// -- Lightweight Provisioning (must come before /:swasId) ---------------------
 
 app.post("/api/v1/swas/provision/options", async (c) => {
   await requireAdmin(c);
   requireCsrf(c);
   const payload = await jsonBody(c);
-  const { account } = await resolveSwasSourceAccount(c.env, payload);
+  const { account, provider } = await resolveSwasSourceAccount(c.env, payload);
   const imageTypeRaw = strOf(payload["image_type"]).trim().toLowerCase();
   const imageType =
     imageTypeRaw === "app" || imageTypeRaw === "custom" ? imageTypeRaw : "system";
@@ -2589,6 +2622,7 @@ app.post("/api/v1/swas/provision/options", async (c) => {
     swas.listImages(c.env, account, imageType),
   ]);
   return c.json({
+    provider,
     region_id: account.region_id,
     site: account.site,
     plans,
@@ -2600,11 +2634,13 @@ app.post("/api/v1/swas/provision/price", async (c) => {
   await requireAdmin(c);
   requireCsrf(c);
   const payload = await jsonBody(c);
-  const { account } = await resolveSwasSourceAccount(c.env, payload);
+  const { account, provider } = await resolveSwasSourceAccount(c.env, payload);
   const planId = strOf(payload["plan_id"]).trim();
   if (!planId) throw invalid("请先选择套餐");
   const periodMonths = Math.trunc(numOf(payload["period_months"], 1));
-  const dataDiskSize = Math.max(0, Math.trunc(numOf(payload["data_disk_size"], 0)));
+  const autoRenew = boolOf(payload["auto_renew"]);
+  const dataDiskSize =
+    provider === "tencent" ? 0 : Math.max(0, Math.trunc(numOf(payload["data_disk_size"], 0)));
   if (dataDiskSize > 0 && (dataDiskSize % 20 !== 0 || dataDiskSize > 16380)) {
     throw invalid("数据盘容量须为 0 或 20 的整数倍（最大 16380 GB）");
   }
@@ -2612,6 +2648,7 @@ app.post("/api/v1/swas/provision/price", async (c) => {
     planId,
     periodMonths,
     dataDiskSize,
+    autoRenew,
   });
   return c.json({ quote });
 });
@@ -2623,15 +2660,17 @@ app.post("/api/v1/swas/provision/create", async (c) => {
   if (!boolOf(payload["confirm_pay"])) {
     throw invalid("请先完成实时询价并勾选扣费确认后再开通轻量服务器");
   }
-  const { account, site } = await resolveSwasSourceAccount(c.env, payload);
+  const { account, site, provider } = await resolveSwasSourceAccount(c.env, payload);
   const planId = strOf(payload["plan_id"]).trim();
   const imageId = strOf(payload["image_id"]).trim();
   const periodMonths = Math.trunc(numOf(payload["period_months"], 1));
-  const dataDiskSize = Math.max(0, Math.trunc(numOf(payload["data_disk_size"], 0)));
+  const dataDiskSize =
+    provider === "tencent" ? 0 : Math.max(0, Math.trunc(numOf(payload["data_disk_size"], 0)));
   const autoRenew = boolOf(payload["auto_renew"]);
   const autoRenewPeriod = Math.trunc(numOf(payload["auto_renew_period"], 1));
   const addToPanel = payload["add_to_panel"] === undefined ? true : boolOf(payload["add_to_panel"]);
   const panelLabel = strOf(payload["panel_label"]).trim();
+  const instanceName = strOf(payload["instance_name"]).trim() || panelLabel;
   const clientToken = strOf(payload["client_token"]).trim();
 
   if (!planId) throw invalid("请选择轻量服务器套餐");
@@ -2644,14 +2683,17 @@ app.post("/api/v1/swas/provision/create", async (c) => {
     dataDiskSize,
     autoRenew,
     autoRenewPeriod,
+    instanceName: instanceName || undefined,
     clientToken: clientToken || undefined,
   });
   const newInstanceId = created.instance_ids[0] ?? "";
 
   let swasId = 0;
   if (addToPanel && newInstanceId) {
+    const providerPrefix = provider === "tencent" ? "腾讯轻量" : "轻量";
     swasId = await repo.upsertSwasServer(c.env, {
-      label: panelLabel || `轻量-${newInstanceId.slice(-6)}`,
+      provider,
+      label: panelLabel || `${providerPrefix}-${newInstanceId.slice(-6)}`,
       access_key_id: account.access_key_id,
       access_key_secret: account.access_key_secret,
       region_id: account.region_id,
@@ -2662,10 +2704,11 @@ app.post("/api/v1/swas/provision/create", async (c) => {
     await swas.refreshSwasServer(c.env, swasId).catch(() => {});
   }
 
+  const vendorLabel = provider === "tencent" ? "腾讯云" : "阿里云";
   await repo.addEvent(
     c.env,
     "manual",
-    messages.ev("开通新轻量服务器", messages.objServer(panelLabel || newInstanceId)),
+    messages.ev(`开通${vendorLabel}轻量服务器`, messages.objServer(panelLabel || newInstanceId)),
     {
       detail: `地域 ${account.region_id} · 套餐 ${planId} · ${periodMonths} 个月 · 实例 ${newInstanceId || "—"}`,
       level: "info",
@@ -2673,6 +2716,7 @@ app.post("/api/v1/swas/provision/create", async (c) => {
   );
   return c.json({
     ok: true,
+    provider,
     instance_id: newInstanceId,
     instance_ids: created.instance_ids,
     request_id: created.request_id,
@@ -2770,8 +2814,9 @@ app.post("/api/v1/swas/:swasId/vnc", async (c) => {
   const swasId = paramInt(c, "swasId");
   const { server, account } = await loadSwasAccount(c.env, swasId);
   const vncUrl = await swas.describeInstanceVncUrl(c.env, account);
-  const consoleUrl = `https://swasnext.console.aliyun.com/servers/${encodeURIComponent(account.region_id)}/${encodeURIComponent(account.instance_id)}/overview`;
+  const consoleUrl = swas.getConsoleUrl(account);
   return c.json({
+    provider: server.provider,
     vnc_url: vncUrl,
     console_url: consoleUrl,
     instance_id: account.instance_id,
@@ -2817,9 +2862,9 @@ app.post("/api/v1/swas/:swasId/workbench", async (c) => {
 app.get("/api/v1/swas/:swasId/account-id", async (c) => {
   await requireAdmin(c);
   const swasId = paramInt(c, "swasId");
-  const { account } = await loadSwasAccount(c.env, swasId);
-  const accountId = await aliyun.getCallerAccountId(c.env, account);
-  return c.json({ account_id: accountId });
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  const accountId = await swas.getCallerAccountId(c.env, account);
+  return c.json({ provider: server.provider, account_id: accountId });
 });
 
 // -- SWAS Reset System & Images/KeyPairs --------------------------------------
@@ -2894,18 +2939,44 @@ app.post("/api/v1/swas/:swasId/snapshots", async (c) => {
   const payload = await jsonBody(c);
   const diskId = strOf(payload["disk_id"]).trim();
   const snapshotName = strOf(payload["snapshot_name"]).trim();
-  if (!diskId) throw invalid("请选择要创建快照的磁盘");
+  if (server.provider !== "tencent" && !diskId) {
+    throw invalid("请选择要创建快照的磁盘");
+  }
   if (snapshotName.length < 2 || snapshotName.length > 50) {
     throw invalid("快照名称长度须为 2–50 个字符");
   }
-  const snapshotId = await swas.createSnapshot(c.env, account, { diskId, snapshotName });
+  const snapshotId = await swas.createSnapshot(c.env, account, {
+    diskId: diskId || undefined,
+    snapshotName,
+  });
   await repo.addEvent(
     c.env,
     "manual",
     messages.ev("创建轻量快照", messages.objServer(server.label)),
-    { detail: `快照 ${snapshotName}（${snapshotId}，磁盘 ${diskId}）`, level: "info" },
+    {
+      detail: `快照 ${snapshotName}（${snapshotId}${diskId ? `，磁盘 ${diskId}` : ""}）`,
+      level: "info",
+    },
   );
   return c.json({ ok: true, snapshot_id: snapshotId });
+});
+
+app.post("/api/v1/swas/:swasId/snapshots/:snapshotId/apply", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const snapshotId = c.req.param("snapshotId").trim();
+  if (!snapshotId) throw invalid("缺少快照 ID");
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  await swas.applySnapshot(c.env, account, snapshotId);
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("回滚轻量快照", messages.objServer(server.label)),
+    { detail: `已提交快照回滚（${snapshotId}）`, level: "warn" },
+  );
+  await swas.refreshSwasServer(c.env, swasId).catch(() => {});
+  return c.json({ ok: true });
 });
 
 app.delete("/api/v1/swas/:swasId/snapshots/:snapshotId", async (c) => {
@@ -2943,21 +3014,33 @@ app.post("/api/v1/swas/:swasId/custom-images", async (c) => {
   const systemSnapshotId = strOf(payload["system_snapshot_id"]).trim();
   const dataSnapshotId = strOf(payload["data_snapshot_id"]).trim();
   const description = strOf(payload["description"]).trim().slice(0, 256);
-  if (imageName.length < 2 || imageName.length > 128) {
-    throw invalid("自定义镜像名称长度须为 2–128 个字符");
+  const forcePowerOff =
+    payload["force_power_off"] === undefined ? true : boolOf(payload["force_power_off"]);
+  const maxNameLen = server.provider === "tencent" ? 60 : 128;
+  if (imageName.length < 2 || imageName.length > maxNameLen) {
+    throw invalid(`自定义镜像名称长度须为 2–${maxNameLen} 个字符`);
   }
-  if (!systemSnapshotId) throw invalid("请选择一个系统盘快照作为镜像来源");
+  if (server.provider !== "tencent" && !systemSnapshotId) {
+    throw invalid("请选择一个系统盘快照作为镜像来源");
+  }
   const imageId = await swas.createCustomImage(c.env, account, {
     imageName,
-    systemSnapshotId,
+    systemSnapshotId: systemSnapshotId || undefined,
     dataSnapshotId: dataSnapshotId || undefined,
     description: description || undefined,
+    forcePowerOff,
   });
   await repo.addEvent(
     c.env,
     "manual",
     messages.ev("创建轻量自定义镜像", messages.objServer(server.label)),
-    { detail: `镜像 ${imageName}（${imageId}，基于快照 ${systemSnapshotId}）`, level: "info" },
+    {
+      detail:
+        server.provider === "tencent"
+          ? `镜像 ${imageName}（${imageId}，源自实例 ${account.instance_id}）`
+          : `镜像 ${imageName}（${imageId}，基于快照 ${systemSnapshotId}）`,
+      level: "info",
+    },
   );
   return c.json({ ok: true, image_id: imageId });
 });
@@ -3016,19 +3099,29 @@ app.post("/api/v1/swas/:swasId/custom-images/:imageId/shares", async (c) => {
   let targetAccountId = strOf(payload["account_id"]).trim();
   const targetSwasId = numOf(payload["target_swas_id"], 0);
   const targetServerId = numOf(payload["target_server_id"], 0);
+  const { server, account } = await loadSwasAccount(c.env, swasId);
 
   if (!targetAccountId && targetSwasId > 0) {
     const target = await loadSwasAccount(c.env, targetSwasId);
-    targetAccountId = await aliyun.getCallerAccountId(c.env, target.account);
+    if (target.server.provider !== server.provider) {
+      throw invalid("跨账号共享仅支持同一云厂商内的账号之间共享");
+    }
+    targetAccountId = await swas.getCallerAccountId(c.env, target.account);
   } else if (!targetAccountId && targetServerId > 0) {
+    if (server.provider === "tencent") {
+      throw invalid("腾讯云轻量镜像只能共享给腾讯云账号，无法选择阿里云 ECS 服务器");
+    }
     const target = await loadServerAccount(c.env, targetServerId);
     targetAccountId = await aliyun.getCallerAccountId(c.env, target.account);
   }
   if (!/^\d{6,24}$/.test(targetAccountId)) {
-    throw invalid("请填写有效的阿里云主账号 UID（纯数字）或选择目标服务器");
+    throw invalid(
+      server.provider === "tencent"
+        ? "请填写有效的腾讯云主账号 UIN（纯数字）或选择目标腾讯云轻量服务器"
+        : "请填写有效的阿里云主账号 UID（纯数字）或选择目标服务器",
+    );
   }
 
-  const { server, account } = await loadSwasAccount(c.env, swasId);
   await swas.updateCustomImageShareAccounts(c.env, account, imageId, action, [targetAccountId]);
   await repo.addEvent(
     c.env,
@@ -3050,6 +3143,7 @@ app.post("/api/v1/swas/:swasId/attribute", async (c) => {
   const payload = await jsonBody(c);
   const instanceName = strOf(payload["instance_name"]).trim();
   const password = strOf(payload["password"]);
+  const userName = strOf(payload["user_name"]).trim();
   const syncLabel = boolOf(payload["sync_label"]);
   const rebootAfter = boolOf(payload["reboot_after"]);
 
@@ -3064,11 +3158,13 @@ app.post("/api/v1/swas/:swasId/attribute", async (c) => {
   await swas.updateInstanceAttribute(c.env, account, {
     instanceName: instanceName || undefined,
     password: password || undefined,
+    userName: userName || undefined,
   });
 
   if (instanceName && syncLabel) {
     await repo.upsertSwasServer(c.env, {
       id: swasId,
+      provider: server.provider,
       label: instanceName,
       region_id: server.region_id,
       site: server.site,
@@ -3077,8 +3173,10 @@ app.post("/api/v1/swas/:swasId/attribute", async (c) => {
     });
   }
 
+  // Tencent ResetInstancesPassword already shuts down, resets, and restarts the
+  // instance automatically; only trigger an explicit reboot for Aliyun SWAS.
   let rebooted = false;
-  if (password && rebootAfter) {
+  if (password && server.provider !== "tencent" && rebootAfter) {
     const detail = await swas.getInstanceDetail(c.env, account).catch(() => null);
     if (detail?.status === "Running") {
       await swas.rebootInstance(c.env, account, false);
@@ -3088,7 +3186,13 @@ app.post("/api/v1/swas/:swasId/attribute", async (c) => {
 
   const changed: string[] = [];
   if (instanceName) changed.push(`实例名改为 ${instanceName}`);
-  if (password) changed.push(rebooted ? "已重置登录密码并触发重启" : "已重置登录密码（需重启生效）");
+  if (password) {
+    if (server.provider === "tencent") {
+      changed.push("已重置登录密码（腾讯云自动重启生效）");
+    } else {
+      changed.push(rebooted ? "已重置登录密码并触发重启" : "已重置登录密码（需重启生效）");
+    }
+  }
   await repo.addEvent(
     c.env,
     "manual",
@@ -3097,6 +3201,34 @@ app.post("/api/v1/swas/:swasId/attribute", async (c) => {
   );
   return c.json({ ok: true, rebooted });
 });
+
+function normalizeTencentFirewallPort(protocol: string, raw: string): string {
+  if (protocol === "ICMP" || protocol === "ALL") return "ALL";
+  const cleaned = raw.trim();
+  if (!cleaned || cleaned.toUpperCase() === "ALL" || cleaned === "-1/-1") return "ALL";
+  const parts = cleaned.split(",").map((s) => s.trim()).filter(Boolean);
+  if (parts.length === 0) throw invalid("请填写端口号（如 22、80,443、8000-8010 或 ALL）");
+  const normalized: string[] = [];
+  for (const part of parts) {
+    if (/^\d+$/.test(part)) {
+      const p = Number(part);
+      if (p < 1 || p > 65535) throw invalid("端口号须在 1–65535 之间");
+      normalized.push(String(p));
+      continue;
+    }
+    const m = part.match(/^(\d+)\s*[/\-:]\s*(\d+)$/);
+    if (!m) {
+      throw invalid("端口格式应为单个端口（22）、逗号分隔（80,443）、区间（8000-9000）或 ALL");
+    }
+    const a = Number(m[1]);
+    const b = Number(m[2]);
+    if (a < 1 || b > 65535 || a > b) {
+      throw invalid("端口范围须在 1–65535 之间，且起始端口不能大于结束端口");
+    }
+    normalized.push(a === b ? String(a) : `${a}-${b}`);
+  }
+  return normalized.join(",");
+}
 
 app.get("/api/v1/swas/:swasId/firewall", async (c) => {
   await requireAdmin(c);
@@ -3113,25 +3245,42 @@ app.post("/api/v1/swas/:swasId/firewall", async (c) => {
   const { server, account } = await loadSwasAccount(c.env, swasId);
   const payload = await jsonBody(c);
   const protoRaw = strOf(payload["rule_protocol"]).trim().toUpperCase();
-  if (protoRaw !== "TCP" && protoRaw !== "UDP" && protoRaw !== "TCP+UDP" && protoRaw !== "ICMP") {
-    throw invalid("轻量防火墙协议仅支持 TCP、UDP、TCP+UDP 或 ICMP");
+  const isTencent = server.provider === "tencent";
+  const allowedProtos = isTencent
+    ? ["TCP", "UDP", "TCP+UDP", "ICMP", "ALL"]
+    : ["TCP", "UDP", "TCP+UDP", "ICMP"];
+  if (!allowedProtos.includes(protoRaw)) {
+    throw invalid(
+      isTencent
+        ? "腾讯云轻量防火墙协议支持 TCP、UDP、TCP+UDP、ICMP 或 ALL"
+        : "轻量防火墙协议仅支持 TCP、UDP、TCP+UDP 或 ICMP",
+    );
   }
-  const port = protoRaw === "ICMP" ? "-1/-1" : normalizePortRange("TCP", strOf(payload["port"]));
+  const port = isTencent
+    ? normalizeTencentFirewallPort(protoRaw, strOf(payload["port"]))
+    : protoRaw === "ICMP"
+      ? "-1/-1"
+      : normalizePortRange("TCP", strOf(payload["port"]));
   const cidrRaw = strOf(payload["source_cidr_ip"]).trim();
   const sourceCidrIp = cidrRaw ? validateCidrIp(cidrRaw) : "0.0.0.0/0";
+  const policyRaw = strOf(payload["policy"]).trim().toLowerCase();
+  const policy = isTencent && policyRaw === "drop" ? "drop" : "accept";
   const remark = strOf(payload["remark"]).trim().slice(0, 128);
 
   const ruleId = await swas.createFirewallRule(c.env, account, {
-    ruleProtocol: protoRaw,
+    ruleProtocol: protoRaw as "TCP" | "UDP" | "TCP+UDP" | "ICMP" | "ALL",
     port,
     sourceCidrIp,
+    policy,
     remark: remark || undefined,
   });
   await repo.addEvent(
     c.env,
     "manual",
     messages.ev("添加轻量防火墙规则", messages.objServer(server.label)),
-    { detail: `${protoRaw} ${port} (${sourceCidrIp})${remark ? ` · ${remark}` : ""}` },
+    {
+      detail: `${protoRaw} ${port} (${sourceCidrIp}${policy === "drop" ? " · 拒绝" : ""})${remark ? ` · ${remark}` : ""}`,
+    },
   );
   const rules = await swas.listFirewallRules(c.env, account);
   return c.json({ ok: true, rule_id: ruleId, rules });
@@ -3180,7 +3329,7 @@ app.post("/api/v1/swas/:swasId/renewal/price", async (c) => {
   await requireAdmin(c);
   requireCsrf(c);
   const swasId = paramInt(c, "swasId");
-  const { account } = await loadSwasAccount(c.env, swasId);
+  const { server, account } = await loadSwasAccount(c.env, swasId);
   const payload = await jsonBody(c);
   const periodMonths = Math.trunc(numOf(payload["period_months"], 1));
   const detail = await swas.getInstanceDetail(c.env, account);
@@ -3194,10 +3343,50 @@ app.post("/api/v1/swas/:swasId/renewal/price", async (c) => {
     instanceId: account.instance_id,
   });
   return c.json({
+    provider: server.provider,
     quote,
     expired_time: detail.expired_time,
     plan_id: detail.plan_id,
+    renew_flag: detail.renew_flag ?? "",
+    console_urls: swas.getRenewalConsoleUrls(account),
   });
+});
+
+app.post("/api/v1/swas/:swasId/renewal/auto", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const swasId = paramInt(c, "swasId");
+  const { server, account } = await loadSwasAccount(c.env, swasId);
+  const payload = await jsonBody(c);
+  const renewFlag = strOf(payload["renew_flag"]).trim().toUpperCase();
+  const validFlags = new Set([
+    "NOTIFY_AND_AUTO_RENEW",
+    "NOTIFY_AND_MANUAL_RENEW",
+    "DISABLE_NOTIFY_AND_MANUAL_RENEW",
+  ]);
+  if (!validFlags.has(renewFlag)) {
+    throw invalid("无效的自动续费策略");
+  }
+  await swas.modifyAutoRenew(
+    c.env,
+    account,
+    renewFlag as
+      | "NOTIFY_AND_AUTO_RENEW"
+      | "NOTIFY_AND_MANUAL_RENEW"
+      | "DISABLE_NOTIFY_AND_MANUAL_RENEW",
+  );
+  const labelMap: Record<string, string> = {
+    NOTIFY_AND_AUTO_RENEW: "通知过期且自动续费",
+    NOTIFY_AND_MANUAL_RENEW: "通知过期不自动续费",
+    DISABLE_NOTIFY_AND_MANUAL_RENEW: "不通知且不自动续费",
+  };
+  await repo.addEvent(
+    c.env,
+    "manual",
+    messages.ev("调整轻量自动续费策略", messages.objServer(server.label)),
+    { detail: `${labelMap[renewFlag] || renewFlag}（${account.instance_id}）`, level: "info" },
+  );
+  return c.json({ ok: true, renew_flag: renewFlag });
 });
 
 app.post("/api/v1/swas/:swasId/renewal/pay", async (c) => {

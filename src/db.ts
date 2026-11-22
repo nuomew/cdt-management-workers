@@ -67,6 +67,7 @@ const SCHEMA_STATEMENTS: readonly string[] = [
   )`,
   `CREATE TABLE IF NOT EXISTS swas_servers (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider            TEXT    NOT NULL DEFAULT 'aliyun',
     label               TEXT    NOT NULL,
     access_key_id       TEXT    NOT NULL,
     access_key_secret   TEXT    NOT NULL,
@@ -234,21 +235,36 @@ export function ensureSchema(db: D1Database | undefined): Promise<void> {
 
   const initPromise = (async () => {
     const check = await db.prepare(TABLE_CHECK_SQL).first<{ cnt?: number }>();
-    if (Number(check?.cnt ?? 0) === REQUIRED_TABLES.length) return;
-
-    const statements: D1PreparedStatement[] = SCHEMA_STATEMENTS.map((sql) =>
-      db.prepare(sql),
-    );
-    for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-      statements.push(
-        db
-          .prepare(
-            "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING",
-          )
-          .bind(key, value),
+    if (Number(check?.cnt ?? 0) !== REQUIRED_TABLES.length) {
+      const statements: D1PreparedStatement[] = SCHEMA_STATEMENTS.map((sql) =>
+        db.prepare(sql),
       );
+      for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
+        statements.push(
+          db
+            .prepare(
+              "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING",
+            )
+            .bind(key, value),
+        );
+      }
+      await db.batch(statements);
     }
-    await db.batch(statements);
+
+    // Idempotent column upgrades for pre-existing D1 databases.
+    const swasCols = await db
+      .prepare("PRAGMA table_info(swas_servers)")
+      .all<{ name?: string }>();
+    const hasProvider = (swasCols.results ?? []).some(
+      (col) => col.name === "provider",
+    );
+    if (!hasProvider) {
+      await db
+        .prepare(
+          "ALTER TABLE swas_servers ADD COLUMN provider TEXT NOT NULL DEFAULT 'aliyun'",
+        )
+        .run();
+    }
   })().catch((err) => {
     // Clear failed promise so a transient D1 error does not poison the isolate.
     schemaReadyCache.delete(db);

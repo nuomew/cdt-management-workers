@@ -105,6 +105,7 @@ export interface TrendPoint {
 
 export interface PublicNodeItem {
   kind: "ecs" | "swas";
+  provider?: repo.SwasProvider;
   name: string;
   region_id: string;
   status: string;
@@ -159,6 +160,7 @@ export interface PublicHomePayload {
   nodes: PublicNodeItem[];
   ranking: {
     kind: "ecs" | "swas";
+    provider?: repo.SwasProvider;
     name: string;
     region_id: string;
     used_gb: number;
@@ -172,6 +174,7 @@ export interface PublicHomePayload {
 export interface AdminNodeMetric {
   id: number;
   kind: "ecs" | "swas";
+  provider?: repo.SwasProvider;
   label: string;
   instance_id: string;
   region_id: string;
@@ -208,6 +211,7 @@ export interface AdminDashboardPayload {
   ranking: {
     id: number;
     kind: "ecs" | "swas";
+    provider?: repo.SwasProvider;
     name: string;
     region_id: string;
     used_gb: number;
@@ -447,6 +451,7 @@ export async function buildPublicHomePayload(env: Env): Promise<PublicHomePayloa
     health[h] += 1;
     return {
       kind: "swas",
+      provider: s.provider,
       name: s.label || "轻量节点",
       region_id: s.region_id,
       status: s.instance_status || "Unknown",
@@ -456,7 +461,8 @@ export async function buildPublicHomePayload(env: Env): Promise<PublicHomePayloa
       percent: pct,
       today_gb: 0,
       health: h,
-      spec_summary: buildSwasSpec(s) || "轻量应用服务器",
+      spec_summary:
+        buildSwasSpec(s) || (s.provider === "tencent" ? "腾讯云轻量" : "阿里云轻量"),
       bandwidth_mbps: s.bandwidth_mbps || 0,
     };
   });
@@ -467,6 +473,7 @@ export async function buildPublicHomePayload(env: Env): Promise<PublicHomePayloa
     .slice(0, 10)
     .map((n) => ({
       kind: n.kind,
+      ...(n.provider ? { provider: n.provider } : {}),
       name: n.name,
       region_id: n.region_id,
       used_gb: n.used_gb,
@@ -481,7 +488,7 @@ export async function buildPublicHomePayload(env: Env): Promise<PublicHomePayloa
     site_title: (config["public_site_title"] || "").trim() || "CDT 云节点流量遥测",
     site_subtitle:
       (config["public_site_subtitle"] || "").trim() ||
-      "阿里云 ECS · 轻量应用服务器实时在线状态与月度流量配额观察站",
+      "阿里云 ECS · 阿里云 / 腾讯云轻量应用服务器实时在线状态与月度流量配额观察站",
     timezone: tzName,
     updated_at: nowSec,
     updated_label: nowInfo.label,
@@ -610,6 +617,7 @@ export async function buildAdminDashboardPayload(
     return {
       id: s.id,
       kind: "swas",
+      provider: s.provider,
       label: s.label || s.instance_id,
       instance_id: s.instance_id,
       region_id: s.region_id,
@@ -624,23 +632,25 @@ export async function buildAdminDashboardPayload(
       projected_gb: round2(used + (used / daily.monthDaysElapsed) * daily.remainingDays),
       days_to_threshold: null,
       health: h,
-      spec_summary: buildSwasSpec(s) || "SWAS",
+      spec_summary:
+        buildSwasSpec(s) || (s.provider === "tencent" ? "腾讯云轻量" : "阿里云轻量"),
       expired_time: s.expired_time || "",
       bandwidth_mbps: s.bandwidth_mbps || 0,
     };
   });
 
-  // Aggregate monthly billing across unique (access_key_id, site) pairs to avoid double counting
-  // accounts that own multiple instances.
+  // Aggregate monthly billing across unique (provider, access_key_id, site) tuples to avoid
+  // double counting accounts that own multiple instances.
   const seenAccountCost = new Set<string>();
   const costByCurrency = new Map<string, { monthly_cost: number; balance: number }>();
   const accumulateBilling = (
+    provider: string,
     ak: string,
     site: string,
     b: ReturnType<typeof billing.summaryOf>,
   ) => {
     if (!b || b.stale) return;
-    const dedupKey = `${ak}:${site}:${b.currency || "CNY"}`;
+    const dedupKey = `${provider}:${ak}:${site}:${b.currency || "CNY"}`;
     if (seenAccountCost.has(dedupKey)) return;
     seenAccountCost.add(dedupKey);
     const cur = b.currency || "CNY";
@@ -650,11 +660,11 @@ export async function buildAdminDashboardPayload(
     costByCurrency.set(cur, entry);
   };
   for (const s of scopedServers) {
-    accumulateBilling(s.access_key_id, s.site, billing.summaryOf(s, config));
+    accumulateBilling("aliyun", s.access_key_id, s.site, billing.summaryOf(s, config));
   }
   if (serverId === 0) {
     for (const s of swasList) {
-      accumulateBilling(s.access_key_id, s.site, billing.summaryOf(s, config));
+      accumulateBilling(s.provider, s.access_key_id, s.site, billing.summaryOf(s, config));
     }
   }
   const costs = Array.from(costByCurrency.entries()).map(([currency, v]) => ({
@@ -670,6 +680,7 @@ export async function buildAdminDashboardPayload(
     .map((n) => ({
       id: n.id,
       kind: n.kind,
+      ...(n.provider ? { provider: n.provider } : {}),
       name: n.label,
       region_id: n.region_id,
       used_gb: n.used_gb,

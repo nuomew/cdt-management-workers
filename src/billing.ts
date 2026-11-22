@@ -21,6 +21,7 @@ import {
   getInstanceBill,
   type AliyunAccount,
 } from "./aliyun";
+import { getAccountBalance as getTencentAccountBalance } from "./tencent_lighthouse";
 import {
   addEvent,
   getServer,
@@ -242,6 +243,25 @@ export async function refreshSwasServer(
   let currency = "";
   let detectedSite = "";
   const errors: string[] = [];
+
+  if (server.provider === "tencent") {
+    try {
+      const wallet = await getTencentAccountBalance(env, account);
+      currency = wallet.currency;
+      balance = wallet.amount;
+    } catch (exc) {
+      errors.push(exc instanceof Error ? exc.message : String(exc));
+    }
+    const errorText = errors.join("；");
+    await updateSwasBilling(env, swasId, {
+      monthlyCost: null,
+      balance,
+      currency,
+      cycle: balance !== null ? cycle : "",
+      error: errorText,
+    });
+    return { monthly_cost: null, balance, currency, cycle, error: errorText };
+  }
 
   try {
     const bill = await getInstanceBill(env, account, cycle);

@@ -25,7 +25,7 @@ import {
 } from 'lucide-react'
 import { regionLabel } from '../regions'
 import { clockText } from '../time'
-import type { Billing, SwasServer } from '../types'
+import type { Billing, SwasProvider, SwasServer } from '../types'
 import { Badge, Empty, Meter, statusLabel, statusTone } from './ui'
 
 type Props = {
@@ -50,6 +50,11 @@ type Props = {
 }
 
 type ViewMode = 'card' | 'list'
+type ProviderFilter = 'all' | SwasProvider
+
+function providerName(provider?: SwasProvider): string {
+  return provider === 'tencent' ? '腾讯云' : '阿里云'
+}
 
 function daysUntilExpire(iso?: string): number | null {
   if (!iso) return null
@@ -97,11 +102,20 @@ export default function SwasView({
   onReorder,
 }: Props) {
   const [viewMode, setViewMode] = useState<ViewMode>('card')
+  const [providerFilter, setProviderFilter] = useState<ProviderFilter>('all')
   const [dragId, setDragId] = useState<number | null>(null)
   const [overId, setOverId] = useState<number | null>(null)
 
+  const aliyunCount = servers.filter((s) => (s.provider || 'aliyun') === 'aliyun').length
+  const tencentCount = servers.filter((s) => s.provider === 'tencent').length
+  const visibleServers =
+    providerFilter === 'all'
+      ? servers
+      : servers.filter((s) => (s.provider || 'aliyun') === providerFilter)
+  const canDrag = providerFilter === 'all'
+
   function handleDrop(targetId: number) {
-    if (dragId === null || dragId === targetId) {
+    if (!canDrag || dragId === null || dragId === targetId) {
       setDragId(null)
       setOverId(null)
       return
@@ -123,10 +137,35 @@ export default function SwasView({
         <div>
           <h1>轻量服务器</h1>
           <p>
-            独立管理阿里云轻量应用服务器（SWAS）：支持套餐流量包监控、一键发现导入、包年包月询价开通与续费、防火墙规则、改密改名、快照与自定义镜像（含跨账号/ECS 共享）、VNC / Workbench 终端与重置系统。
+            统一管理阿里云轻量应用服务器（SWAS）与腾讯云轻量应用服务器（Lighthouse）：支持套餐流量包监控、一键发现导入、包年包月询价开通与续费、防火墙规则、改密改名、快照与自定义镜像、VNC 远程终端与重装系统。
           </p>
         </div>
         <div className="page-actions">
+          {servers.length > 0 && (
+            <div className="view-toggle" role="group" aria-label="云厂商筛选">
+              <button
+                type="button"
+                className={`btn sm${providerFilter === 'all' ? ' primary' : ''}`}
+                onClick={() => setProviderFilter('all')}
+              >
+                全部 ({servers.length})
+              </button>
+              <button
+                type="button"
+                className={`btn sm${providerFilter === 'aliyun' ? ' primary' : ''}`}
+                onClick={() => setProviderFilter('aliyun')}
+              >
+                阿里云 ({aliyunCount})
+              </button>
+              <button
+                type="button"
+                className={`btn sm${providerFilter === 'tencent' ? ' primary' : ''}`}
+                onClick={() => setProviderFilter('tencent')}
+              >
+                腾讯云 ({tencentCount})
+              </button>
+            </div>
+          )}
           {servers.length > 1 && (
             <div className="view-toggle" role="group" aria-label="视图切换">
               <button
@@ -159,12 +198,18 @@ export default function SwasView({
       {servers.length === 0 ? (
         <div className="card">
           <Empty icon={<Cloud size={20} />} title="还没有轻量服务器">
-            可点击右上角「开通轻量」直接询价新购包年包月套餐，或点「添加轻量」复用已有阿里云账号一键拉取导入已有轻量实例。
+            可点击右上角「开通轻量」直接询价新购阿里云 / 腾讯云包年包月套餐，或点「添加轻量」一键拉取导入已有轻量实例。
+          </Empty>
+        </div>
+      ) : visibleServers.length === 0 ? (
+        <div className="card">
+          <Empty icon={<Cloud size={20} />} title={`暂无${providerName(providerFilter === 'all' ? 'aliyun' : providerFilter)}轻量服务器`}>
+            点击右上角「添加轻量」导入实例，或切换到「全部」查看其他云厂商的轻量服务器。
           </Empty>
         </div>
       ) : viewMode === 'list' ? (
         <SwasTable
-          servers={servers}
+          servers={visibleServers}
           busyId={busyId}
           billingId={billingId}
           onEdit={onEdit}
@@ -182,7 +227,7 @@ export default function SwasView({
         />
       ) : (
         <div className="server-grid">
-          {servers.map((server) => {
+          {visibleServers.map((server) => {
             const running = server.instance_status === 'Running'
             const busy = busyId === server.id
             const hasInstance = Boolean(server.instance_id && server.region_id)
@@ -190,6 +235,7 @@ export default function SwasView({
             const spec = specSummary(server)
             const totalGb = server.traffic_total_gb ?? 0
             const usedGb = server.traffic_used_gb
+            const prov: SwasProvider = server.provider === 'tencent' ? 'tencent' : 'aliyun'
 
             return (
               <div
@@ -197,13 +243,15 @@ export default function SwasView({
                   overId === server.id ? ' drag-over' : ''
                 }`}
                 key={server.id}
-                draggable
+                draggable={canDrag}
                 onDragStart={(event) => {
+                  if (!canDrag) return
                   setDragId(server.id)
                   event.dataTransfer.effectAllowed = 'move'
                   event.dataTransfer.setData('text/plain', String(server.id))
                 }}
                 onDragOver={(event) => {
+                  if (!canDrag) return
                   event.preventDefault()
                   event.dataTransfer.dropEffect = 'move'
                   if (overId !== server.id) setOverId(server.id)
@@ -221,7 +269,7 @@ export default function SwasView({
                 }}
               >
                 <div className="head">
-                  <GripVertical size={13} className="drag-handle" aria-hidden />
+                  {canDrag && <GripVertical size={13} className="drag-handle" aria-hidden />}
                   <Badge tone={statusTone(server.instance_status)} pulse={running}>
                     {statusLabel(server.instance_status)}
                   </Badge>
@@ -253,6 +301,7 @@ export default function SwasView({
                 </div>
 
                 <div className="meta-line">
+                  <span className={`provider-tag ${prov}`}>{providerName(prov)}</span>
                   <code style={{ fontSize: 11 }}>{server.instance_id || '未填实例 ID'}</code>
                   {spec && (
                     <span className="site-tag" style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
@@ -320,7 +369,7 @@ export default function SwasView({
                     type="button"
                     className="btn ghost sm"
                     disabled={!hasInstance}
-                    title="快照备份、自定义镜像制作及跨账号/ECS 镜像共享"
+                    title={prov === 'tencent' ? '快照备份/回滚、自定义镜像制作与跨账号共享' : '快照备份、自定义镜像制作及跨账号/ECS 镜像共享'}
                     onClick={() => onImages(server)}
                   >
                     <Layers size={12} /> 镜像
@@ -329,7 +378,7 @@ export default function SwasView({
                     type="button"
                     className="btn ghost sm"
                     disabled={!hasInstance}
-                    title="打开内置全屏 VNC 远程控制台 / Workbench"
+                    title={prov === 'tencent' ? '打开腾讯云轻量 VNC 远程终端' : '打开内置全屏 VNC 远程控制台 / Workbench'}
                     onClick={() => onVnc(server)}
                   >
                     <Monitor size={12} /> VNC
@@ -477,11 +526,13 @@ function SwasTable({
             const busy = busyId === server.id
             const hasInstance = Boolean(server.instance_id && server.region_id)
             const exp = expireShortText(server.expired_time)
+            const prov: SwasProvider = server.provider === 'tencent' ? 'tencent' : 'aliyun'
             return (
               <tr key={server.id}>
                 <td data-label="轻量服务器">
-                  <div className="server-table-title" title={server.label}>
-                    {server.label}
+                  <div className="server-table-title" title={server.label} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                    <span className={`provider-tag ${prov}`}>{providerName(prov)}</span>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{server.label}</span>
                   </div>
                   <code className="server-table-sub" title={server.instance_id}>
                     {server.instance_id || '未填实例 ID'}
