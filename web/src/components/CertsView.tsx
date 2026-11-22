@@ -1229,8 +1229,8 @@ export default function CertsView({ onToast, onChanged, onGoDnsAccounts }: Props
           ) : detailError ? (
             <div className="cloud-dns-error">{detailError}</div>
           ) : detailData ? (
-            <div className="form-stack">
-              <div className="cert-meta-grid">
+            <div className="form-stack cert-detail-stack">
+              <div className="cert-meta-grid cert-detail-meta">
                 <div>
                   <span className="cert-meta-k">证书 ID</span>
                   <span className="cert-meta-v mono">{detailData.certificate_id}</span>
@@ -1248,8 +1248,9 @@ export default function CertsView({ onToast, onChanged, onGoDnsAccounts }: Props
                 </div>
                 <div>
                   <span className="cert-meta-k">有效期</span>
-                  <span className="cert-meta-v mono">
-                    {detailData.cert_begin_time || '-'} ~ {detailData.cert_end_time || '-'}
+                  <span className="cert-meta-v mono cert-validity-range">
+                    <span>{detailData.cert_begin_time || '-'}</span>
+                    <span>~ {detailData.cert_end_time || '-'}</span>
                   </span>
                 </div>
               </div>
@@ -1292,10 +1293,13 @@ export default function CertsView({ onToast, onChanged, onGoDnsAccounts }: Props
               )}
 
               {detailData.certificate_public_key ? (
-                <>
-                  <div className="field">
+                <div className="cert-pem-stack">
+                  <div className="cert-pem-card">
                     <div className="cert-pem-head">
-                      <label>证书公钥链（fullchain.pem / .crt）</label>
+                      <div className="cert-pem-title">
+                        <strong>证书公钥链</strong>
+                        <code>fullchain.pem / .crt</code>
+                      </div>
                       <button
                         type="button"
                         className="btn ghost sm"
@@ -1305,15 +1309,19 @@ export default function CertsView({ onToast, onChanged, onGoDnsAccounts }: Props
                       </button>
                     </div>
                     <textarea
-                      className="input cert-pem-box"
+                      className="textarea cert-pem-box"
                       readOnly
-                      rows={6}
+                      spellCheck={false}
+                      rows={9}
                       value={detailData.certificate_public_key}
                     />
                   </div>
-                  <div className="field">
+                  <div className="cert-pem-card">
                     <div className="cert-pem-head">
-                      <label>证书私钥（private.key）</label>
+                      <div className="cert-pem-title">
+                        <strong>证书私钥</strong>
+                        <code>private.key</code>
+                      </div>
                       <button
                         type="button"
                         className="btn ghost sm"
@@ -1323,13 +1331,14 @@ export default function CertsView({ onToast, onChanged, onGoDnsAccounts }: Props
                       </button>
                     </div>
                     <textarea
-                      className="input cert-pem-box"
+                      className="textarea cert-pem-box"
                       readOnly
-                      rows={6}
+                      spellCheck={false}
+                      rows={9}
                       value={detailData.certificate_private_key}
                     />
                   </div>
-                </>
+                </div>
               ) : (
                 <div className="cloud-dns-empty-sm">
                   证书尚未签发，待验证通过后即可在此查看并复制 PEM 证书链与私钥，或下载官方 ZIP 压缩包。
