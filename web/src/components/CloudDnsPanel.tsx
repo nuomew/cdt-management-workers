@@ -31,7 +31,7 @@ import { Badge, Empty, Modal, Segmented, Switch } from './ui'
 
 const RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'NS', 'SRV', 'CAA'] as const
 const DNSPOD_LINES = ['默认', '电信', '联通', '移动', '教育网', '境外', '搜索引擎'] as const
-const RECORDS_PAGE_SIZE = 20
+const RECORDS_PAGE_SIZE = 10
 
 type ToastFn = (message: string, tone?: 'success' | 'error' | 'info') => void
 
