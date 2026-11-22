@@ -164,7 +164,7 @@ export default function DNSView({
           className={subTab === 'cloud' ? 'on' : ''}
           onClick={() => setSubTab('cloud')}
         >
-          云解析管理（腾讯云 / Cloudflare）
+          云解析管理
         </button>
         <button
           type="button"
