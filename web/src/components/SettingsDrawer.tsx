@@ -12,7 +12,6 @@ import {
   SlidersHorizontal,
   TriangleAlert,
   UserRound,
-  X,
 } from 'lucide-react'
 import { SLOW_TIMEOUT_MS, fetchLatestRelease, post } from '../api'
 import type { Settings } from '../types'
@@ -20,7 +19,6 @@ import { Segmented, Switch } from './ui'
 
 type Props = {
   settings: Settings
-  onClose: () => void
   onSaved: (message: string) => void
 }
 
@@ -36,26 +34,45 @@ const TIMEZONES = [
   'UTC',
 ]
 
-export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
+function normalizeSettingsDraft(source: Settings): Settings {
+  const draft = structuredClone(source)
+  // 老版本的响应里只有单条 record，补成数组，后面全按数组处理
+  if (!Array.isArray(draft.ddns.records)) draft.ddns.records = []
+  if (draft.ddns.records.length === 0 && draft.ddns.record) {
+    draft.ddns.records = [draft.ddns.record]
+  }
+  // 1.2.6 及以前没有这个字段，补 0 让输入框保持受控
+  if (!draft.reconcile_offset) draft.reconcile_offset = '0'
+  return draft
+}
+
+export default function SettingsDrawer({ settings, onSaved }: Props) {
   const [tab, setTab] = useState<Tab>('general')
   const [notifyTab, setNotifyTab] = useState<NotifyTab>('channel')
-  const [form, setForm] = useState(() => {
-    const draft = structuredClone(settings)
-    // 老版本的响应里只有单条 record，补成数组，后面全按数组处理
-    if (!Array.isArray(draft.ddns.records)) draft.ddns.records = []
-    if (draft.ddns.records.length === 0 && draft.ddns.record) {
-      draft.ddns.records = [draft.ddns.record]
-    }
-    // 1.2.6 及以前没有这个字段，补 0 让输入框保持受控
-    if (!draft.reconcile_offset) draft.reconcile_offset = '0'
-    return draft
-  })
+  const [form, setForm] = useState(() => normalizeSettingsDraft(settings))
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [testing, setTesting] = useState('')
   const [testResult, setTestResult] = useState('')
   const [newUsername, setNewUsername] = useState(settings.admin_username ?? '')
   const [newPassword, setNewPassword] = useState('')
+
+  // Keep read-only status metadata synced when background polling refreshes `settings`.
+  useEffect(() => {
+    setForm((current) => {
+      const draft = structuredClone(current)
+      draft.ddns.cf_token_configured = settings.ddns.cf_token_configured
+      draft.ddns.cf_key_configured = settings.ddns.cf_key_configured
+      draft.ddns.last_status = settings.ddns.last_status
+      draft.ddns.last_ip = settings.ddns.last_ip
+      draft.telegram.token_configured = settings.telegram.token_configured
+      draft.email.password_configured = settings.email.password_configured
+      draft.version = settings.version
+      draft.repo = settings.repo
+      draft.upstream_repo = settings.upstream_repo
+      return draft
+    })
+  }, [settings])
 
   function patch(updater: (draft: Settings) => void) {
     setForm((current) => {
@@ -125,6 +142,14 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
         new_username: newUsername || undefined,
         new_password: newPassword || undefined,
       })
+      // Clear transient secret inputs after persisting since the page stays mounted.
+      setNewPassword('')
+      patch((draft) => {
+        delete (draft.ddns as unknown as { cf_token?: string }).cf_token
+        delete (draft.ddns as unknown as { cf_key?: string }).cf_key
+        delete (draft.telegram as unknown as { token?: string }).token
+        delete (draft.email as unknown as { password?: string }).password
+      })
       onSaved('设置已保存')
     } catch (err) {
       setError(err instanceof Error ? err.message : '保存失败')
@@ -167,32 +192,37 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
 
   return (
     <>
-      <div className="overlay" style={{ zIndex: 90 }} onMouseDown={onClose} />
-      <aside className="drawer" role="dialog" aria-modal="true">
-        <div className="modal-head">
-          <SlidersHorizontal size={16} style={{ color: 'var(--green)' }} />
-          <h3>设置</h3>
-          <button className="btn ghost icon sm close" onClick={onClose} aria-label="关闭">
-            <X size={16} />
-          </button>
+      <div className="page-head">
+        <div>
+          <h1>设置</h1>
         </div>
+        {tab !== 'about' && (
+          <div className="page-actions">
+            <button type="button" className="btn primary" onClick={save} disabled={busy}>
+              {busy ? <LoaderCircle size={14} className="spin" /> : <Save size={14} />}
+              保存
+            </button>
+          </div>
+        )}
+      </div>
 
-        <div className="tabs">
-          <button className={tab === 'general' ? 'on' : ''} onClick={() => setTab('general')}>
-            常规
-          </button>
-          <button className={tab === 'ddns' ? 'on' : ''} onClick={() => setTab('ddns')}>
-            DDNS
-          </button>
-          <button className={tab === 'notify' ? 'on' : ''} onClick={() => setTab('notify')}>
-            通知
-          </button>
-          <button className={tab === 'about' ? 'on' : ''} onClick={() => setTab('about')}>
-            关于
-          </button>
-        </div>
+      <div className="tabs page-tabs">
+        <button type="button" className={tab === 'general' ? 'on' : ''} onClick={() => setTab('general')}>
+          常规
+        </button>
+        <button type="button" className={tab === 'ddns' ? 'on' : ''} onClick={() => setTab('ddns')}>
+          DDNS
+        </button>
+        <button type="button" className={tab === 'notify' ? 'on' : ''} onClick={() => setTab('notify')}>
+          通知
+        </button>
+        <button type="button" className={tab === 'about' ? 'on' : ''} onClick={() => setTab('about')}>
+          关于
+        </button>
+      </div>
 
-        <div className="modal-body" style={{ flex: 1 }}>
+      <div className="card settings-page-card">
+        <div className="settings-page-body">
           {tab === 'general' && (
             <>
               <div className="section-head">
@@ -888,23 +918,20 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
         </div>
 
         {tab !== 'about' && (
-          <div className="modal-foot">
+          <div className="settings-page-foot">
             <span className="foot-note">
               {newUsername !== (settings.admin_username ?? '') || newPassword
                 ? '账号有改动，保存后生效'
                 : '修改会即时生效'}
             </span>
             <span className="spacer" />
-            <button className="btn" onClick={onClose}>
-              取消
-            </button>
-            <button className="btn primary" onClick={save} disabled={busy}>
+            <button type="button" className="btn primary" onClick={save} disabled={busy}>
               {busy ? <LoaderCircle size={14} className="spin" /> : <Save size={14} />}
               保存
             </button>
           </div>
         )}
-      </aside>
+      </div>
     </>
   )
 }

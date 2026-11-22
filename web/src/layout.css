@@ -547,6 +547,10 @@ button.nav-parent:hover svg,
     padding: 7px 8px;
   }
 
+  .sidebar-foot .nav-item.on::before {
+    display: none;
+  }
+
   .sidebar-foot .nav-text,
   .sidebar-foot .meta {
     display: none;

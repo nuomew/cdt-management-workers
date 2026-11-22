@@ -2565,29 +2565,28 @@ input[type='number']::-webkit-inner-spin-button {
   color: var(--muted-soft);
 }
 
-.drawer {
-  position: fixed;
-  top: 0;
-  right: 0;
-  z-index: 95;
-  /* 抽屉底部就是「取消 / 保存」。iOS Safari 的 100vh 按地址栏收起时算，
-     比可视区高 60–100px，只写 100vh 会让保存按钮落在屏幕外点不到。 */
-  height: 100vh;
-  height: 100dvh;
-  width: min(540px, 100vw);
-  display: flex;
-  flex-direction: column;
-  border-left: 1px solid var(--line-strong);
-  background: var(--panel-solid);
-  box-shadow: var(--shadow-pop);
-  animation: drawer-in 280ms var(--ease);
+.settings-page-card {
+  overflow: hidden;
+  padding: 0;
 }
 
-@keyframes drawer-in {
-  from {
-    transform: translateX(24px);
-    opacity: 0.6;
-  }
+.settings-page-body {
+  padding: 20px 22px;
+}
+
+.settings-page-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 13px 22px;
+  border-top: 1px solid var(--line);
+  background: var(--panel-soft);
+}
+
+.settings-page-foot .foot-note {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--muted-soft);
 }
 
 .tabs {

@@ -63,7 +63,7 @@ import { ownerLabel } from './owners'
 import { syncClock } from './time'
 
 type Phase = 'loading' | 'public' | 'setup' | 'login' | 'ready' | 'fatal'
-type View = 'telemetry' | 'keepalive' | 'shift' | 'servers' | 'swas' | 'dns' | 'certs'
+type View = 'telemetry' | 'keepalive' | 'shift' | 'servers' | 'swas' | 'dns' | 'certs' | 'settings'
 type Toast = { id: number; tone: 'success' | 'error' | 'info'; message: string }
 
 function isAdminPath(pathname: string = window.location.pathname): boolean {
@@ -183,7 +183,6 @@ export default function App() {
     open: false,
     group: null,
   })
-  const [settingsOpen, setSettingsOpen] = useState(false)
   const [keepalivePicker, setKeepalivePicker] = useState(false)
   // 单机保活设置页：新建时带 server，编辑时带 item
   const [keepaliveDialog, setKeepaliveDialog] = useState<{
@@ -952,7 +951,11 @@ export default function App() {
               <span className="nav-text">公开首页</span>
             </button>
           )}
-          <button className="nav-item" onClick={() => setSettingsOpen(true)}>
+          <button
+            className={`nav-item${view === 'settings' ? ' on' : ''}`}
+            aria-current={view === 'settings' ? 'page' : undefined}
+            onClick={() => setView('settings')}
+          >
             <SettingsIcon size={15} />
             <span className="nav-text">设置</span>
           </button>
@@ -1071,7 +1074,7 @@ export default function App() {
             onAddRecord={addDnsRecord}
             onRemoveRecord={removeDnsRecord}
             onReorder={reorderDns}
-            onOpenSettings={() => setSettingsOpen(true)}
+            onOpenSettings={() => setView('settings')}
             onToast={toast}
             onCloudChanged={() => void loadAll()}
           />
@@ -1082,6 +1085,13 @@ export default function App() {
             onToast={toast}
             onChanged={() => void loadAll()}
             onGoDnsAccounts={() => setView('dns')}
+          />
+        )}
+
+        {view === 'settings' && (
+          <SettingsDrawer
+            settings={settings}
+            onSaved={(message) => void refreshAfterSave(message)}
           />
         )}
 
@@ -1364,17 +1374,6 @@ export default function App() {
             setKeepaliveDialog(null)
             void loadAll()
             toast(message, 'success')
-          }}
-        />
-      )}
-
-      {settingsOpen && (
-        <SettingsDrawer
-          settings={settings}
-          onClose={() => setSettingsOpen(false)}
-          onSaved={(message) => {
-            setSettingsOpen(false)
-            void refreshAfterSave(message)
           }}
         />
       )}
