@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Clock,
   Copy,
   Download,
@@ -26,6 +28,8 @@ import type {
 import { timeAgo } from '../time'
 import ConfirmDialog from './ConfirmDialog'
 import { Badge, Empty, Modal, Segmented, Switch, type Tone } from './ui'
+
+const CERTS_PAGE_SIZE = 5
 
 type ToastFn = (message: string, tone?: 'success' | 'error' | 'info') => void
 
@@ -147,6 +151,8 @@ export default function CertsView({ onToast, onChanged, onGoDnsAccounts }: Props
     void loadCerts()
   }, [loadCerts])
 
+  const [page, setPage] = useState(1)
+
   const stats = useMemo(() => {
     let issued = 0
     let pending = 0
@@ -162,6 +168,27 @@ export default function CertsView({ onToast, onChanged, onGoDnsAccounts }: Props
     }
     return { total: certs.length, issued, pending, expiring }
   }, [certs])
+
+  const totalPages = Math.max(1, Math.ceil(certs.length / CERTS_PAGE_SIZE))
+  const safePage = Math.min(page, totalPages)
+  const pagedCerts = useMemo(() => {
+    const start = (safePage - 1) * CERTS_PAGE_SIZE
+    return certs.slice(start, start + CERTS_PAGE_SIZE)
+  }, [certs, safePage])
+
+  const pageTokens = useMemo<(number | 'ellipsis')[]>(() => {
+    if (totalPages <= 7) {
+      return Array.from({ length: totalPages }, (_, i) => i + 1)
+    }
+    const items: (number | 'ellipsis')[] = [1]
+    const left = Math.max(2, safePage - 1)
+    const right = Math.min(totalPages - 1, safePage + 1)
+    if (left > 2) items.push('ellipsis')
+    for (let p = left; p <= right; p += 1) items.push(p)
+    if (right < totalPages - 1) items.push('ellipsis')
+    items.push(totalPages)
+    return items
+  }, [safePage, totalPages])
 
   function openApplyModal() {
     const defaultTcAcct = tencentAccounts[0]?.id ?? 0
@@ -236,6 +263,7 @@ export default function CertsView({ onToast, onChanged, onGoDnsAccounts }: Props
               : '已提交申请，后台 Cron 将自动跟进验证'
       onToast(`${res.item.domain}：${stepNote}`, 'success')
       setApplyModal(null)
+      setPage(1)
       await loadCerts()
       onChanged?.()
     } catch (err) {
@@ -259,7 +287,12 @@ export default function CertsView({ onToast, onChanged, onGoDnsAccounts }: Props
     }
     setSyncing(true)
     try {
-      const res = await post<{ imported: number; updated: number; totalRemote: number }>(
+      const res = await post<{
+        imported: number
+        updated: number
+        cleaned?: number
+        totalRemote: number
+      }>(
         '/api/v1/certs/sync',
         {
           tencent_account_id: syncTencentAccountId,
@@ -269,11 +302,13 @@ export default function CertsView({ onToast, onChanged, onGoDnsAccounts }: Props
         },
         SLOW_TIMEOUT_MS,
       )
+      const cleanedNote = res.cleaned ? `，自动清理旧/过期 ${res.cleaned} 张` : ''
       onToast(
-        `同步完成：云端 ${res.totalRemote} 张，新导入 ${res.imported} 张，更新 ${res.updated} 张`,
+        `同步完成：云端 ${res.totalRemote} 张，新导入 ${res.imported} 张，更新 ${res.updated} 张${cleanedNote}`,
         'success',
       )
       setSyncModalOpen(false)
+      setPage(1)
       await loadCerts()
       onChanged?.()
     } catch (err) {
@@ -292,11 +327,13 @@ export default function CertsView({ onToast, onChanged, onGoDnsAccounts }: Props
           issued: number
           renewalsStarted: number
           dnsWritten: number
+          cleaned?: number
           errors: string[]
         }
       }>('/api/v1/certs/reconcile', {}, SLOW_TIMEOUT_MS)
       const s = res.summary
-      const msg = `巡检完成：检查 ${s.checked} 项，自动续签 ${s.renewalsStarted} 张，写入验证解析 ${s.dnsWritten} 条，新签发 ${s.issued} 张`
+      const cleanedNote = s.cleaned ? `，自动清理旧/过期 ${s.cleaned} 张` : ''
+      const msg = `巡检完成：检查 ${s.checked} 项，自动续签 ${s.renewalsStarted} 张，写入验证解析 ${s.dnsWritten} 条，新签发 ${s.issued} 张${cleanedNote}`
       onToast(
         s.errors.length > 0 ? `${msg}（异常 ${s.errors.length} 项）` : msg,
         s.errors.length > 0 ? 'info' : 'success',
@@ -494,209 +531,257 @@ export default function CertsView({ onToast, onChanged, onGoDnsAccounts }: Props
           </Empty>
         </div>
       ) : (
-        <div className="certs-list">
-          {certs.map((cert) => {
-            const badge = certStatusBadge(cert)
-            const isBusy = busyId === cert.id
-            return (
-              <div key={cert.id} className="card cert-card">
-                <div className="cert-card-head">
-                  <div className="cert-domain-wrap">
-                    <ShieldCheck size={16} style={{ color: 'var(--accent)' }} />
-                    <span className="cert-domain">{cert.domain}</span>
-                    <Badge tone={badge.tone} pulse={badge.pulse}>
-                      {badge.text}
-                    </Badge>
-                    <Badge tone="gray" dot={false}>
-                      {cert.encrypt_algo}
-                    </Badge>
-                    {cert.remaining_days !== null && (
-                      <Badge
-                        tone={
-                          cert.remaining_days <= 0
-                            ? 'red'
-                            : cert.remaining_days <= cert.renew_before_days
-                              ? 'amber'
-                              : 'green'
-                        }
-                        dot={false}
-                      >
-                        <Clock size={11} style={{ marginRight: 3 }} />
-                        {cert.remaining_days <= 0
-                          ? `已过期 ${Math.abs(cert.remaining_days)} 天`
-                          : `剩余 ${cert.remaining_days} 天`}
+        <>
+          <div className="certs-list">
+            {pagedCerts.map((cert) => {
+              const badge = certStatusBadge(cert)
+              const isBusy = busyId === cert.id
+              return (
+                <div key={cert.id} className="card cert-card">
+                  <div className="cert-card-head">
+                    <div className="cert-domain-wrap">
+                      <ShieldCheck size={16} style={{ color: 'var(--accent)' }} />
+                      <span className="cert-domain">{cert.domain}</span>
+                      <Badge tone={badge.tone} pulse={badge.pulse}>
+                        {badge.text}
                       </Badge>
-                    )}
-                  </div>
-
-                  <div className="cert-auto-toggle">
-                    <span className="muted-xs">到期前 {cert.renew_before_days} 天自动续签</span>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={cert.auto_renew}
-                      aria-label={`自动续签 ${cert.domain}`}
-                      className={`switch${cert.auto_renew ? ' on' : ''}`}
-                      disabled={isBusy}
-                      onClick={() => void toggleAutoRenew(cert, !cert.auto_renew)}
-                    />
-                  </div>
-                </div>
-
-                <div className="cert-meta-grid">
-                  <div>
-                    <span className="cert-meta-k">腾讯云账号</span>
-                    <span className="cert-meta-v">{cert.tencent_account_label}</span>
-                  </div>
-                  <div>
-                    <span className="cert-meta-k">自动验证方式</span>
-                    <span className="cert-meta-v">{cert.dns_account_label}</span>
-                  </div>
-                  <div>
-                    <span className="cert-meta-k">证书 ID</span>
-                    <span className="cert-meta-v mono">
-                      {cert.cert_id || '-'}
-                      {cert.pending_cert_id && (
-                        <span className="cert-pending-id"> → 新单 {cert.pending_cert_id}</span>
+                      <Badge tone="gray" dot={false}>
+                        {cert.encrypt_algo}
+                      </Badge>
+                      {cert.remaining_days !== null && (
+                        <Badge
+                          tone={
+                            cert.remaining_days <= 0
+                              ? 'red'
+                              : cert.remaining_days <= cert.renew_before_days
+                                ? 'amber'
+                                : 'green'
+                          }
+                          dot={false}
+                        >
+                          <Clock size={11} style={{ marginRight: 3 }} />
+                          {cert.remaining_days <= 0
+                            ? `已过期 ${Math.abs(cert.remaining_days)} 天`
+                            : `剩余 ${cert.remaining_days} 天`}
+                        </Badge>
                       )}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="cert-meta-k">有效期</span>
-                    <span className="cert-meta-v mono">
-                      {cert.cert_begin_time && cert.cert_end_time
-                        ? `${cert.cert_begin_time.slice(0, 10)} ~ ${cert.cert_end_time.slice(0, 10)}`
-                        : cert.status_name || '等待签发'}
-                    </span>
-                  </div>
-                </div>
+                    </div>
 
-                {/* 待验证 / 续签中时展示当前 DNS 解析验证详情 */}
-                {(cert.status === 'pending_dns' ||
-                  cert.status === 'verifying' ||
-                  cert.has_pending_renewal) &&
-                  cert.dv_auth_value && (
-                    <div className="cert-dv-box">
-                      <div className="cert-dv-head">
-                        <strong>当前 DNS 验证记录</strong>
-                        {cert.dns_record_written ? (
-                          <Badge tone="green" dot={false}>
-                            <CheckCircle2 size={11} style={{ marginRight: 3 }} /> 已自动写入云解析
-                          </Badge>
-                        ) : cert.dns_verify_mode === 'tencent_auto' ? (
-                          <Badge tone="blue" dot={false}>
-                            腾讯云 DNS_AUTO 自动托管
-                          </Badge>
-                        ) : (
-                          <Badge tone="amber" dot={false}>
-                            待写入验证解析
-                          </Badge>
+                    <div className="cert-auto-toggle">
+                      <span className="muted-xs">到期前 {cert.renew_before_days} 天自动续签</span>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={cert.auto_renew}
+                        aria-label={`自动续签 ${cert.domain}`}
+                        className={`switch${cert.auto_renew ? ' on' : ''}`}
+                        disabled={isBusy}
+                        onClick={() => void toggleAutoRenew(cert, !cert.auto_renew)}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="cert-meta-grid">
+                    <div>
+                      <span className="cert-meta-k">腾讯云账号</span>
+                      <span className="cert-meta-v">{cert.tencent_account_label}</span>
+                    </div>
+                    <div>
+                      <span className="cert-meta-k">自动验证方式</span>
+                      <span className="cert-meta-v">{cert.dns_account_label}</span>
+                    </div>
+                    <div>
+                      <span className="cert-meta-k">证书 ID</span>
+                      <span className="cert-meta-v mono">
+                        {cert.cert_id || '-'}
+                        {cert.pending_cert_id && (
+                          <span className="cert-pending-id"> → 新单 {cert.pending_cert_id}</span>
                         )}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="cert-meta-k">有效期</span>
+                      <span className="cert-meta-v mono">
+                        {cert.cert_begin_time && cert.cert_end_time
+                          ? `${cert.cert_begin_time.slice(0, 10)} ~ ${cert.cert_end_time.slice(0, 10)}`
+                          : cert.status_name || '等待签发'}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* 待验证 / 续签中时展示当前 DNS 解析验证详情 */}
+                  {(cert.status === 'pending_dns' ||
+                    cert.status === 'verifying' ||
+                    cert.has_pending_renewal) &&
+                    cert.dv_auth_value && (
+                      <div className="cert-dv-box">
+                        <div className="cert-dv-head">
+                          <strong>当前 DNS 验证记录</strong>
+                          {cert.dns_record_written ? (
+                            <Badge tone="green" dot={false}>
+                              <CheckCircle2 size={11} style={{ marginRight: 3 }} /> 已自动写入云解析
+                            </Badge>
+                          ) : cert.dns_verify_mode === 'tencent_auto' ? (
+                            <Badge tone="blue" dot={false}>
+                              腾讯云 DNS_AUTO 自动托管
+                            </Badge>
+                          ) : (
+                            <Badge tone="amber" dot={false}>
+                              待写入验证解析
+                            </Badge>
+                          )}
+                        </div>
+                        <div className="cert-dv-fields">
+                          <span>
+                            类型：<code>{cert.dv_auth_type || 'TXT'}</code>
+                          </span>
+                          <span>
+                            主机记录：<code>{cert.dv_auth_sub_domain}</code>
+                          </span>
+                          <span className="cert-dv-val">
+                            记录值：<code>{cert.dv_auth_value}</code>
+                          </span>
+                        </div>
                       </div>
-                      <div className="cert-dv-fields">
-                        <span>
-                          类型：<code>{cert.dv_auth_type || 'TXT'}</code>
-                        </span>
-                        <span>
-                          主机记录：<code>{cert.dv_auth_sub_domain}</code>
-                        </span>
-                        <span className="cert-dv-val">
-                          记录值：<code>{cert.dv_auth_value}</code>
-                        </span>
-                      </div>
+                    )}
+
+                  {cert.last_error && (
+                    <div className="cert-error">
+                      <AlertTriangle size={13} />
+                      <span>{cert.last_error}</span>
                     </div>
                   )}
 
-                {cert.last_error && (
-                  <div className="cert-error">
-                    <AlertTriangle size={13} />
-                    <span>{cert.last_error}</span>
-                  </div>
-                )}
+                  <div className="cert-card-foot">
+                    <span className="muted-xs">
+                      {cert.last_checked_at
+                        ? `上次检查：${timeAgo(cert.last_checked_at)}`
+                        : '尚未巡检'}
+                      {cert.remark ? ` · ${cert.remark}` : ''}
+                    </span>
 
-                <div className="cert-card-foot">
-                  <span className="muted-xs">
-                    {cert.last_checked_at
-                      ? `上次检查：${timeAgo(cert.last_checked_at)}`
-                      : '尚未巡检'}
-                    {cert.remark ? ` · ${cert.remark}` : ''}
-                  </span>
-
-                  <div className="cert-card-actions">
-                    <button
-                      type="button"
-                      className="btn ghost sm"
-                      disabled={isBusy}
-                      onClick={() => void openDetail(cert)}
-                    >
-                      <FileKey2 size={13} /> 详情 / PEM
-                    </button>
-                    {cert.status === 'issued' && cert.cert_id && (
-                      <a
+                    <div className="cert-card-actions">
+                      <button
+                        type="button"
                         className="btn ghost sm"
-                        href={`/api/v1/certs/${cert.id}/download`}
-                        download
+                        disabled={isBusy}
+                        onClick={() => void openDetail(cert)}
                       >
-                        <Download size={13} /> 下载 ZIP
-                      </a>
-                    )}
-                    <button
-                      type="button"
-                      className="btn ghost sm"
-                      disabled={isBusy}
-                      onClick={() => void verifyCert(cert)}
-                    >
-                      {isBusy ? (
-                        <LoaderCircle size={13} className="spin" />
-                      ) : (
-                        <RefreshCw size={13} />
-                      )}{' '}
-                      验证 / 刷新
-                    </button>
-                    <button
-                      type="button"
-                      className="btn ghost sm"
-                      disabled={isBusy}
-                      onClick={() => void renewCertNow(cert)}
-                    >
-                      <RotateCw size={13} /> 立即续签
-                    </button>
-                    <button
-                      type="button"
-                      className="btn ghost icon sm"
-                      title="续签与验证配置"
-                      onClick={() =>
-                        setEditModal({
-                          id: cert.id,
-                          domain: cert.domain,
-                          dns_verify_mode: cert.dns_verify_mode,
-                          dns_account_id: cert.dns_account_id || dnsAccounts[0]?.id || 0,
-                          auto_renew: cert.auto_renew,
-                          renew_before_days: cert.renew_before_days,
-                          clean_dns_after_issue: cert.clean_dns_after_issue,
-                          remark: cert.remark,
-                        })
-                      }
-                    >
-                      <Settings2 size={13} />
-                    </button>
-                    <button
-                      type="button"
-                      className="btn ghost icon sm"
-                      title="移除托管"
-                      onClick={() => {
-                        setDeleteRemote(false)
-                        setDeleteTarget(cert)
-                      }}
-                    >
-                      <Trash2 size={13} />
-                    </button>
+                        <FileKey2 size={13} /> 详情 / PEM
+                      </button>
+                      {cert.status === 'issued' && cert.cert_id && (
+                        <a
+                          className="btn ghost sm"
+                          href={`/api/v1/certs/${cert.id}/download`}
+                          download
+                        >
+                          <Download size={13} /> 下载 ZIP
+                        </a>
+                      )}
+                      <button
+                        type="button"
+                        className="btn ghost sm"
+                        disabled={isBusy}
+                        onClick={() => void verifyCert(cert)}
+                      >
+                        {isBusy ? (
+                          <LoaderCircle size={13} className="spin" />
+                        ) : (
+                          <RefreshCw size={13} />
+                        )}{' '}
+                        验证 / 刷新
+                      </button>
+                      <button
+                        type="button"
+                        className="btn ghost sm"
+                        disabled={isBusy}
+                        onClick={() => void renewCertNow(cert)}
+                      >
+                        <RotateCw size={13} /> 立即续签
+                      </button>
+                      <button
+                        type="button"
+                        className="btn ghost icon sm"
+                        title="续签与验证配置"
+                        onClick={() =>
+                          setEditModal({
+                            id: cert.id,
+                            domain: cert.domain,
+                            dns_verify_mode: cert.dns_verify_mode,
+                            dns_account_id: cert.dns_account_id || dnsAccounts[0]?.id || 0,
+                            auto_renew: cert.auto_renew,
+                            renew_before_days: cert.renew_before_days,
+                            clean_dns_after_issue: cert.clean_dns_after_issue,
+                            remark: cert.remark,
+                          })
+                        }
+                      >
+                        <Settings2 size={13} />
+                      </button>
+                      <button
+                        type="button"
+                        className="btn ghost icon sm"
+                        title="移除托管"
+                        onClick={() => {
+                          setDeleteRemote(false)
+                          setDeleteTarget(cert)
+                        }}
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    </div>
                   </div>
                 </div>
+              )
+            })}
+          </div>
+
+          {totalPages > 1 && (
+            <div className="card certs-pager">
+              <div className="cloud-dns-pager" role="navigation" aria-label="证书分页">
+                <span className="cloud-dns-pager-info">
+                  共 {certs.length} 张 · 第 {(safePage - 1) * CERTS_PAGE_SIZE + 1}–
+                  {Math.min(safePage * CERTS_PAGE_SIZE, certs.length)} 张（{safePage} / {totalPages} 页）
+                </span>
+                <div className="cloud-dns-pager-controls">
+                  <button
+                    type="button"
+                    className="cloud-dns-page-btn"
+                    disabled={safePage <= 1}
+                    onClick={() => setPage(Math.max(1, safePage - 1))}
+                  >
+                    <ChevronLeft size={13} /> 上一页
+                  </button>
+                  {pageTokens.map((tok, idx) =>
+                    tok === 'ellipsis' ? (
+                      <span key={`e-${idx}`} className="cloud-dns-page-ellipsis">
+                        …
+                      </span>
+                    ) : (
+                      <button
+                        key={tok}
+                        type="button"
+                        className={`cloud-dns-page-btn${tok === safePage ? ' on' : ''}`}
+                        aria-current={tok === safePage ? 'page' : undefined}
+                        onClick={() => setPage(tok)}
+                      >
+                        {tok}
+                      </button>
+                    ),
+                  )}
+                  <button
+                    type="button"
+                    className="cloud-dns-page-btn"
+                    disabled={safePage >= totalPages}
+                    onClick={() => setPage(Math.min(totalPages, safePage + 1))}
+                  >
+                    下一页 <ChevronRight size={13} />
+                  </button>
+                </div>
               </div>
-            )
-          })}
-        </div>
+            </div>
+          )}
+        </>
       )}
 
       {/* 申请 443 免费证书弹窗 */}

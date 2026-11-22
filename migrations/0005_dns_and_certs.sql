@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS ssl_certificates (
   dns_zone_id           TEXT    NOT NULL DEFAULT '',
   cert_id               TEXT    NOT NULL DEFAULT '',
   pending_cert_id       TEXT    NOT NULL DEFAULT '',
+  replaced_cert_id      TEXT    NOT NULL DEFAULT '',
   encrypt_algo          TEXT    NOT NULL DEFAULT 'RSA',
   status                TEXT    NOT NULL DEFAULT 'pending_dns',
   tencent_status        INTEGER NOT NULL DEFAULT -1,

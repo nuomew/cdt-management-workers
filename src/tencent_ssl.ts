@@ -99,6 +99,7 @@ export interface ReconcileCertsSummary {
   issued: number;
   renewalsStarted: number;
   dnsWritten: number;
+  cleaned: number;
   errors: string[];
 }
 
@@ -769,6 +770,36 @@ export async function deleteTencentCertificate(
   await sslRpc(creds, "DeleteCertificate", { CertificateId: certificateId });
 }
 
+/**
+ * Best-effort delete of an obsolete or expired Tencent Cloud SSL certificate.
+ * Treats "already missing" as deleted; preserves non-fatal upstream blocks
+ * (e.g. `CannotBeDeletedIssued` while an old cert still has days left) so the
+ * Cron scheduler can retry automatically once the certificate expires.
+ */
+async function tryDeleteRemoteCert(
+  env: Env,
+  creds: TencentCreds,
+  certificateId: string,
+): Promise<{ deleted: boolean; reason: string }> {
+  const id = certificateId.trim();
+  if (!id) return { deleted: true, reason: "" };
+  try {
+    await deleteTencentCertificate(env, creds, id);
+    return { deleted: true, reason: "" };
+  } catch (err) {
+    const code = (err as Error & { tcCode?: string }).tcCode ?? "";
+    const msg = err instanceof Error ? err.message : String(err);
+    if (
+      code === "FailedOperation.CertificateNotFound" ||
+      msg.includes("CertificateNotFound") ||
+      msg.includes("证书不存在")
+    ) {
+      return { deleted: true, reason: "already_gone" };
+    }
+    return { deleted: false, reason: msg };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Notification helper (uses existing configured channels: Telegram / Email / Webhook)
 // ---------------------------------------------------------------------------
@@ -991,6 +1022,7 @@ export async function refreshManagedCertificate(
   dnsAction: string;
   verifyTriggered: boolean;
   justIssued: boolean;
+  oldCertDeleted: boolean;
 }> {
   const cert = await repo.getSslCertificate(env, id, true);
   if (!cert) throw new Error("证书记录不存在");
@@ -1006,6 +1038,7 @@ export async function refreshManagedCertificate(
   let dnsAction = "";
   let verifyTriggered = false;
   let justIssued = false;
+  let oldCertDeleted = false;
   const checkedAt = nowSeconds();
 
   const patch: Partial<repo.SslCertificateCreateInput> = {
@@ -1043,7 +1076,13 @@ export async function refreshManagedCertificate(
         patch.status = isRenewalFlow ? cert.status : "pending_dns";
         await repo.updateSslCertificate(env, id, patch);
         const updated = (await repo.getSslCertificate(env, id, false))!;
-        return { certificate: updated, dnsAction: "failed", verifyTriggered: false, justIssued: false };
+        return {
+          certificate: updated,
+          dnsAction: "failed",
+          verifyTriggered: false,
+          justIssued: false,
+          oldCertDeleted: false,
+        };
       }
     }
 
@@ -1075,6 +1114,9 @@ export async function refreshManagedCertificate(
   // Now check whether the active cert has transitioned to Issued / Failed / Expired.
   if (detail.status === 1) {
     const wasAlreadyIssuedSameCert = !isRenewalFlow && cert.status === "issued";
+    const previousCertId =
+      isRenewalFlow && cert.cert_id && cert.cert_id !== activeCertId ? cert.cert_id : "";
+
     if (isRenewalFlow) {
       patch.cert_id = activeCertId;
       patch.pending_cert_id = "";
@@ -1101,11 +1143,26 @@ export async function refreshManagedCertificate(
       }
     }
 
+    // Automatically delete the superseded old certificate on Tencent Cloud.
+    let oldCleanupNote = "";
+    if (previousCertId) {
+      const delRes = await tryDeleteRemoteCert(env, creds, previousCertId);
+      if (delRes.deleted) {
+        oldCertDeleted = true;
+        await repo.updateSslCertificate(env, id, { replaced_cert_id: "" });
+        oldCleanupNote = `；已自动删除旧证书 ${previousCertId}`;
+      } else {
+        // Keep the old cert ID queued so Cron automatically retries deletion once Tencent allows it (e.g. after expiry).
+        await repo.updateSslCertificate(env, id, { replaced_cert_id: previousCertId });
+        oldCleanupNote = `；旧证书 ${previousCertId} 将在到期后由巡检自动删除`;
+      }
+    }
+
     if (!wasAlreadyIssuedSameCert) {
       justIssued = true;
       const actionTitle = isRenewalFlow ? "SSL 证书自动续签已签发" : "SSL 证书已签发";
       await repo.addEvent(env, "ssl", messages.ev(actionTitle, messages.objServer(cert.domain)), {
-        detail: `域名 ${cert.domain} 证书（ID: ${activeCertId}）已签发，有效期至 ${detail.certEndTime || "未知"}`,
+        detail: `域名 ${cert.domain} 证书（ID: ${activeCertId}）已签发，有效期至 ${detail.certEndTime || "未知"}${oldCleanupNote}`,
       });
       await notifyCertEvent(env, "ssl_issued", `✅ ${actionTitle}：${cert.domain}`, [
         `域名：${cert.domain}`,
@@ -1113,6 +1170,7 @@ export async function refreshManagedCertificate(
         `生效时间：${detail.certBeginTime || "-"}`,
         `到期时间：${detail.certEndTime || "-"}`,
         `下次自动续签：到期前 ${cert.renew_before_days} 天`,
+        ...(oldCleanupNote ? [`旧证清理：${oldCleanupNote.replace(/^；/, "")}`] : []),
       ]);
     }
   } else if (detail.status === 2 || detail.status === 7 || detail.status === 10) {
@@ -1152,7 +1210,7 @@ export async function refreshManagedCertificate(
   }
 
   const finalCert = (await repo.getSslCertificate(env, id, false))!;
-  return { certificate: finalCert, dnsAction, verifyTriggered, justIssued };
+  return { certificate: finalCert, dnsAction, verifyTriggered, justIssued, oldCertDeleted };
 }
 
 /**
@@ -1169,6 +1227,7 @@ export async function renewManagedCertificate(
   newCertId: string;
   dnsAction: string;
   verifyTriggered: boolean;
+  oldCertDeleted: boolean;
 }> {
   const cert = await repo.getSslCertificate(env, id, true);
   if (!cert) throw new Error("证书记录不存在");
@@ -1231,18 +1290,20 @@ export async function renewManagedCertificate(
     newCertId: certificateId,
     dnsAction: refreshed.dnsAction,
     verifyTriggered: refreshed.verifyTriggered,
+    oldCertDeleted: refreshed.oldCertDeleted,
   };
 }
 
 /**
  * Import existing certificates from a configured Tencent Cloud account into
- * local management so users can enable 7-day auto-renewal & downloads.
+ * local management, while automatically deleting expired or already-superseded
+ * old certificates on Tencent Cloud and locally.
  */
 export async function syncAccountCertificates(
   env: Env,
   tencentAccountId: number,
   opts?: { dnsVerifyMode?: SslVerifyMode; dnsAccountId?: number; autoRenew?: boolean },
-): Promise<{ imported: number; updated: number; totalRemote: number }> {
+): Promise<{ imported: number; updated: number; cleaned: number; totalRemote: number }> {
   const acct = await repo.getDnsAccount(env, tencentAccountId, true);
   if (!acct || acct.provider !== "tencent") {
     throw new Error("请选择有效的腾讯云账号");
@@ -1253,14 +1314,68 @@ export async function syncAccountCertificates(
     sourceLabel: acct.label,
   };
   const remoteList = await listTencentCertificates(env, creds, { limit: 100 });
+  const now = nowSeconds();
   let imported = 0;
   let updated = 0;
+  let cleaned = 0;
+
+  // Determine the latest active issued certificate per domain so older duplicates can be cleaned.
+  const latestValidByDomain = new Map<string, { certId: string; endTs: number }>();
+  for (const item of remoteList) {
+    if (!item.certificateId || !item.domain || item.domain.startsWith("*.")) continue;
+    const isValidIssued =
+      item.status === 1 && (item.certEndTs === 0 || item.certEndTs > now);
+    if (!isValidIssued) continue;
+    const cur = latestValidByDomain.get(item.domain);
+    if (!cur || item.certEndTs > cur.endTs) {
+      latestValidByDomain.set(item.domain, {
+        certId: item.certificateId,
+        endTs: item.certEndTs,
+      });
+    }
+  }
 
   for (const item of remoteList) {
     if (!item.certificateId || !item.domain) continue;
-    // Skip wildcard or non-DV or cancelled/revoked certs from auto-import noise unless already tracked.
+    if (item.domain.startsWith("*.")) continue;
+
     const existing = await repo.getSslCertificateByCertId(env, item.certificateId, false);
     const mappedStatus = mapTencentStatus(item.status, item.certEndTs);
+    const isExpired = mappedStatus === "expired";
+    const newer = latestValidByDomain.get(item.domain);
+    const isSuperseded =
+      Boolean(newer) &&
+      newer!.certId !== item.certificateId &&
+      (item.status === 1 || item.status === 3);
+
+    // Auto-delete expired certificates or old certificates already replaced by a newer issued one.
+    if (isExpired || isSuperseded) {
+      const keepLocalForPendingRenew = Boolean(existing?.pending_cert_id);
+      if (!keepLocalForPendingRenew) {
+        const delRes = await tryDeleteRemoteCert(env, creds, item.certificateId);
+        if (existing) {
+          await repo.deleteSslCertificate(env, existing.id);
+        }
+        if (delRes.deleted || existing) {
+          cleaned += 1;
+          await repo.addEvent(
+            env,
+            "ssl",
+            messages.ev(
+              isExpired ? "SSL 过期证书已自动删除" : "SSL 旧证书已自动删除",
+              messages.objServer(item.domain),
+            ),
+            {
+              detail: `证书 ${item.certificateId}（${
+                isExpired ? "已过期" : `已被新证书 ${newer?.certId} 替代`
+              }）${delRes.deleted ? "已从腾讯云和面板自动清理" : "已从面板清理"}`,
+            },
+          );
+        }
+      }
+      continue;
+    }
+
     if (existing) {
       await repo.updateSslCertificate(env, existing.id, {
         tencent_status: item.status,
@@ -1269,13 +1384,12 @@ export async function syncAccountCertificates(
         cert_begin_time: item.certBeginTime,
         cert_end_time: item.certEndTime,
         cert_end_ts: item.certEndTs,
-        last_checked_at: nowSeconds(),
+        last_checked_at: now,
       });
       updated += 1;
       continue;
     }
     if (item.status === 7 || item.status === 10 || item.status === 14) continue;
-    if (item.domain.startsWith("*.")) continue;
 
     const verifyMode: SslVerifyMode =
       opts?.dnsVerifyMode ??
@@ -1301,21 +1415,116 @@ export async function syncAccountCertificates(
       auto_renew: opts?.autoRenew !== false,
       renew_before_days: 7,
       clean_dns_after_issue: true,
-      last_checked_at: nowSeconds(),
+      last_checked_at: now,
     });
     imported += 1;
   }
 
-  return { imported, updated, totalRemote: remoteList.length };
+  return { imported, updated, cleaned, totalRemote: remoteList.length };
+}
+
+/**
+ * Cleanup pass for Cron / manual reconcile:
+ * 1. Retry deletion of any queued `replaced_cert_id` left over from a renewal.
+ * 2. Delete superseded duplicate rows when the same domain already has a newer valid issued cert.
+ * 3. Delete expired certificates (remote Tencent cert + local row) when auto-renew is off or
+ *    a newer valid certificate already covers the domain.
+ */
+async function cleanupObsoleteAndExpiredCertificates(
+  env: Env,
+  now: number,
+): Promise<{ cleaned: number; errors: string[] }> {
+  let cleaned = 0;
+  const errors: string[] = [];
+  const allCerts = await repo.listSslCertificates(env, true);
+
+  // 1. Retry any pending remote deletion of previously replaced old certs.
+  for (const cert of allCerts) {
+    if (!cert.replaced_cert_id) continue;
+    try {
+      const creds = await resolveTencentCredsForCert(env, cert);
+      const delRes = await tryDeleteRemoteCert(env, creds, cert.replaced_cert_id);
+      if (delRes.deleted) {
+        const oldId = cert.replaced_cert_id;
+        await repo.updateSslCertificate(env, cert.id, { replaced_cert_id: "" });
+        cleaned += 1;
+        await repo.addEvent(
+          env,
+          "ssl",
+          messages.ev("SSL 旧证书已自动删除", messages.objServer(cert.domain)),
+          { detail: `已从腾讯云自动清理续签替换后的旧证书 ${oldId}` },
+        );
+      }
+    } catch (err) {
+      errors.push(`${cert.domain} 清理旧证书失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // Build map of newest valid issued certificate per domain.
+  const bestValidByDomain = new Map<string, SslCertificateRecord>();
+  for (const cert of allCerts) {
+    const isValidIssued =
+      cert.status === "issued" && (cert.cert_end_ts === 0 || cert.cert_end_ts > now);
+    if (!isValidIssued) continue;
+    const prev = bestValidByDomain.get(cert.domain);
+    if (!prev || cert.cert_end_ts > prev.cert_end_ts || (cert.cert_end_ts === prev.cert_end_ts && cert.id > prev.id)) {
+      bestValidByDomain.set(cert.domain, cert);
+    }
+  }
+
+  // 2. Remove superseded old rows and expired rows (without breaking active renewals).
+  for (const cert of allCerts) {
+    if (cert.pending_cert_id) continue;
+
+    const best = bestValidByDomain.get(cert.domain);
+    const isSupersededByNewer = Boolean(best && best.id !== cert.id);
+    const isExpired =
+      cert.status === "expired" ||
+      (cert.cert_end_ts > 0 && cert.cert_end_ts <= now);
+
+    // Delete if superseded by a newer valid cert of the same domain, OR expired without auto-renew.
+    const shouldDelete = isSupersededByNewer || (isExpired && !cert.auto_renew);
+    if (!shouldDelete) continue;
+
+    let remoteDeleted = false;
+    if (cert.cert_id) {
+      try {
+        const creds = await resolveTencentCredsForCert(env, cert);
+        const delRes = await tryDeleteRemoteCert(env, creds, cert.cert_id);
+        remoteDeleted = delRes.deleted;
+      } catch (err) {
+        errors.push(`${cert.domain} 删除远端证书失败: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    await repo.deleteSslCertificate(env, cert.id);
+    cleaned += 1;
+    await repo.addEvent(
+      env,
+      "ssl",
+      messages.ev(
+        isExpired ? "SSL 过期证书已自动删除" : "SSL 旧证书已自动删除",
+        messages.objServer(cert.domain),
+      ),
+      {
+        detail: `${cert.domain}（${cert.cert_id || `#${cert.id}`}，${
+          isSupersededByNewer ? `已被新证书 ${best?.cert_id} 替代` : "证书已过期"
+        }）${remoteDeleted ? "已同步从腾讯云和面板删除" : "已从面板移除"}`,
+      },
+    );
+  }
+
+  return { cleaned, errors };
 }
 
 /**
  * Cron reconcile engine invoked from `src/scheduler.ts`:
  * 1. Polls pending/verifying certificates (~every 2 min) to push DNS records,
- *    trigger `CompleteCertificate`, and promote issued certs.
+ *    trigger `CompleteCertificate`, promote issued certs, and delete replaced old certs.
  * 2. Scans `auto_renew = 1` certificates (~every 15 min) expiring within
  *    `renew_before_days` (default 7 days) and automatically re-applies + writes
  *    DNS validation records + verifies them.
+ * 3. Automatically deletes expired certificates and superseded old certificates.
  */
 export async function reconcileCertificates(
   env: Env,
@@ -1326,6 +1535,7 @@ export async function reconcileCertificates(
     issued: 0,
     renewalsStarted: 0,
     dnsWritten: 0,
+    cleaned: 0,
     errors: [],
   };
   const force = Boolean(opts?.force);
@@ -1364,6 +1574,9 @@ export async function reconcileCertificates(
         if (res.justIssued) {
           summary.issued += 1;
         }
+        if (res.oldCertDeleted) {
+          summary.cleaned += 1;
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         summary.errors.push(`${cert.domain}: ${msg}`);
@@ -1380,11 +1593,23 @@ export async function reconcileCertificates(
   // Phase 2: Auto-renew certificates expiring within `renew_before_days` (default 7 days).
   if (shouldScanRenewals) {
     const freshCerts = await repo.listSslCertificates(env, false);
+    // Skip renewing older duplicate records when the domain already has a newer valid cert.
+    const bestValidByDomain = new Map<string, number>();
+    for (const c of freshCerts) {
+      if (c.status === "issued" && (c.cert_end_ts === 0 || c.cert_end_ts > now)) {
+        const cur = bestValidByDomain.get(c.domain) ?? 0;
+        if (c.cert_end_ts > cur) bestValidByDomain.set(c.domain, c.cert_end_ts);
+      }
+    }
+
     for (const cert of freshCerts) {
       if (!cert.auto_renew) continue;
       if (cert.pending_cert_id) continue; // renewal already in progress
       if (cert.status === "pending_dns" || cert.status === "verifying") continue;
       if (!cert.cert_end_ts || cert.cert_end_ts <= 0) continue;
+
+      const bestEnd = bestValidByDomain.get(cert.domain) ?? 0;
+      if (bestEnd > cert.cert_end_ts) continue; // already superseded by a newer cert; Phase 3 will delete it
 
       const remainingSec = cert.cert_end_ts - now;
       const renewWindowSec = Math.max(1, cert.renew_before_days || 7) * 86400;
@@ -1403,6 +1628,9 @@ export async function reconcileCertificates(
         }
         if (res.certificate.status === "issued" && res.certificate.cert_id === res.newCertId) {
           summary.issued += 1;
+        }
+        if (res.oldCertDeleted) {
+          summary.cleaned += 1;
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1427,6 +1655,12 @@ export async function reconcileCertificates(
         ]);
       }
     }
+
+    // Phase 3: Automatically delete expired certificates and replaced/superseded old certificates.
+    const cleanRes = await cleanupObsoleteAndExpiredCertificates(env, now);
+    summary.cleaned += cleanRes.cleaned;
+    summary.errors.push(...cleanRes.errors);
+
     await repo.clearFlag(env, RENEW_SCAN_FLAG);
     await repo.setFlag(env, RENEW_SCAN_FLAG);
   }

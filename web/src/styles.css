@@ -5902,4 +5902,14 @@ input[type='number']::-webkit-inner-spin-button {
   color: var(--muted-soft);
 }
 
+.certs-pager {
+  margin-top: 12px;
+  padding: 10px 14px;
+}
+
+.certs-pager .cloud-dns-pager {
+  padding-top: 0;
+  border-top: 0;
+}
+
 

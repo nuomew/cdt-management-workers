@@ -2892,6 +2892,7 @@ export interface SslCertificateRecord {
   dns_zone_id: string;
   cert_id: string;
   pending_cert_id: string;
+  replaced_cert_id: string;
   encrypt_algo: "RSA" | "ECC";
   status: SslCertStatus;
   tencent_status: number;
@@ -2927,6 +2928,7 @@ export interface SslCertificateCreateInput {
   dns_zone_id?: string;
   cert_id?: string;
   pending_cert_id?: string;
+  replaced_cert_id?: string;
   encrypt_algo?: "RSA" | "ECC";
   status?: SslCertStatus;
   tencent_status?: number;
@@ -2986,6 +2988,7 @@ async function normalizeSslCertRow(
     dns_zone_id: asStr(row["dns_zone_id"]),
     cert_id: asStr(row["cert_id"]),
     pending_cert_id: asStr(row["pending_cert_id"]),
+    replaced_cert_id: asStr(row["replaced_cert_id"]),
     encrypt_algo: algo,
     status,
     tencent_status: asInt(row["tencent_status"], -1),
@@ -3071,7 +3074,7 @@ export async function createSslCertificate(
     `INSERT INTO ssl_certificates (
       domain, tencent_account_id, tencent_secret_id, tencent_secret_key,
       dns_verify_mode, dns_account_id, dns_root_domain, dns_zone_id,
-      cert_id, pending_cert_id, encrypt_algo, status, tencent_status, status_name,
+      cert_id, pending_cert_id, replaced_cert_id, encrypt_algo, status, tencent_status, status_name,
       dv_auth_domain, dv_auth_sub_domain, dv_auth_type, dv_auth_value,
       dns_record_id, dns_record_written, cert_begin_time, cert_end_time, cert_end_ts,
       auto_renew, renew_before_days, clean_dns_after_issue,
@@ -3079,7 +3082,7 @@ export async function createSslCertificate(
     ) VALUES (
       ?, ?, ?, ?,
       ?, ?, ?, ?,
-      ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
       ?, ?, ?, ?, ?,
       ?, ?, ?,
@@ -3096,6 +3099,7 @@ export async function createSslCertificate(
       (input.dns_zone_id ?? "").trim(),
       (input.cert_id ?? "").trim(),
       (input.pending_cert_id ?? "").trim(),
+      (input.replaced_cert_id ?? "").trim(),
       input.encrypt_algo === "ECC" ? "ECC" : "RSA",
       input.status ?? "pending_dns",
       input.tencent_status ?? -1,
@@ -3146,6 +3150,7 @@ export async function updateSslCertificate(
   if (patch.dns_zone_id !== undefined) add("dns_zone_id", patch.dns_zone_id.trim());
   if (patch.cert_id !== undefined) add("cert_id", patch.cert_id.trim());
   if (patch.pending_cert_id !== undefined) add("pending_cert_id", patch.pending_cert_id.trim());
+  if (patch.replaced_cert_id !== undefined) add("replaced_cert_id", patch.replaced_cert_id.trim());
   if (patch.encrypt_algo !== undefined) add("encrypt_algo", patch.encrypt_algo === "ECC" ? "ECC" : "RSA");
   if (patch.status !== undefined) add("status", patch.status);
   if (patch.tencent_status !== undefined) add("tencent_status", patch.tencent_status);

@@ -229,6 +229,7 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     dns_zone_id           TEXT    NOT NULL DEFAULT '',
     cert_id               TEXT    NOT NULL DEFAULT '',
     pending_cert_id       TEXT    NOT NULL DEFAULT '',
+    replaced_cert_id      TEXT    NOT NULL DEFAULT '',
     encrypt_algo          TEXT    NOT NULL DEFAULT 'RSA',
     status                TEXT    NOT NULL DEFAULT 'pending_dns',
     tencent_status        INTEGER NOT NULL DEFAULT -1,
@@ -313,6 +314,20 @@ export function ensureSchema(db: D1Database | undefined): Promise<void> {
       await db
         .prepare(
           "ALTER TABLE swas_servers ADD COLUMN provider TEXT NOT NULL DEFAULT 'aliyun'",
+        )
+        .run();
+    }
+
+    const sslCols = await db
+      .prepare("PRAGMA table_info(ssl_certificates)")
+      .all<{ name?: string }>();
+    const hasReplacedCertId = (sslCols.results ?? []).some(
+      (col) => col.name === "replaced_cert_id",
+    );
+    if (!hasReplacedCertId) {
+      await db
+        .prepare(
+          "ALTER TABLE ssl_certificates ADD COLUMN replaced_cert_id TEXT NOT NULL DEFAULT ''",
         )
         .run();
     }
