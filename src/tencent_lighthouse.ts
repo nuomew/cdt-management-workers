@@ -1760,7 +1760,9 @@ export async function describePrice(
       {
         InstanceIds: [opts.instanceId],
         InstanceChargePrepaid: { Period: months },
-        RenewDataDisk: true,
+        // Explicit false prevents Tencent Lighthouse from rejecting instances
+        // that have no separate elastic data disk attached.
+        RenewDataDisk: false,
       },
     );
     return parseTencentPrice(data, months, defaultCurrency);
@@ -1800,10 +1802,13 @@ export async function renewInstance(
     return { request_id: makeClientToken("tc-renew"), expired_time: nextIso };
   }
 
+  // Must explicitly pass RenewDataDisk: false (RenewInstances defaults to true
+  // upstream, which fails when an instance has no attached elastic data disk
+  // and would diverge from the InquirePriceRenewInstances quote above).
   const data = await lighthouseRpc<Record<string, unknown>>(account, "RenewInstances", {
     InstanceIds: [account.instance_id],
     InstanceChargePrepaid: { Period: months },
-    RenewDataDisk: true,
+    RenewDataDisk: false,
     AutoVoucher: opts.autoVoucher ?? true,
   });
   const detail = await getInstanceDetail(env, account).catch(() => null);
