@@ -44,12 +44,22 @@ export default {
       return app.fetch(request, runtimeEnv, ctx);
     }
     if (env.ASSETS) {
-      const assetRes = await env.ASSETS.fetch(request);
+      let assetRes = await env.ASSETS.fetch(request);
       if (assetRes.status === 404 && (request.method === "GET" || request.method === "HEAD")) {
         const lastSegment = url.pathname.split("/").pop() ?? "";
         if (!lastSegment.includes(".")) {
-          return env.ASSETS.fetch(new Request(new URL("/index.html", url.origin), request));
+          assetRes = await env.ASSETS.fetch(new Request(new URL("/index.html", url.origin), request));
         }
+      }
+      const contentType = assetRes.headers.get("content-type") ?? "";
+      if (contentType.includes("text/html")) {
+        const headers = new Headers(assetRes.headers);
+        headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
+        return new Response(assetRes.body, {
+          status: assetRes.status,
+          statusText: assetRes.statusText,
+          headers,
+        });
       }
       return assetRes;
     }
