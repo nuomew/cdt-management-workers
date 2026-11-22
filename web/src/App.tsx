@@ -6,7 +6,6 @@ import {
   BarChart3,
   Cloud,
   ExternalLink,
-  Gauge,
   Globe2,
   HeartPulse,
   LoaderCircle,
@@ -29,7 +28,6 @@ import type {
   SwasServer,
 } from './types'
 import Auth from './components/Auth'
-import DashboardView from './components/DashboardView'
 import PublicHomeView from './components/PublicHomeView'
 import TelemetryDashboardView from './components/TelemetryDashboardView'
 import KeepaliveView from './components/KeepaliveView'
@@ -63,7 +61,7 @@ import { ownerLabel } from './owners'
 import { syncClock } from './time'
 
 type Phase = 'loading' | 'public' | 'setup' | 'login' | 'ready' | 'fatal'
-type View = 'dashboard' | 'telemetry' | 'keepalive' | 'shift' | 'servers' | 'swas' | 'dns'
+type View = 'telemetry' | 'keepalive' | 'shift' | 'servers' | 'swas' | 'dns'
 type Toast = { id: number; tone: 'success' | 'error' | 'info'; message: string }
 
 function isAdminPath(pathname: string = window.location.pathname): boolean {
@@ -82,27 +80,26 @@ type ConfirmRequest = {
 
 const REFRESH_MS = 10_000
 
-type NavLeaf = { key: View; label: string; icon: typeof Gauge }
+type NavLeaf = { key: View; label: string; icon: typeof BarChart3 }
 
 /**
- * 侧栏三个总菜单：概览 / 保活 / DNS。
- * 带 key 的总菜单本身就是页面（概览、DNS 可点），不带的只作分组标签（保活）。
+ * 侧栏三个总菜单：仪表盘 / 保活 / DNS。
+ * 带 key 的总菜单本身就是页面（仪表盘、DNS 可点），不带的只作分组标签（保活）。
  * 子项统一缩进挂在总菜单下面。
  */
 type NavSection = {
   title: string
   key?: View
-  icon?: typeof Gauge
+  icon?: typeof BarChart3
   children: NavLeaf[]
 }
 
 const NAV_SECTIONS: NavSection[] = [
   {
-    title: '概览',
-    key: 'dashboard',
-    icon: Gauge,
+    title: '仪表盘',
+    key: 'telemetry',
+    icon: BarChart3,
     children: [
-      { key: 'telemetry', label: '仪表盘', icon: BarChart3 },
       { key: 'servers', label: '服务器', icon: ServerIcon },
       { key: 'swas', label: '轻量服务器', icon: Cloud },
     ],
@@ -139,7 +136,7 @@ function sectionCount(section: NavSection, overview: Overview): number {
 
 export default function App() {
   const [phase, setPhase] = useState<Phase>('loading')
-  const [view, setView] = useState<View>('dashboard')
+  const [view, setView] = useState<View>('telemetry')
   const [meta, setMeta] = useState<InitStatus>({
     initialized: false,
     brand: 'CDT-Management',
@@ -879,9 +876,9 @@ export default function App() {
         <button
           type="button"
           className="brand"
-          title="回到概览"
-          aria-label="回到概览"
-          onClick={() => setView('dashboard')}
+          title="回到仪表盘"
+          aria-label="回到仪表盘"
+          onClick={() => setView('telemetry')}
         >
           <div className="brand-mark">
             <Repeat size={18} />
@@ -965,13 +962,6 @@ export default function App() {
       </aside>
 
       <main className="main-area">
-        {view === 'dashboard' && (
-          <DashboardView
-            overview={overview}
-            onNavigate={(target) => setView(target)}
-          />
-        )}
-
         {view === 'telemetry' && (
           <TelemetryDashboardView
             onNavigate={(target) => setView(target)}
