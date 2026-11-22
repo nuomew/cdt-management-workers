@@ -117,7 +117,7 @@ export default function ServersView({
     <>
       <div className="page-head">
         <div>
-          <h1>服务器</h1>
+          <h1>云服务器</h1>
           <p>
             管理阿里云 ECS 全生命周期：支持询价开通新实例、续费与自动续费、改密改名、安全组端口、镜像制作与跨账号共享、VNC 终端、重装系统与实例释放。
             {idleCount > 0 && ` 当前 ${idleCount} 台是闲散机器，可直接手动控制。`}

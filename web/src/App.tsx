@@ -102,7 +102,7 @@ const NAV_SECTIONS: NavSection[] = [
     key: 'telemetry',
     icon: BarChart3,
     children: [
-      { key: 'servers', label: '服务器', icon: ServerIcon },
+      { key: 'servers', label: '云服务器', icon: ServerIcon },
       { key: 'swas', label: '轻量服务器', icon: Cloud },
     ],
   },
