@@ -2701,3 +2701,484 @@ export async function updateSwasBilling(
   await execute(env.DB, `UPDATE swas_servers SET ${sets.join(", ")} WHERE id=?`, params);
 }
 
+// ---------------------------------------------------------------------------
+// dns_accounts (Tencent Cloud DNSPod & Cloudflare DNS accounts)
+// ---------------------------------------------------------------------------
+
+export type DnsAccountProvider = "tencent" | "cloudflare";
+export type DnsAccountAuthMode = "cam" | "token" | "global_key";
+
+export interface DnsAccountRecord {
+  id: number;
+  provider: DnsAccountProvider;
+  label: string;
+  auth_mode: DnsAccountAuthMode;
+  cred_id: string;
+  cred_id_preview: string;
+  has_secret: boolean;
+  cred_secret?: string;
+  remark: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface DnsAccountInput {
+  provider: DnsAccountProvider;
+  label: string;
+  auth_mode?: DnsAccountAuthMode;
+  cred_id?: string;
+  cred_secret?: string;
+  remark?: string;
+}
+
+async function normalizeDnsAccountRow(
+  env: Env,
+  row: Row,
+  decryptSecret: boolean,
+): Promise<DnsAccountRecord> {
+  const provider: DnsAccountProvider =
+    asStr(row["provider"]).toLowerCase() === "cloudflare" ? "cloudflare" : "tencent";
+  const rawAuthMode = asStr(row["auth_mode"]).toLowerCase();
+  const authMode: DnsAccountAuthMode =
+    provider === "tencent"
+      ? "cam"
+      : rawAuthMode === "global_key"
+        ? "global_key"
+        : "token";
+  const credId = asStr(row["cred_id"]);
+  const encryptedSecret = asStr(row["cred_secret"]);
+  const out: DnsAccountRecord = {
+    id: asInt(row["id"]),
+    provider,
+    label: asStr(row["label"]),
+    auth_mode: authMode,
+    cred_id: credId,
+    cred_id_preview: credId ? (provider === "tencent" ? mask(credId) : credId) : "",
+    has_secret: Boolean(encryptedSecret),
+    remark: asStr(row["remark"]),
+    created_at: asInt(row["created_at"]),
+    updated_at: asInt(row["updated_at"]),
+  };
+  if (decryptSecret && encryptedSecret) {
+    out.cred_secret = await decrypt(encryptedSecret, env.ENCRYPTION_KEY);
+  }
+  return out;
+}
+
+export async function listDnsAccounts(
+  env: Env,
+  opts?: { provider?: DnsAccountProvider; decryptSecret?: boolean },
+): Promise<DnsAccountRecord[]> {
+  const rows = opts?.provider
+    ? await query<Row>(
+        env.DB,
+        "SELECT * FROM dns_accounts WHERE provider=? ORDER BY id ASC",
+        [opts.provider],
+      )
+    : await query<Row>(env.DB, "SELECT * FROM dns_accounts ORDER BY provider ASC, id ASC");
+  const list: DnsAccountRecord[] = [];
+  for (const row of rows) {
+    list.push(await normalizeDnsAccountRow(env, row, Boolean(opts?.decryptSecret)));
+  }
+  return list;
+}
+
+export async function getDnsAccount(
+  env: Env,
+  id: number,
+  decryptSecret = false,
+): Promise<DnsAccountRecord | null> {
+  const row = await queryOne<Row>(env.DB, "SELECT * FROM dns_accounts WHERE id=?", [id]);
+  if (!row) return null;
+  return normalizeDnsAccountRow(env, row, decryptSecret);
+}
+
+export async function createDnsAccount(
+  env: Env,
+  input: DnsAccountInput,
+): Promise<number> {
+  const now = nowSeconds();
+  const provider: DnsAccountProvider =
+    input.provider === "cloudflare" ? "cloudflare" : "tencent";
+  const authMode: DnsAccountAuthMode =
+    provider === "tencent"
+      ? "cam"
+      : input.auth_mode === "global_key"
+        ? "global_key"
+        : "token";
+  const secretEnc = await encrypt((input.cred_secret ?? "").trim(), env.ENCRYPTION_KEY);
+  const res = await execute(
+    env.DB,
+    `INSERT INTO dns_accounts (
+      provider, label, auth_mode, cred_id, cred_secret, remark, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      provider,
+      input.label.trim(),
+      authMode,
+      (input.cred_id ?? "").trim(),
+      secretEnc,
+      (input.remark ?? "").trim(),
+      now,
+      now,
+    ],
+  );
+  return res.lastInsertRowId;
+}
+
+export async function updateDnsAccount(
+  env: Env,
+  id: number,
+  input: Partial<DnsAccountInput>,
+): Promise<void> {
+  const existing = await queryOne<Row>(env.DB, "SELECT * FROM dns_accounts WHERE id=?", [id]);
+  if (!existing) throw new Error("DNS 账号不存在");
+  const provider: DnsAccountProvider =
+    (input.provider ?? asStr(existing["provider"])) === "cloudflare"
+      ? "cloudflare"
+      : "tencent";
+  const authMode: DnsAccountAuthMode =
+    provider === "tencent"
+      ? "cam"
+      : (input.auth_mode ?? asStr(existing["auth_mode"])) === "global_key"
+        ? "global_key"
+        : "token";
+  const sets: string[] = [
+    "provider=?",
+    "label=?",
+    "auth_mode=?",
+    "cred_id=?",
+    "remark=?",
+    "updated_at=?",
+  ];
+  const params: (string | number | null)[] = [
+    provider,
+    (input.label ?? asStr(existing["label"])).trim(),
+    authMode,
+    input.cred_id !== undefined ? input.cred_id.trim() : asStr(existing["cred_id"]),
+    input.remark !== undefined ? input.remark.trim() : asStr(existing["remark"]),
+    nowSeconds(),
+  ];
+  if (input.cred_secret && input.cred_secret.trim()) {
+    sets.push("cred_secret=?");
+    params.push(await encrypt(input.cred_secret.trim(), env.ENCRYPTION_KEY));
+  }
+  params.push(id);
+  await execute(env.DB, `UPDATE dns_accounts SET ${sets.join(", ")} WHERE id=?`, params);
+}
+
+export async function deleteDnsAccount(env: Env, id: number): Promise<void> {
+  await execute(env.DB, "DELETE FROM dns_accounts WHERE id=?", [id]);
+}
+
+// ---------------------------------------------------------------------------
+// ssl_certificates (Tencent Cloud 443 free SSL certificates + auto renewal)
+// ---------------------------------------------------------------------------
+
+export type SslVerifyMode = "tencent_auto" | "dns_account" | "manual";
+export type SslCertStatus = "pending_dns" | "verifying" | "issued" | "failed" | "expired";
+
+export interface SslCertificateRecord {
+  id: number;
+  domain: string;
+  tencent_account_id: number;
+  tencent_secret_id: string;
+  tencent_secret_id_preview: string;
+  has_custom_secret: boolean;
+  tencent_secret_key?: string;
+  dns_verify_mode: SslVerifyMode;
+  dns_account_id: number;
+  dns_root_domain: string;
+  dns_zone_id: string;
+  cert_id: string;
+  pending_cert_id: string;
+  encrypt_algo: "RSA" | "ECC";
+  status: SslCertStatus;
+  tencent_status: number;
+  status_name: string;
+  dv_auth_domain: string;
+  dv_auth_sub_domain: string;
+  dv_auth_type: string;
+  dv_auth_value: string;
+  dns_record_id: string;
+  dns_record_written: boolean;
+  cert_begin_time: string;
+  cert_end_time: string;
+  cert_end_ts: number;
+  auto_renew: boolean;
+  renew_before_days: number;
+  clean_dns_after_issue: boolean;
+  last_error: string;
+  last_checked_at: number;
+  last_renew_at: number;
+  remark: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface SslCertificateCreateInput {
+  domain: string;
+  tencent_account_id?: number;
+  tencent_secret_id?: string;
+  tencent_secret_key?: string;
+  dns_verify_mode?: SslVerifyMode;
+  dns_account_id?: number;
+  dns_root_domain?: string;
+  dns_zone_id?: string;
+  cert_id?: string;
+  pending_cert_id?: string;
+  encrypt_algo?: "RSA" | "ECC";
+  status?: SslCertStatus;
+  tencent_status?: number;
+  status_name?: string;
+  dv_auth_domain?: string;
+  dv_auth_sub_domain?: string;
+  dv_auth_type?: string;
+  dv_auth_value?: string;
+  dns_record_id?: string;
+  dns_record_written?: boolean;
+  cert_begin_time?: string;
+  cert_end_time?: string;
+  cert_end_ts?: number;
+  auto_renew?: boolean;
+  renew_before_days?: number;
+  clean_dns_after_issue?: boolean;
+  last_error?: string;
+  last_checked_at?: number;
+  last_renew_at?: number;
+  remark?: string;
+}
+
+async function normalizeSslCertRow(
+  env: Env,
+  row: Row,
+  decryptSecret: boolean,
+): Promise<SslCertificateRecord> {
+  const modeRaw = asStr(row["dns_verify_mode"]).toLowerCase();
+  const mode: SslVerifyMode =
+    modeRaw === "tencent_auto"
+      ? "tencent_auto"
+      : modeRaw === "manual"
+        ? "manual"
+        : "dns_account";
+  const statusRaw = asStr(row["status"]).toLowerCase();
+  const status: SslCertStatus =
+    statusRaw === "verifying" ||
+    statusRaw === "issued" ||
+    statusRaw === "failed" ||
+    statusRaw === "expired"
+      ? statusRaw
+      : "pending_dns";
+  const secretId = asStr(row["tencent_secret_id"]);
+  const secretKeyEnc = asStr(row["tencent_secret_key"]);
+  const algo = asStr(row["encrypt_algo"]).toUpperCase() === "ECC" ? "ECC" : "RSA";
+
+  const out: SslCertificateRecord = {
+    id: asInt(row["id"]),
+    domain: asStr(row["domain"]),
+    tencent_account_id: asInt(row["tencent_account_id"]),
+    tencent_secret_id: secretId,
+    tencent_secret_id_preview: secretId ? mask(secretId) : "",
+    has_custom_secret: Boolean(secretId && secretKeyEnc),
+    dns_verify_mode: mode,
+    dns_account_id: asInt(row["dns_account_id"]),
+    dns_root_domain: asStr(row["dns_root_domain"]),
+    dns_zone_id: asStr(row["dns_zone_id"]),
+    cert_id: asStr(row["cert_id"]),
+    pending_cert_id: asStr(row["pending_cert_id"]),
+    encrypt_algo: algo,
+    status,
+    tencent_status: asInt(row["tencent_status"], -1),
+    status_name: asStr(row["status_name"]),
+    dv_auth_domain: asStr(row["dv_auth_domain"]),
+    dv_auth_sub_domain: asStr(row["dv_auth_sub_domain"]),
+    dv_auth_type: asStr(row["dv_auth_type"]),
+    dv_auth_value: asStr(row["dv_auth_value"]),
+    dns_record_id: asStr(row["dns_record_id"]),
+    dns_record_written: asBool(row["dns_record_written"]),
+    cert_begin_time: asStr(row["cert_begin_time"]),
+    cert_end_time: asStr(row["cert_end_time"]),
+    cert_end_ts: asInt(row["cert_end_ts"]),
+    auto_renew: asBool(row["auto_renew"]),
+    renew_before_days: Math.max(1, asInt(row["renew_before_days"], 7)),
+    clean_dns_after_issue: asBool(row["clean_dns_after_issue"]),
+    last_error: asStr(row["last_error"]),
+    last_checked_at: asInt(row["last_checked_at"]),
+    last_renew_at: asInt(row["last_renew_at"]),
+    remark: asStr(row["remark"]),
+    created_at: asInt(row["created_at"]),
+    updated_at: asInt(row["updated_at"]),
+  };
+  if (decryptSecret && secretKeyEnc) {
+    out.tencent_secret_key = await decrypt(secretKeyEnc, env.ENCRYPTION_KEY);
+  }
+  return out;
+}
+
+export async function listSslCertificates(
+  env: Env,
+  decryptSecret = false,
+): Promise<SslCertificateRecord[]> {
+  const rows = await query<Row>(
+    env.DB,
+    "SELECT * FROM ssl_certificates ORDER BY id DESC",
+  );
+  const out: SslCertificateRecord[] = [];
+  for (const row of rows) {
+    out.push(await normalizeSslCertRow(env, row, decryptSecret));
+  }
+  return out;
+}
+
+export async function getSslCertificate(
+  env: Env,
+  id: number,
+  decryptSecret = false,
+): Promise<SslCertificateRecord | null> {
+  const row = await queryOne<Row>(
+    env.DB,
+    "SELECT * FROM ssl_certificates WHERE id=?",
+    [id],
+  );
+  if (!row) return null;
+  return normalizeSslCertRow(env, row, decryptSecret);
+}
+
+export async function getSslCertificateByCertId(
+  env: Env,
+  certId: string,
+  decryptSecret = false,
+): Promise<SslCertificateRecord | null> {
+  const row = await queryOne<Row>(
+    env.DB,
+    "SELECT * FROM ssl_certificates WHERE cert_id=? OR pending_cert_id=? LIMIT 1",
+    [certId, certId],
+  );
+  if (!row) return null;
+  return normalizeSslCertRow(env, row, decryptSecret);
+}
+
+export async function createSslCertificate(
+  env: Env,
+  input: SslCertificateCreateInput,
+): Promise<number> {
+  const now = nowSeconds();
+  const secretKeyEnc = input.tencent_secret_key?.trim()
+    ? await encrypt(input.tencent_secret_key.trim(), env.ENCRYPTION_KEY)
+    : "";
+  const res = await execute(
+    env.DB,
+    `INSERT INTO ssl_certificates (
+      domain, tencent_account_id, tencent_secret_id, tencent_secret_key,
+      dns_verify_mode, dns_account_id, dns_root_domain, dns_zone_id,
+      cert_id, pending_cert_id, encrypt_algo, status, tencent_status, status_name,
+      dv_auth_domain, dv_auth_sub_domain, dv_auth_type, dv_auth_value,
+      dns_record_id, dns_record_written, cert_begin_time, cert_end_time, cert_end_ts,
+      auto_renew, renew_before_days, clean_dns_after_issue,
+      last_error, last_checked_at, last_renew_at, remark, created_at, updated_at
+    ) VALUES (
+      ?, ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?, ?, ?,
+      ?, ?, ?,
+      ?, ?, ?, ?, ?, ?
+    )`,
+    [
+      input.domain.trim().toLowerCase(),
+      input.tencent_account_id ?? 0,
+      (input.tencent_secret_id ?? "").trim(),
+      secretKeyEnc,
+      input.dns_verify_mode ?? "dns_account",
+      input.dns_account_id ?? 0,
+      (input.dns_root_domain ?? "").trim().toLowerCase(),
+      (input.dns_zone_id ?? "").trim(),
+      (input.cert_id ?? "").trim(),
+      (input.pending_cert_id ?? "").trim(),
+      input.encrypt_algo === "ECC" ? "ECC" : "RSA",
+      input.status ?? "pending_dns",
+      input.tencent_status ?? -1,
+      (input.status_name ?? "").trim(),
+      (input.dv_auth_domain ?? "").trim(),
+      (input.dv_auth_sub_domain ?? "").trim(),
+      (input.dv_auth_type ?? "").trim(),
+      (input.dv_auth_value ?? "").trim(),
+      (input.dns_record_id ?? "").trim(),
+      input.dns_record_written ? 1 : 0,
+      (input.cert_begin_time ?? "").trim(),
+      (input.cert_end_time ?? "").trim(),
+      input.cert_end_ts ?? 0,
+      input.auto_renew === false ? 0 : 1,
+      Math.max(1, Math.min(30, input.renew_before_days ?? 7)),
+      input.clean_dns_after_issue === false ? 0 : 1,
+      (input.last_error ?? "").trim(),
+      input.last_checked_at ?? 0,
+      input.last_renew_at ?? 0,
+      (input.remark ?? "").trim(),
+      now,
+      now,
+    ],
+  );
+  return res.lastInsertRowId;
+}
+
+export async function updateSslCertificate(
+  env: Env,
+  id: number,
+  patch: Partial<SslCertificateCreateInput>,
+): Promise<void> {
+  const sets: string[] = [];
+  const params: (string | number | null)[] = [];
+  const add = (col: string, val: string | number | null) => {
+    sets.push(`${col}=?`);
+    params.push(val);
+  };
+  if (patch.domain !== undefined) add("domain", patch.domain.trim().toLowerCase());
+  if (patch.tencent_account_id !== undefined) add("tencent_account_id", patch.tencent_account_id);
+  if (patch.tencent_secret_id !== undefined) add("tencent_secret_id", patch.tencent_secret_id.trim());
+  if (patch.tencent_secret_key !== undefined && patch.tencent_secret_key.trim()) {
+    add("tencent_secret_key", await encrypt(patch.tencent_secret_key.trim(), env.ENCRYPTION_KEY));
+  }
+  if (patch.dns_verify_mode !== undefined) add("dns_verify_mode", patch.dns_verify_mode);
+  if (patch.dns_account_id !== undefined) add("dns_account_id", patch.dns_account_id);
+  if (patch.dns_root_domain !== undefined) add("dns_root_domain", patch.dns_root_domain.trim().toLowerCase());
+  if (patch.dns_zone_id !== undefined) add("dns_zone_id", patch.dns_zone_id.trim());
+  if (patch.cert_id !== undefined) add("cert_id", patch.cert_id.trim());
+  if (patch.pending_cert_id !== undefined) add("pending_cert_id", patch.pending_cert_id.trim());
+  if (patch.encrypt_algo !== undefined) add("encrypt_algo", patch.encrypt_algo === "ECC" ? "ECC" : "RSA");
+  if (patch.status !== undefined) add("status", patch.status);
+  if (patch.tencent_status !== undefined) add("tencent_status", patch.tencent_status);
+  if (patch.status_name !== undefined) add("status_name", patch.status_name);
+  if (patch.dv_auth_domain !== undefined) add("dv_auth_domain", patch.dv_auth_domain);
+  if (patch.dv_auth_sub_domain !== undefined) add("dv_auth_sub_domain", patch.dv_auth_sub_domain);
+  if (patch.dv_auth_type !== undefined) add("dv_auth_type", patch.dv_auth_type);
+  if (patch.dv_auth_value !== undefined) add("dv_auth_value", patch.dv_auth_value);
+  if (patch.dns_record_id !== undefined) add("dns_record_id", patch.dns_record_id);
+  if (patch.dns_record_written !== undefined) add("dns_record_written", patch.dns_record_written ? 1 : 0);
+  if (patch.cert_begin_time !== undefined) add("cert_begin_time", patch.cert_begin_time);
+  if (patch.cert_end_time !== undefined) add("cert_end_time", patch.cert_end_time);
+  if (patch.cert_end_ts !== undefined) add("cert_end_ts", patch.cert_end_ts);
+  if (patch.auto_renew !== undefined) add("auto_renew", patch.auto_renew ? 1 : 0);
+  if (patch.renew_before_days !== undefined) {
+    add("renew_before_days", Math.max(1, Math.min(30, patch.renew_before_days)));
+  }
+  if (patch.clean_dns_after_issue !== undefined) {
+    add("clean_dns_after_issue", patch.clean_dns_after_issue ? 1 : 0);
+  }
+  if (patch.last_error !== undefined) add("last_error", patch.last_error);
+  if (patch.last_checked_at !== undefined) add("last_checked_at", patch.last_checked_at);
+  if (patch.last_renew_at !== undefined) add("last_renew_at", patch.last_renew_at);
+  if (patch.remark !== undefined) add("remark", patch.remark.trim());
+
+  if (sets.length === 0) return;
+  add("updated_at", nowSeconds());
+  params.push(id);
+  await execute(env.DB, `UPDATE ssl_certificates SET ${sets.join(", ")} WHERE id=?`, params);
+}
+
+export async function deleteSslCertificate(env: Env, id: number): Promise<void> {
+  await execute(env.DB, "DELETE FROM ssl_certificates WHERE id=?", [id]);
+}
+
+

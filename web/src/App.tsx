@@ -14,6 +14,7 @@ import {
   Repeat,
   Server as ServerIcon,
   Settings as SettingsIcon,
+  ShieldCheck,
   Zap,
 } from 'lucide-react'
 import { APIError, SLOW_TIMEOUT_MS, api, del, post } from './api'
@@ -56,12 +57,13 @@ import GroupDialog from './components/GroupDialog'
 import SettingsDrawer from './components/SettingsDrawer'
 import ConfirmDialog from './components/ConfirmDialog'
 import DNSView from './components/DNSView'
+import CertsView from './components/CertsView'
 import { Badge, Modal } from './components/ui'
 import { ownerLabel } from './owners'
 import { syncClock } from './time'
 
 type Phase = 'loading' | 'public' | 'setup' | 'login' | 'ready' | 'fatal'
-type View = 'telemetry' | 'keepalive' | 'shift' | 'servers' | 'swas' | 'dns'
+type View = 'telemetry' | 'keepalive' | 'shift' | 'servers' | 'swas' | 'dns' | 'certs'
 type Toast = { id: number; tone: 'success' | 'error' | 'info'; message: string }
 
 function isAdminPath(pathname: string = window.location.pathname): boolean {
@@ -84,7 +86,7 @@ type NavLeaf = { key: View; label: string; icon: typeof BarChart3 }
 
 /**
  * 侧栏三个总菜单：仪表盘 / 保活 / DNS。
- * 带 key 的总菜单本身就是页面（仪表盘、DNS 可点），不带的只作分组标签（保活）。
+ * 带 key 的总菜单本身就是页面（仪表盘可点），不带的只作分组标签（保活、DNS）。
  * 子项统一缩进挂在总菜单下面。
  */
 type NavSection = {
@@ -114,9 +116,11 @@ const NAV_SECTIONS: NavSection[] = [
   },
   {
     title: 'DNS',
-    key: 'dns',
     icon: Globe2,
-    children: [],
+    children: [
+      { key: 'dns', label: '域名解析', icon: Globe2 },
+      { key: 'certs', label: '证书服务', icon: ShieldCheck },
+    ],
   },
 ]
 
@@ -125,12 +129,13 @@ function navCount(key: View, overview: Overview): number {
   if (key === 'swas') return overview.swas_servers?.length ?? 0
   if (key === 'keepalive') return overview.keepalives.length
   if (key === 'shift') return overview.groups.length
+  if (key === 'dns') return (overview.dns_accounts_count ?? 0) || (overview.dns?.records.length ?? 0)
+  if (key === 'certs') return overview.ssl_certs_count ?? 0
   return 0
 }
 
-/** 总菜单那一行右侧的数字（DNS 用它显示记录条数） */
-function sectionCount(section: NavSection, overview: Overview): number {
-  if (section.key === 'dns') return overview.dns?.records.length ?? 0
+/** 总菜单那一行右侧的数字（预留扩展） */
+function sectionCount(_section: NavSection, _overview: Overview): number {
   return 0
 }
 
@@ -1067,6 +1072,16 @@ export default function App() {
             onRemoveRecord={removeDnsRecord}
             onReorder={reorderDns}
             onOpenSettings={() => setSettingsOpen(true)}
+            onToast={toast}
+            onCloudChanged={() => void loadAll()}
+          />
+        )}
+
+        {view === 'certs' && (
+          <CertsView
+            onToast={toast}
+            onChanged={() => void loadAll()}
+            onGoDnsAccounts={() => setView('dns')}
           />
         )}
 

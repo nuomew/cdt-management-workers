@@ -5270,3 +5270,577 @@ input[type='number']::-webkit-inner-spin-button {
   }
 }
 
+/* ------------------------------------------------------ Cloud DNS & SSL Certs */
+
+.page-tabs {
+  margin-bottom: 14px;
+  padding: 0 2px;
+}
+
+.form-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.muted-sm {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.muted-xs {
+  font-size: 11.5px;
+  color: var(--muted-soft);
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+.mono-strong {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--ink);
+  word-break: break-all;
+}
+
+.mono-muted {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.cloud-dns-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.cloud-dns-accounts-card {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.cloud-dns-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.cloud-dns-head-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--ink);
+}
+
+.cloud-dns-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cloud-dns-import-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.cloud-dns-acct-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.cloud-dns-acct-pill {
+  flex: 1 1 230px;
+  max-width: 340px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--panel-solid);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.cloud-dns-acct-pill:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+
+.cloud-dns-acct-pill.is-active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel-solid));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+.cloud-dns-acct-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cloud-dns-acct-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-dns-acct-sub {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+
+.cloud-dns-acct-ops {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.cloud-dns-workspace {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.cloud-dns-domains {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cloud-dns-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px;
+  font-size: 13px;
+}
+
+.cloud-dns-domain-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 520px;
+  overflow-y: auto;
+}
+
+.cloud-dns-domain-item {
+  width: 100%;
+  text-align: left;
+  padding: 9px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.cloud-dns-domain-item:hover {
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.cloud-dns-domain-item.is-active {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.cloud-dns-domain-name {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-dns-domain-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--muted-soft);
+}
+
+.cloud-dns-records {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.cloud-dns-records-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.cloud-dns-records-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.cloud-dns-records-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cloud-dns-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.cloud-dns-search svg {
+  position: absolute;
+  left: 9px;
+  color: var(--muted-soft);
+  pointer-events: none;
+}
+
+.cloud-dns-search .input {
+  padding-left: 28px;
+  min-width: 200px;
+  height: 30px;
+  font-size: 12px;
+}
+
+.cloud-dns-table-wrap {
+  overflow-x: auto;
+}
+
+.cloud-dns-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.cloud-dns-table th {
+  text-align: left;
+  padding: 8px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.cloud-dns-table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  vertical-align: middle;
+}
+
+.cloud-dns-table tr.is-disabled td {
+  opacity: 0.58;
+}
+
+.cloud-dns-val-cell {
+  max-width: 300px;
+}
+
+.cloud-dns-val-cell code {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
+}
+
+.cloud-dns-row-ops {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+}
+
+.cf-proxy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--panel-solid);
+  color: var(--muted);
+  font-size: 11.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.cf-proxy-btn.on {
+  border-color: color-mix(in srgb, var(--amber) 50%, var(--line));
+  background: color-mix(in srgb, var(--amber) 14%, var(--panel-solid));
+  color: var(--amber);
+  font-weight: 600;
+}
+
+.cloud-dns-loading,
+.cloud-dns-empty-sm {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px 12px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.cloud-dns-error {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--red) 35%, var(--line));
+  background: color-mix(in srgb, var(--red) 8%, var(--panel-solid));
+  color: var(--red);
+  font-size: 12.5px;
+}
+
+/* SSL Certificate Service */
+
+.certs-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.certs-kpi {
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.certs-kpi span {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.certs-kpi strong {
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+.certs-kpi strong.tone-green {
+  color: var(--green);
+}
+
+.certs-kpi strong.tone-blue {
+  color: var(--blue);
+}
+
+.certs-kpi strong.tone-amber {
+  color: var(--amber);
+}
+
+.certs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.cert-card {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.cert-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.cert-domain-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cert-domain {
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.cert-auto-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cert-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px 14px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--ink) 3%, var(--panel-solid));
+  border: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
+}
+
+.cert-meta-k {
+  display: block;
+  font-size: 11px;
+  color: var(--muted-soft);
+  margin-bottom: 2px;
+}
+
+.cert-meta-v {
+  display: block;
+  font-size: 12.5px;
+  color: var(--ink);
+  word-break: break-all;
+}
+
+.cert-pending-id {
+  color: var(--blue);
+  font-weight: 600;
+}
+
+.cert-dv-box {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px dashed color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: color-mix(in srgb, var(--accent) 5%, var(--panel-solid));
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cert-dv-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.cert-dv-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.cert-dv-fields code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink);
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--panel-solid);
+  word-break: break-all;
+}
+
+.cert-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--red) 8%, var(--panel-solid));
+  border: 1px solid color-mix(in srgb, var(--red) 30%, var(--line));
+  color: var(--red);
+  font-size: 12px;
+}
+
+.cert-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 75%, transparent);
+}
+
+.cert-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cert-pem-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.cert-pem-box {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre;
+  resize: vertical;
+}
+
+@media (max-width: 960px) {
+  .cloud-dns-workspace {
+    grid-template-columns: 1fr;
+  }
+  .certs-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .cert-meta-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .cert-meta-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+

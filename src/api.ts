@@ -57,6 +57,8 @@ import * as billing from "./billing";
 import * as aliyun from "./aliyun";
 import * as swas from "./swas";
 import * as analytics from "./analytics";
+import * as dnsProviders from "./dns_providers";
+import * as tencentSsl from "./tencent_ssl";
 import {
   BRAND,
   CSRF_COOKIE,
@@ -1041,6 +1043,8 @@ app.get("/api/v1/overview", async (c) => {
   const groups = await repo.listGroups(env);
   const servers = await repo.listServers(env);
   const swasServers = await repo.listSwasServers(env);
+  const dnsAccounts = await repo.listDnsAccounts(env);
+  const sslCerts = await repo.listSslCertificates(env);
   const managed = managedMap(groups, keepalives);
   const books = await dns.recordBooks(env);
   const cards = await dns.booksForCards(env, now.epoch, books);
@@ -1067,6 +1071,8 @@ app.get("/api/v1/overview", async (c) => {
       groups.map((g) => groupPayload(env, g, config, now.epoch, managed, books)),
     ),
     dns: await dns.snapshot(env, config, now.epoch),
+    dns_accounts_count: dnsAccounts.length,
+    ssl_certs_count: sslCerts.length,
     notifications: {
       channels,
       telegram: channels.includes("telegram"),
@@ -1085,11 +1091,13 @@ app.post("/api/v1/reconcile", async (c) => {
   // and no `busy` flag. The round still runs exactly once per call.
   await reconcileAll(c.env);
   await swas.refreshAllSwasServers(c.env).catch(() => 0);
+  const ssl = await tencentSsl.reconcileCertificates(c.env).catch(() => null);
   // Manual reconcile also sweeps DNS, same as Python.
   return c.json({
     results: [],
     busy: false,
     dns: await dns.reconcile(c.env, await repo.getSettings(c.env)),
+    ssl,
   });
 });
 
@@ -3642,6 +3650,730 @@ app.post("/api/v1/dns/sync", async (c) => {
     throw httpErr(400, "invalid_request", "DDNS 未启用，请先在设置里打开");
   }
   return c.json({ items: await dns.reconcile(c.env, config, true) });
+});
+
+// -- Cloud DNS (Tencent Cloud DNSPod & Cloudflare) ----------------------------
+
+function parseBoolFlag(value: unknown, fallback = false): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const lower = value.trim().toLowerCase();
+    if (lower === "1" || lower === "true" || lower === "yes" || lower === "on") return true;
+    if (lower === "0" || lower === "false" || lower === "no" || lower === "off") return false;
+  }
+  return fallback;
+}
+
+function sanitizeDnsAccount(acct: repo.DnsAccountRecord) {
+  return {
+    id: acct.id,
+    provider: acct.provider,
+    label: acct.label,
+    auth_mode: acct.auth_mode,
+    cred_id: acct.provider === "cloudflare" ? acct.cred_id : "",
+    cred_id_preview: acct.cred_id_preview,
+    has_secret: acct.has_secret,
+    remark: acct.remark,
+    created_at: acct.created_at,
+    updated_at: acct.updated_at,
+  };
+}
+
+app.get("/api/v1/dns-accounts", async (c) => {
+  await requireAdmin(c);
+  const providerRaw = (c.req.query("provider") ?? "").trim().toLowerCase();
+  const providerFilter: repo.DnsAccountProvider | undefined =
+    providerRaw === "tencent" || providerRaw === "cloudflare" ? providerRaw : undefined;
+  const accounts = await repo.listDnsAccounts(c.env, { provider: providerFilter });
+  const config = await repo.getSettings(c.env);
+  const hasCfDdns = Boolean(
+    (c.env.CLOUDFLARE_API_TOKEN ?? "").trim() ||
+      (config["ddns_cf_token"] ?? "").trim() ||
+      ((config["ddns_cf_email"] ?? "").trim() && (config["ddns_cf_key"] ?? "").trim()),
+  );
+  const swasServers = await repo.listSwasServers(c.env);
+  const tencentSwas = swasServers
+    .filter((s) => s.provider === "tencent")
+    .map((s) => ({
+      id: s.id,
+      label: s.label,
+      region_id: s.region_id,
+      access_key_id_preview: security.mask(s.access_key_id),
+    }));
+
+  return c.json({
+    items: accounts.map(sanitizeDnsAccount),
+    importable: {
+      cloudflare_ddns: hasCfDdns,
+      tencent_swas: tencentSwas,
+    },
+  });
+});
+
+app.post("/api/v1/dns-accounts", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const importFrom = strOf(payload["import_from"]).trim().toLowerCase();
+
+  let provider: repo.DnsAccountProvider =
+    strOf(payload["provider"]).trim().toLowerCase() === "cloudflare"
+      ? "cloudflare"
+      : "tencent";
+  let label = strOf(payload["label"]).trim();
+  let authMode: repo.DnsAccountAuthMode =
+    strOf(payload["auth_mode"]).trim().toLowerCase() === "global_key"
+      ? "global_key"
+      : provider === "cloudflare"
+        ? "token"
+        : "cam";
+  let credId = strOf(payload["cred_id"]).trim();
+  let credSecret = strOf(payload["cred_secret"]).trim();
+  const remark = strOf(payload["remark"]).trim();
+
+  if (importFrom === "cf_ddns") {
+    const config = await repo.getSettings(c.env);
+    provider = "cloudflare";
+    const envToken = (c.env.CLOUDFLARE_API_TOKEN ?? "").trim();
+    const cfMode = (config["ddns_cf_auth_mode"] ?? "token").trim().toLowerCase();
+    if (envToken) {
+      authMode = "token";
+      credId = "";
+      credSecret = envToken;
+    } else if (cfMode === "global_key") {
+      authMode = "global_key";
+      credId = (config["ddns_cf_email"] ?? "").trim();
+      credSecret = (config["ddns_cf_key"] ?? "").trim();
+    } else {
+      authMode = "token";
+      credId = "";
+      credSecret = (config["ddns_cf_token"] ?? "").trim();
+    }
+    if (!credSecret) {
+      throw invalid("当前设置里尚未配置 Cloudflare DDNS 凭据，无法一键导入");
+    }
+    if (!label) label = "Cloudflare（来自 DDNS 设置）";
+  } else if (importFrom === "tencent_swas") {
+    const swasId = numOf(payload["swas_id"]);
+    if (!swasId) throw invalid("请选择要导入凭据的腾讯云轻量服务器");
+    const swasRow = await repo.getSwasServer(c.env, swasId, true);
+    if (!swasRow || swasRow.provider !== "tencent") {
+      throw httpErr(404, "not_found", "未找到对应的腾讯云轻量服务器");
+    }
+    provider = "tencent";
+    authMode = "cam";
+    credId = String(swasRow.access_key_id || "").trim();
+    credSecret = String(swasRow.access_key_secret || "").trim();
+    if (!credId || !credSecret) {
+      throw invalid("该腾讯云轻量服务器缺少完整的 API 密钥");
+    }
+    if (!label) label = `腾讯云（${swasRow.label}）`;
+  }
+
+  if (!label) throw invalid("请填写账号名称");
+  if (provider === "tencent") {
+    if (!credId || !credSecret) {
+      throw invalid("腾讯云域名解析账号需要填写 SecretId 和 SecretKey");
+    }
+    authMode = "cam";
+  } else {
+    if (authMode === "global_key" && !credId) {
+      throw invalid("Cloudflare Global API Key 模式需要填写登录邮箱");
+    }
+    if (!credSecret) {
+      throw invalid("Cloudflare 账号需要填写 API Token 或 Global API Key");
+    }
+  }
+
+  const id = await repo.createDnsAccount(c.env, {
+    provider,
+    label,
+    auth_mode: authMode,
+    cred_id: credId,
+    cred_secret: credSecret,
+    remark,
+  });
+  const created = await repo.getDnsAccount(c.env, id, false);
+  await repo.addEvent(c.env, "dns", messages.ev("云解析账号已添加", messages.objServer(label)), {
+    detail: `${provider === "tencent" ? "腾讯云 DNSPod" : "Cloudflare"} / ${label}`,
+  });
+  return c.json({ id, item: created ? sanitizeDnsAccount(created) : null });
+});
+
+app.put("/api/v1/dns-accounts/:id", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const id = paramInt(c, "id");
+  const existing = await repo.getDnsAccount(c.env, id, false);
+  if (!existing) throw httpErr(404, "not_found", "DNS 账号不存在");
+  const payload = await jsonBody(c);
+  const label = strOf(payload["label"]).trim() || existing.label;
+  const authModeRaw = strOf(payload["auth_mode"]).trim().toLowerCase();
+  const authMode: repo.DnsAccountAuthMode =
+    existing.provider === "tencent"
+      ? "cam"
+      : authModeRaw === "global_key"
+        ? "global_key"
+        : authModeRaw === "token"
+          ? "token"
+          : existing.auth_mode;
+  const credId =
+    payload["cred_id"] !== undefined ? strOf(payload["cred_id"]).trim() : existing.cred_id;
+  const credSecret = strOf(payload["cred_secret"]).trim();
+  const remark =
+    payload["remark"] !== undefined ? strOf(payload["remark"]).trim() : existing.remark;
+
+  await repo.updateDnsAccount(c.env, id, {
+    label,
+    auth_mode: authMode,
+    cred_id: credId,
+    cred_secret: credSecret || undefined,
+    remark,
+  });
+  const updated = await repo.getDnsAccount(c.env, id, false);
+  return c.json({ ok: true, item: updated ? sanitizeDnsAccount(updated) : null });
+});
+
+app.delete("/api/v1/dns-accounts/:id", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const id = paramInt(c, "id");
+  const existing = await repo.getDnsAccount(c.env, id, false);
+  if (!existing) throw httpErr(404, "not_found", "DNS 账号不存在");
+  await repo.deleteDnsAccount(c.env, id);
+  await repo.addEvent(
+    c.env,
+    "dns",
+    messages.ev("云解析账号已删除", messages.objServer(existing.label)),
+    {
+      detail: `${existing.provider === "tencent" ? "腾讯云 DNSPod" : "Cloudflare"} / ${existing.label}`,
+    },
+  );
+  return c.json({ ok: true });
+});
+
+app.post("/api/v1/dns-accounts/:id/test", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const id = paramInt(c, "id");
+  const acct = await repo.getDnsAccount(c.env, id, true);
+  if (!acct) throw httpErr(404, "not_found", "DNS 账号不存在");
+  try {
+    const result = await dnsProviders.testDnsAccount(c.env, acct);
+    return c.json(result);
+  } catch (err) {
+    throw httpErr(400, "dns_test_failed", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.get("/api/v1/dns-accounts/:id/domains", async (c) => {
+  await requireAdmin(c);
+  const id = paramInt(c, "id");
+  const acct = await repo.getDnsAccount(c.env, id, true);
+  if (!acct) throw httpErr(404, "not_found", "DNS 账号不存在");
+  try {
+    const domains = await dnsProviders.listDomains(c.env, acct);
+    return c.json({ account: sanitizeDnsAccount(acct), items: domains });
+  } catch (err) {
+    throw httpErr(502, "dns_upstream_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.get("/api/v1/dns-accounts/:id/records", async (c) => {
+  await requireAdmin(c);
+  const id = paramInt(c, "id");
+  const acct = await repo.getDnsAccount(c.env, id, true);
+  if (!acct) throw httpErr(404, "not_found", "DNS 账号不存在");
+  const domain = (c.req.query("domain") ?? "").trim();
+  const zoneId = (c.req.query("zone_id") ?? "").trim();
+  const keyword = (c.req.query("keyword") ?? "").trim();
+  const type = (c.req.query("type") ?? "").trim();
+  if (!domain) throw invalid("请指定要查询的域名 domain");
+  try {
+    const items = await dnsProviders.listRecords(c.env, acct, domain, zoneId, {
+      keyword: keyword || undefined,
+      type: type || undefined,
+    });
+    return c.json({ items, provider: acct.provider, domain, zone_id: zoneId });
+  } catch (err) {
+    throw httpErr(502, "dns_upstream_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/dns-accounts/:id/records", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const id = paramInt(c, "id");
+  const acct = await repo.getDnsAccount(c.env, id, true);
+  if (!acct) throw httpErr(404, "not_found", "DNS 账号不存在");
+  const payload = await jsonBody(c);
+  const domain = strOf(payload["domain"]).trim();
+  const zoneId = strOf(payload["zone_id"]).trim();
+  const name = strOf(payload["name"]).trim() || "@";
+  const type = strOf(payload["type"]).trim().toUpperCase();
+  const value = strOf(payload["value"]).trim();
+  if (!domain || !type || !value) {
+    throw invalid("请填写完整的域名、记录类型与记录值");
+  }
+  try {
+    const record = await dnsProviders.createRecord(c.env, acct, domain, zoneId, {
+      name,
+      type,
+      value,
+      ttl: payload["ttl"] !== undefined ? numOf(payload["ttl"]) : undefined,
+      line: strOf(payload["line"]).trim() || undefined,
+      mx: payload["mx"] !== undefined ? numOf(payload["mx"]) : undefined,
+      proxied: parseBoolFlag(payload["proxied"], false),
+      enabled: parseBoolFlag(payload["enabled"], true),
+      remark: strOf(payload["remark"]).trim(),
+    });
+    await repo.addEvent(
+      c.env,
+      "dns",
+      messages.ev("解析记录已新增", messages.objServer(record.full_name)),
+      {
+        detail: `${acct.provider === "tencent" ? "腾讯云 DNSPod" : "Cloudflare"} / ${record.type} ${record.full_name} → ${record.value}`,
+      },
+    );
+    return c.json({ ok: true, item: record });
+  } catch (err) {
+    throw httpErr(400, "dns_create_failed", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.put("/api/v1/dns-accounts/:id/records/:recordId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const id = paramInt(c, "id");
+  const recordId = c.req.param("recordId");
+  const acct = await repo.getDnsAccount(c.env, id, true);
+  if (!acct) throw httpErr(404, "not_found", "DNS 账号不存在");
+  const payload = await jsonBody(c);
+  const domain = strOf(payload["domain"]).trim();
+  const zoneId = strOf(payload["zone_id"]).trim();
+  const name = strOf(payload["name"]).trim() || "@";
+  const type = strOf(payload["type"]).trim().toUpperCase();
+  const value = strOf(payload["value"]).trim();
+  if (!domain || !type || !value) {
+    throw invalid("请填写完整的域名、记录类型与记录值");
+  }
+  try {
+    const record = await dnsProviders.updateRecord(c.env, acct, domain, zoneId, recordId, {
+      name,
+      type,
+      value,
+      ttl: payload["ttl"] !== undefined ? numOf(payload["ttl"]) : undefined,
+      line: strOf(payload["line"]).trim() || undefined,
+      mx: payload["mx"] !== undefined ? numOf(payload["mx"]) : undefined,
+      proxied: parseBoolFlag(payload["proxied"], false),
+      enabled: payload["enabled"] !== undefined ? parseBoolFlag(payload["enabled"], true) : undefined,
+      remark: payload["remark"] !== undefined ? strOf(payload["remark"]).trim() : undefined,
+    });
+    return c.json({ ok: true, item: record });
+  } catch (err) {
+    throw httpErr(400, "dns_update_failed", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/dns-accounts/:id/records/:recordId/status", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const id = paramInt(c, "id");
+  const recordId = c.req.param("recordId");
+  const acct = await repo.getDnsAccount(c.env, id, true);
+  if (!acct) throw httpErr(404, "not_found", "DNS 账号不存在");
+  const payload = await jsonBody(c);
+  const domain = strOf(payload["domain"]).trim();
+  const zoneId = strOf(payload["zone_id"]).trim();
+  const enabled = parseBoolFlag(payload["enabled"], true);
+  if (!domain) throw invalid("缺少域名参数 domain");
+  try {
+    await dnsProviders.setRecordStatus(c.env, acct, domain, zoneId, recordId, enabled);
+    return c.json({ ok: true, enabled });
+  } catch (err) {
+    throw httpErr(400, "dns_status_failed", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.delete("/api/v1/dns-accounts/:id/records/:recordId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const id = paramInt(c, "id");
+  const recordId = c.req.param("recordId");
+  const acct = await repo.getDnsAccount(c.env, id, true);
+  if (!acct) throw httpErr(404, "not_found", "DNS 账号不存在");
+  const domain = (c.req.query("domain") ?? "").trim();
+  const zoneId = (c.req.query("zone_id") ?? "").trim();
+  if (!domain) throw invalid("缺少域名参数 domain");
+  try {
+    await dnsProviders.deleteRecord(c.env, acct, domain, zoneId, recordId);
+    await repo.addEvent(c.env, "dns", messages.ev("解析记录已删除", messages.objServer(domain)), {
+      detail: `${acct.provider === "tencent" ? "腾讯云 DNSPod" : "Cloudflare"} / RecordId=${recordId}`,
+    });
+    return c.json({ ok: true });
+  } catch (err) {
+    throw httpErr(400, "dns_delete_failed", err instanceof Error ? err.message : String(err));
+  }
+});
+
+// -- SSL Certificates (Tencent Cloud 443 Free DV SSL + Auto Renewal) ----------
+
+function decorateCertItem(
+  cert: repo.SslCertificateRecord,
+  accountMap: Map<number, repo.DnsAccountRecord>,
+  nowSec: number,
+) {
+  const tcAcct = cert.tencent_account_id ? accountMap.get(cert.tencent_account_id) : undefined;
+  const dnsAcct = cert.dns_account_id ? accountMap.get(cert.dns_account_id) : undefined;
+  const remainingDays =
+    cert.cert_end_ts > 0 ? Math.ceil((cert.cert_end_ts - nowSec) / 86400) : null;
+  const expiringSoon =
+    remainingDays !== null && remainingDays <= (cert.renew_before_days || 7);
+  return {
+    id: cert.id,
+    domain: cert.domain,
+    tencent_account_id: cert.tencent_account_id,
+    tencent_account_label:
+      tcAcct?.label || (cert.has_custom_secret ? `独立密钥 (${cert.tencent_secret_id_preview})` : "未绑定"),
+    dns_verify_mode: cert.dns_verify_mode,
+    dns_account_id: cert.dns_account_id,
+    dns_account_label:
+      cert.dns_verify_mode === "tencent_auto"
+        ? "腾讯云同账号 DNS_AUTO"
+        : cert.dns_verify_mode === "manual"
+          ? "手动 DNS 验证"
+          : dnsAcct
+            ? `${dnsAcct.provider === "cloudflare" ? "Cloudflare" : "腾讯云 DNSPod"} · ${dnsAcct.label}`
+            : "未绑定解析账号",
+    dns_provider:
+      cert.dns_verify_mode === "tencent_auto"
+        ? "tencent_auto"
+        : cert.dns_verify_mode === "manual"
+          ? "manual"
+          : dnsAcct?.provider ?? "unknown",
+    dns_root_domain: cert.dns_root_domain,
+    cert_id: cert.cert_id,
+    pending_cert_id: cert.pending_cert_id,
+    has_pending_renewal: Boolean(cert.pending_cert_id),
+    encrypt_algo: cert.encrypt_algo,
+    status: cert.status,
+    tencent_status: cert.tencent_status,
+    status_name: cert.status_name,
+    dv_auth_domain: cert.dv_auth_domain,
+    dv_auth_sub_domain: cert.dv_auth_sub_domain,
+    dv_auth_type: cert.dv_auth_type,
+    dv_auth_value: cert.dv_auth_value,
+    dns_record_id: cert.dns_record_id,
+    dns_record_written: cert.dns_record_written,
+    cert_begin_time: cert.cert_begin_time,
+    cert_end_time: cert.cert_end_time,
+    cert_end_ts: cert.cert_end_ts,
+    remaining_days: remainingDays,
+    expiring_soon: expiringSoon,
+    auto_renew: cert.auto_renew,
+    renew_before_days: cert.renew_before_days,
+    clean_dns_after_issue: cert.clean_dns_after_issue,
+    last_error: cert.last_error,
+    last_checked_at: cert.last_checked_at,
+    last_renew_at: cert.last_renew_at,
+    remark: cert.remark,
+    created_at: cert.created_at,
+    updated_at: cert.updated_at,
+  };
+}
+
+app.get("/api/v1/certs", async (c) => {
+  await requireAdmin(c);
+  const [certs, accounts, swasServers] = await Promise.all([
+    repo.listSslCertificates(c.env, false),
+    repo.listDnsAccounts(c.env),
+    repo.listSwasServers(c.env),
+  ]);
+  const accountMap = new Map<number, repo.DnsAccountRecord>();
+  for (const a of accounts) accountMap.set(a.id, a);
+  const nowSec = Math.floor(Date.now() / 1000);
+  return c.json({
+    items: certs.map((item) => decorateCertItem(item, accountMap, nowSec)),
+    dns_accounts: accounts.map(sanitizeDnsAccount),
+    tencent_swas: swasServers
+      .filter((s) => s.provider === "tencent")
+      .map((s) => ({
+        id: s.id,
+        label: s.label,
+        access_key_id_preview: security.mask(s.access_key_id),
+      })),
+  });
+});
+
+app.post("/api/v1/certs/apply", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const domain = strOf(payload["domain"]).trim();
+  const modeRaw = strOf(payload["dns_verify_mode"]).trim().toLowerCase();
+  const dnsVerifyMode: repo.SslVerifyMode =
+    modeRaw === "tencent_auto"
+      ? "tencent_auto"
+      : modeRaw === "manual"
+        ? "manual"
+        : "dns_account";
+
+  try {
+    const res = await tencentSsl.applyManagedCertificate(c.env, {
+      domain,
+      tencent_account_id: numOf(payload["tencent_account_id"]) || undefined,
+      tencent_swas_id: numOf(payload["tencent_swas_id"]) || undefined,
+      tencent_secret_id: strOf(payload["tencent_secret_id"]).trim() || undefined,
+      tencent_secret_key: strOf(payload["tencent_secret_key"]).trim() || undefined,
+      dns_verify_mode: dnsVerifyMode,
+      dns_account_id: numOf(payload["dns_account_id"]) || undefined,
+      encrypt_algo: strOf(payload["encrypt_algo"]).toUpperCase() === "ECC" ? "ECC" : "RSA",
+      auto_renew: parseBoolFlag(payload["auto_renew"], true),
+      renew_before_days: Math.max(1, Math.min(30, numOf(payload["renew_before_days"]) || 7)),
+      clean_dns_after_issue: parseBoolFlag(payload["clean_dns_after_issue"], true),
+      contact_email: strOf(payload["contact_email"]).trim() || undefined,
+      remark: strOf(payload["remark"]).trim(),
+    });
+    const accounts = await repo.listDnsAccounts(c.env);
+    const accountMap = new Map(accounts.map((a) => [a.id, a]));
+    return c.json({
+      ok: true,
+      item: decorateCertItem(res.certificate, accountMap, Math.floor(Date.now() / 1000)),
+      dns_action: res.dnsAction,
+      verify_triggered: res.verifyTriggered,
+    });
+  } catch (err) {
+    throw httpErr(400, "ssl_apply_failed", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/certs/sync", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const tencentAccountId = numOf(payload["tencent_account_id"]);
+  if (!tencentAccountId) throw invalid("请选择要同步的腾讯云账号");
+  const modeRaw = strOf(payload["dns_verify_mode"]).trim().toLowerCase();
+  const dnsVerifyMode: repo.SslVerifyMode | undefined =
+    modeRaw === "tencent_auto" || modeRaw === "dns_account" || modeRaw === "manual"
+      ? modeRaw
+      : undefined;
+  try {
+    const res = await tencentSsl.syncAccountCertificates(c.env, tencentAccountId, {
+      dnsVerifyMode,
+      dnsAccountId: numOf(payload["dns_account_id"]) || undefined,
+      autoRenew: parseBoolFlag(payload["auto_renew"], true),
+    });
+    return c.json({ ok: true, ...res });
+  } catch (err) {
+    throw httpErr(400, "ssl_sync_failed", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/certs/reconcile", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const summary = await tencentSsl.reconcileCertificates(c.env, { force: true });
+  return c.json({ ok: true, summary });
+});
+
+app.patch("/api/v1/certs/:id", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const id = paramInt(c, "id");
+  const existing = await repo.getSslCertificate(c.env, id, false);
+  if (!existing) throw httpErr(404, "not_found", "证书记录不存在");
+  const payload = await jsonBody(c);
+  const patch: Partial<repo.SslCertificateCreateInput> = {};
+
+  if (payload["auto_renew"] !== undefined) {
+    patch.auto_renew = parseBoolFlag(payload["auto_renew"], existing.auto_renew);
+  }
+  if (payload["renew_before_days"] !== undefined) {
+    patch.renew_before_days = Math.max(
+      1,
+      Math.min(30, numOf(payload["renew_before_days"]) || 7),
+    );
+  }
+  if (payload["clean_dns_after_issue"] !== undefined) {
+    patch.clean_dns_after_issue = parseBoolFlag(
+      payload["clean_dns_after_issue"],
+      existing.clean_dns_after_issue,
+    );
+  }
+  if (payload["dns_verify_mode"] !== undefined) {
+    const mode = strOf(payload["dns_verify_mode"]).trim().toLowerCase();
+    if (mode === "tencent_auto" || mode === "dns_account" || mode === "manual") {
+      patch.dns_verify_mode = mode;
+    }
+  }
+  if (payload["dns_account_id"] !== undefined) {
+    patch.dns_account_id = numOf(payload["dns_account_id"]);
+    patch.dns_root_domain = "";
+    patch.dns_zone_id = "";
+  }
+  if (payload["remark"] !== undefined) {
+    patch.remark = strOf(payload["remark"]).trim();
+  }
+
+  await repo.updateSslCertificate(c.env, id, patch);
+  const updated = (await repo.getSslCertificate(c.env, id, false))!;
+  const accounts = await repo.listDnsAccounts(c.env);
+  const accountMap = new Map(accounts.map((a) => [a.id, a]));
+  return c.json({
+    ok: true,
+    item: decorateCertItem(updated, accountMap, Math.floor(Date.now() / 1000)),
+  });
+});
+
+app.post("/api/v1/certs/:id/verify", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const id = paramInt(c, "id");
+  try {
+    const res = await tencentSsl.refreshManagedCertificate(c.env, id, {
+      forceWriteDns: true,
+      triggerVerify: true,
+    });
+    const accounts = await repo.listDnsAccounts(c.env);
+    const accountMap = new Map(accounts.map((a) => [a.id, a]));
+    return c.json({
+      ok: true,
+      item: decorateCertItem(res.certificate, accountMap, Math.floor(Date.now() / 1000)),
+      dns_action: res.dnsAction,
+      verify_triggered: res.verifyTriggered,
+      just_issued: res.justIssued,
+    });
+  } catch (err) {
+    throw httpErr(400, "ssl_verify_failed", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/certs/:id/renew", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const id = paramInt(c, "id");
+  try {
+    const res = await tencentSsl.renewManagedCertificate(c.env, id, "manual");
+    const accounts = await repo.listDnsAccounts(c.env);
+    const accountMap = new Map(accounts.map((a) => [a.id, a]));
+    return c.json({
+      ok: true,
+      item: decorateCertItem(res.certificate, accountMap, Math.floor(Date.now() / 1000)),
+      new_cert_id: res.newCertId,
+      dns_action: res.dnsAction,
+      verify_triggered: res.verifyTriggered,
+    });
+  } catch (err) {
+    throw httpErr(400, "ssl_renew_failed", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.get("/api/v1/certs/:id/detail", async (c) => {
+  await requireAdmin(c);
+  const id = paramInt(c, "id");
+  const cert = await repo.getSslCertificate(c.env, id, true);
+  if (!cert) throw httpErr(404, "not_found", "证书记录不存在");
+  try {
+    const creds = await tencentSsl.resolveTencentCredsForCert(c.env, cert);
+    const targetCertId = cert.cert_id || cert.pending_cert_id;
+    if (!targetCertId) throw invalid("证书缺少 CertificateId");
+    const detail = await tencentSsl.describeTencentCertificateDetail(
+      c.env,
+      creds,
+      targetCertId,
+    );
+    let verification: {
+      issued: boolean;
+      localCheck: number;
+      caCheck: number;
+      failReason: string;
+    } | null = null;
+    if (detail.status === 0 || detail.status === 4 || cert.pending_cert_id) {
+      verification = await tencentSsl
+        .checkTencentDomainVerification(c.env, creds, cert.pending_cert_id || targetCertId)
+        .catch(() => null);
+    }
+    return c.json({
+      ok: true,
+      certificate_id: detail.certificateId,
+      domain: detail.domain || cert.domain,
+      status: detail.status,
+      status_name: detail.statusName,
+      status_msg: detail.statusMsg,
+      product_name: detail.productZhName,
+      encrypt_algo: detail.encryptAlgorithm,
+      cert_begin_time: detail.certBeginTime,
+      cert_end_time: detail.certEndTime,
+      certificate_public_key: detail.certificatePublicKey,
+      certificate_private_key: detail.certificatePrivateKey,
+      dv_auth: detail.dvAuth,
+      verification,
+    });
+  } catch (err) {
+    throw httpErr(400, "ssl_detail_failed", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.get("/api/v1/certs/:id/download", async (c) => {
+  await requireAdmin(c);
+  const id = paramInt(c, "id");
+  const cert = await repo.getSslCertificate(c.env, id, true);
+  if (!cert) throw httpErr(404, "not_found", "证书记录不存在");
+  if (!cert.cert_id) throw invalid("当前没有已签发的可下载证书");
+  try {
+    const creds = await tencentSsl.resolveTencentCredsForCert(c.env, cert);
+    const { contentBase64, contentType } = await tencentSsl.downloadTencentCertificateZip(
+      c.env,
+      creds,
+      cert.cert_id,
+    );
+    const binary = atob(contentBase64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    const safeName = cert.domain.replace(/[^a-zA-Z0-9._-]/g, "_");
+    return new Response(bytes, {
+      status: 200,
+      headers: {
+        "Content-Type": contentType || "application/zip",
+        "Content-Disposition": `attachment; filename="${safeName}_${cert.cert_id}_ssl.zip"`,
+        "Cache-Control": "no-store",
+      },
+    });
+  } catch (err) {
+    throw httpErr(400, "ssl_download_failed", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.delete("/api/v1/certs/:id", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const id = paramInt(c, "id");
+  const cert = await repo.getSslCertificate(c.env, id, true);
+  if (!cert) throw httpErr(404, "not_found", "证书记录不存在");
+  const deleteRemote = (c.req.query("delete_remote") ?? "") === "1";
+  let remoteError = "";
+  if (deleteRemote && (cert.cert_id || cert.pending_cert_id)) {
+    try {
+      const creds = await tencentSsl.resolveTencentCredsForCert(c.env, cert);
+      const targetId = cert.pending_cert_id || cert.cert_id;
+      await tencentSsl.deleteTencentCertificate(c.env, creds, targetId);
+    } catch (err) {
+      remoteError = err instanceof Error ? err.message : String(err);
+    }
+  }
+  await repo.deleteSslCertificate(c.env, id);
+  await repo.addEvent(c.env, "ssl", messages.ev("SSL 托管证书已移除", messages.objServer(cert.domain)), {
+    detail: remoteError
+      ? `本地托管已删除（腾讯云侧未删除：${remoteError}）`
+      : deleteRemote
+        ? `已删除托管记录及腾讯云侧证书`
+        : `已删除面板托管记录（腾讯云侧证书保留）`,
+  });
+  return c.json({ ok: true, remote_error: remoteError || undefined });
 });
 
 // -- Settings -----------------------------------------------------------------

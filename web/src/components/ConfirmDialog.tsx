@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react'
 import { TriangleAlert } from 'lucide-react'
 import { Modal } from './ui'
 
@@ -8,6 +9,7 @@ type Props = {
   hint?: string
   confirmText?: string
   busy?: boolean
+  children?: ReactNode
   onCancel: () => void
   onConfirm: () => void
 }
@@ -24,6 +26,7 @@ export default function ConfirmDialog({
   hint,
   confirmText = '确认删除',
   busy = false,
+  children,
   onCancel,
   onConfirm,
 }: Props) {
@@ -46,6 +49,7 @@ export default function ConfirmDialog({
       <div className="confirm-body">
         <p className="confirm-text">{message}</p>
         {hint && <p className="confirm-hint">{hint}</p>}
+        {children}
       </div>
     </Modal>
   )

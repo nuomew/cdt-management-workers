@@ -14,6 +14,7 @@ import {
 } from 'lucide-react'
 import type { DnsRecord, DnsState, Keepalive, Server, ShiftGroup } from '../types'
 import { timeAgo } from '../time'
+import CloudDnsPanel from './CloudDnsPanel'
 import { Badge, Empty, type Tone } from './ui'
 
 type Props = {
@@ -30,6 +31,8 @@ type Props = {
   onRemoveRecord: (record: string) => void
   onReorder: (ordered: string[]) => void
   onOpenSettings: () => void
+  onToast: (message: string, tone?: 'success' | 'error' | 'info') => void
+  onCloudChanged?: () => void
 }
 
 const STATE_META: Record<DnsRecord['state'], { tone: Tone; text: string }> = {
@@ -72,7 +75,10 @@ export default function DNSView({
   onRemoveRecord,
   onReorder,
   onOpenSettings,
+  onToast,
+  onCloudChanged,
 }: Props) {
+  const [subTab, setSubTab] = useState<'cloud' | 'ddns'>('cloud')
   const [adding, setAdding] = useState(false)
   const [draft, setDraft] = useState('')
   const [saving, setSaving] = useState(false)
@@ -128,86 +134,113 @@ export default function DNSView({
     <>
       <div className="page-head">
         <div>
-          <h1>DNS</h1>
+          <h1>域名解析</h1>
           <p>
-            一条域名只绑一台机器（或一个换班组），但一台机器、一个换班组都可以挂多条域名。
-            没绑的记录一律不动；机器一开机，指向它的所有记录一起更新 —— 不会再出现几台机器抢同一个域名。
-            绑到单台机器就固定指它，不跟随换班组的轮换走。
+            {subTab === 'cloud'
+              ? '接入腾讯云 DNSPod 与 Cloudflare 域名解析服务，统一管理域名与解析记录，并为「证书服务」提供自动验证解析能力。'
+              : '一条域名只绑一台机器（或一个换班组），但一台机器、一个换班组都可以挂多条域名；机器开机时自动把对应域名同步到最新公网 IP。'}
           </p>
         </div>
-        <div className="page-actions">
-          <button
-            className="btn"
-            onClick={onSyncAll}
-            disabled={!dns.enabled || syncingAll || dns.records.length === 0}
-          >
-            {syncingAll ? <LoaderCircle size={14} className="spin" /> : <RefreshCw size={14} />}
-            全部同步
-          </button>
-          <button className="btn primary" onClick={() => setAdding((value) => !value)}>
-            <Plus size={14} /> 添加记录名
-          </button>
-        </div>
+        {subTab === 'ddns' && (
+          <div className="page-actions">
+            <button
+              className="btn"
+              onClick={onSyncAll}
+              disabled={!dns.enabled || syncingAll || dns.records.length === 0}
+            >
+              {syncingAll ? <LoaderCircle size={14} className="spin" /> : <RefreshCw size={14} />}
+              全部同步
+            </button>
+            <button className="btn primary" onClick={() => setAdding((value) => !value)}>
+              <Plus size={14} /> 添加记录名
+            </button>
+          </div>
+        )}
       </div>
 
-      {!dns.enabled && (
-        <div className="notice amber">
-          <CircleSlash size={14} />
-          <span>DDNS 已关闭，这里的绑定不会生效。</span>
-          <button className="btn ghost sm" onClick={onOpenSettings}>
-            去设置里打开
-          </button>
-        </div>
-      )}
+      <div className="tabs page-tabs">
+        <button
+          type="button"
+          className={subTab === 'cloud' ? 'on' : ''}
+          onClick={() => setSubTab('cloud')}
+        >
+          云解析管理（腾讯云 / Cloudflare）
+        </button>
+        <button
+          type="button"
+          className={subTab === 'ddns' ? 'on' : ''}
+          onClick={() => setSubTab('ddns')}
+        >
+          DDNS 自动绑定{dns.records.length > 0 ? ` (${dns.records.length})` : ''}
+        </button>
+      </div>
 
-      {dns.enabled && !dns.configured && (
-        <div className="notice amber">
-          <CircleSlash size={14} />
-          <span>还没填 Cloudflare Token / Key，同步会直接失败。</span>
-          <button className="btn ghost sm" onClick={onOpenSettings}>
-            去设置
-          </button>
-        </div>
-      )}
-
-      {adding && (
-        <div className="card card-pad dns-add">
-          <div className="field" style={{ flex: 1 }}>
-            <label htmlFor="newRecord">新记录名</label>
-            <input
-              id="newRecord"
-              className="input"
-              value={draft}
-              autoFocus
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') void submit()
-                if (event.key === 'Escape') setAdding(false)
-              }}
-              placeholder="cdt-b.example.com"
-            />
-            <div className="hint">
-              必须是在 Cloudflare 里已经存在的 A 记录；Zone ID 留空时会按根域自动反查。
+      {subTab === 'cloud' ? (
+        <CloudDnsPanel onToast={onToast} onChanged={onCloudChanged} />
+      ) : (
+        <>
+          {!dns.enabled && (
+            <div className="notice amber">
+              <CircleSlash size={14} />
+              <span>DDNS 已关闭，这里的绑定不会生效。</span>
+              <button className="btn ghost sm" onClick={onOpenSettings}>
+                去设置里打开
+              </button>
             </div>
-          </div>
-          <div className="dns-add-actions">
-            <button className="btn" onClick={() => setAdding(false)} disabled={saving}>
-              取消
-            </button>
-            <button className="btn primary" onClick={() => void submit()} disabled={saving || !draft.trim()}>
-              {saving ? <LoaderCircle size={13} className="spin" /> : null} 添加
-            </button>
-          </div>
-        </div>
-      )}
+          )}
 
-      {dns.records.length === 0 ? (
-        <div className="card">
-          <Empty icon={<Globe2 size={20} />} title="还没有域名记录">
-            先添加一条记录名，再把它绑到某台机器或某个换班组上。第一次用需要先在设置里填 Cloudflare 的
-            Token 与 TTL。
-          </Empty>
-        </div>
+          {dns.enabled && !dns.configured && (
+            <div className="notice amber">
+              <CircleSlash size={14} />
+              <span>还没填 Cloudflare Token / Key，同步会直接失败。</span>
+              <button className="btn ghost sm" onClick={onOpenSettings}>
+                去设置
+              </button>
+            </div>
+          )}
+
+          {adding && (
+            <div className="card card-pad dns-add">
+              <div className="field" style={{ flex: 1 }}>
+                <label htmlFor="newRecord">新记录名</label>
+                <input
+                  id="newRecord"
+                  className="input"
+                  value={draft}
+                  autoFocus
+                  onChange={(event) => setDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') void submit()
+                    if (event.key === 'Escape') setAdding(false)
+                  }}
+                  placeholder="cdt-b.example.com"
+                />
+                <div className="hint">
+                  必须是在 Cloudflare 里已经存在的 A 记录；Zone ID 留空时会按根域自动反查。
+                </div>
+              </div>
+              <div className="dns-add-actions">
+                <button className="btn" onClick={() => setAdding(false)} disabled={saving}>
+                  取消
+                </button>
+                <button
+                  className="btn primary"
+                  onClick={() => void submit()}
+                  disabled={saving || !draft.trim()}
+                >
+                  {saving ? <LoaderCircle size={13} className="spin" /> : null} 添加
+                </button>
+              </div>
+            </div>
+          )}
+
+          {dns.records.length === 0 ? (
+            <div className="card">
+              <Empty icon={<Globe2 size={20} />} title="还没有域名记录">
+                先添加一条记录名，再把它绑到某台机器或某个换班组上。第一次用需要先在设置里填 Cloudflare 的
+                Token 与 TTL。
+              </Empty>
+            </div>
       ) : (
         <div className="dns-list">
           {dns.records.map((record) => {
@@ -355,6 +388,8 @@ export default function DNSView({
             )
           })}
         </div>
+      )}
+        </>
       )}
     </>
   )

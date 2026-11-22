@@ -193,6 +193,8 @@ export type Overview = {
   keepalives: Keepalive[]
   groups: ShiftGroup[]
   dns: DnsState
+  dns_accounts_count?: number
+  ssl_certs_count?: number
   notifications: {
     channels: string[]
     telegram: boolean
@@ -799,5 +801,132 @@ export type AdminDashboardPayload = {
     bandwidth_mbps?: number
   }[]
 }
+
+export type DnsAccountProvider = 'tencent' | 'cloudflare'
+export type DnsAccountAuthMode = 'cam' | 'token' | 'global_key'
+
+export type DnsAccount = {
+  id: number
+  provider: DnsAccountProvider
+  label: string
+  auth_mode: DnsAccountAuthMode
+  cred_id: string
+  cred_id_preview: string
+  has_secret: boolean
+  remark: string
+  created_at: number
+  updated_at: number
+}
+
+export type ImportableDnsSources = {
+  cloudflare_ddns: boolean
+  tencent_swas: {
+    id: number
+    label: string
+    region_id: string
+    access_key_id_preview: string
+  }[]
+}
+
+export type CloudDnsDomain = {
+  id: string
+  name: string
+  status: string
+  record_count: number
+  ttl: number
+  plan: string
+  name_servers: string[]
+  updated_on: string
+  provider: DnsAccountProvider
+}
+
+export type CloudDnsRecord = {
+  id: string
+  domain: string
+  zone_id: string
+  name: string
+  full_name: string
+  type: string
+  value: string
+  ttl: number
+  line: string
+  mx?: number
+  proxied?: boolean
+  enabled: boolean
+  remark: string
+  updated_on: string
+  provider: DnsAccountProvider
+}
+
+export type SslVerifyMode = 'tencent_auto' | 'dns_account' | 'manual'
+export type SslCertStatus = 'pending_dns' | 'verifying' | 'issued' | 'failed' | 'expired'
+
+export type SslCertificateItem = {
+  id: number
+  domain: string
+  tencent_account_id: number
+  tencent_account_label: string
+  dns_verify_mode: SslVerifyMode
+  dns_account_id: number
+  dns_account_label: string
+  dns_provider: 'tencent' | 'cloudflare' | 'tencent_auto' | 'manual' | 'unknown'
+  dns_root_domain: string
+  cert_id: string
+  pending_cert_id: string
+  has_pending_renewal: boolean
+  encrypt_algo: 'RSA' | 'ECC'
+  status: SslCertStatus
+  tencent_status: number
+  status_name: string
+  dv_auth_domain: string
+  dv_auth_sub_domain: string
+  dv_auth_type: string
+  dv_auth_value: string
+  dns_record_id: string
+  dns_record_written: boolean
+  cert_begin_time: string
+  cert_end_time: string
+  cert_end_ts: number
+  remaining_days: number | null
+  expiring_soon: boolean
+  auto_renew: boolean
+  renew_before_days: number
+  clean_dns_after_issue: boolean
+  last_error: string
+  last_checked_at: number
+  last_renew_at: number
+  remark: string
+  created_at: number
+  updated_at: number
+}
+
+export type SslCertDetailResponse = {
+  ok: boolean
+  certificate_id: string
+  domain: string
+  status: number
+  status_name: string
+  status_msg: string
+  product_name: string
+  encrypt_algo: string
+  cert_begin_time: string
+  cert_end_time: string
+  certificate_public_key: string
+  certificate_private_key: string
+  dv_auth: {
+    domain: string
+    subDomain: string
+    fullHost: string
+    verifyType: 'TXT' | 'CNAME'
+    value: string
+  } | null
+  verification: {
+    issued: boolean
+    localCheck: number
+    caCheck: number
+    failReason: string
+  } | null
+}
+
 
 

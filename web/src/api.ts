@@ -86,6 +86,22 @@ export function post<T>(path: string, payload?: unknown, timeoutMs?: number): Pr
   })
 }
 
+export function put<T>(path: string, payload?: unknown, timeoutMs?: number): Promise<T> {
+  return api<T>(path, {
+    method: 'PUT',
+    body: payload === undefined ? undefined : JSON.stringify(payload),
+    timeoutMs,
+  })
+}
+
+export function patch<T>(path: string, payload?: unknown, timeoutMs?: number): Promise<T> {
+  return api<T>(path, {
+    method: 'PATCH',
+    body: payload === undefined ? undefined : JSON.stringify(payload),
+    timeoutMs,
+  })
+}
+
 export function del<T>(path: string, timeoutMs?: number): Promise<T> {
   return api<T>(path, { method: 'DELETE', timeoutMs })
 }

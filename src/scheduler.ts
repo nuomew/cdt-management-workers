@@ -43,6 +43,7 @@ import * as repo from "./repo";
 import * as dns from "./dns";
 import * as billing from "./billing";
 import * as swas from "./swas";
+import * as tencentSsl from "./tencent_ssl";
 import { dailyReport, reconcileAll } from "./shift";
 import { resolveSettings } from "./settings";
 
@@ -108,6 +109,14 @@ export async function runReconcile(env: Env): Promise<void> {
     await dns.reconcile(runtimeEnv, await repo.getSettings(runtimeEnv));
   } catch (e) {
     console.error("DNS reconcile failed", e);
+  }
+
+  // Tencent Cloud SSL certificates: poll in-flight validations (~2 min) and
+  // auto-renew certificates expiring within 7 days (~15 min).
+  try {
+    await tencentSsl.reconcileCertificates(runtimeEnv);
+  } catch (e) {
+    console.error("SSL certificate reconcile failed", e);
   }
 
   // Lightweight application servers: read-only status + traffic package refresh.
