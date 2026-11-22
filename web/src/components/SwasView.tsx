@@ -136,9 +136,6 @@ export default function SwasView({
       <div className="page-head">
         <div>
           <h1>轻量服务器</h1>
-          <p>
-            统一管理阿里云轻量应用服务器（SWAS）与腾讯云轻量应用服务器（Lighthouse）：支持套餐流量包监控、一键发现导入、包年包月询价开通与续费、防火墙规则、改密改名、快照与自定义镜像、VNC 远程终端与重装系统。
-          </p>
         </div>
         <div className="page-actions">
           {servers.length > 0 && (
