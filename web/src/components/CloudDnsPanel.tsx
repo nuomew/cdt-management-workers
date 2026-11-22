@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Cloud,
   Edit3,
   Globe2,
@@ -29,6 +31,7 @@ import { Badge, Empty, Modal, Segmented, Switch } from './ui'
 
 const RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'NS', 'SRV', 'CAA'] as const
 const DNSPOD_LINES = ['默认', '电信', '联通', '移动', '教育网', '境外', '搜索引擎'] as const
+const RECORDS_PAGE_SIZE = 20
 
 type ToastFn = (message: string, tone?: 'success' | 'error' | 'info') => void
 
@@ -204,6 +207,8 @@ export default function CloudDnsPanel({ onToast, onChanged }: Props) {
     }
   }, [selectedAccountId, selectedDomain, loadRecords])
 
+  const [page, setPage] = useState(1)
+
   const filteredRecords = useMemo(() => {
     const kw = keyword.trim().toLowerCase()
     const tf = typeFilter.trim().toUpperCase()
@@ -216,6 +221,31 @@ export default function CloudDnsPanel({ onToast, onChanged }: Props) {
       return true
     })
   }, [records, keyword, typeFilter])
+
+  useEffect(() => {
+    setPage(1)
+  }, [selectedAccountId, selectedDomain?.name, keyword, typeFilter])
+
+  const totalPages = Math.max(1, Math.ceil(filteredRecords.length / RECORDS_PAGE_SIZE))
+  const safePage = Math.min(page, totalPages)
+  const pagedRecords = useMemo(() => {
+    const start = (safePage - 1) * RECORDS_PAGE_SIZE
+    return filteredRecords.slice(start, start + RECORDS_PAGE_SIZE)
+  }, [filteredRecords, safePage])
+
+  const pageTokens = useMemo<(number | 'ellipsis')[]>(() => {
+    if (totalPages <= 7) {
+      return Array.from({ length: totalPages }, (_, i) => i + 1)
+    }
+    const items: (number | 'ellipsis')[] = [1]
+    const left = Math.max(2, safePage - 1)
+    const right = Math.min(totalPages - 1, safePage + 1)
+    if (left > 2) items.push('ellipsis')
+    for (let p = left; p <= right; p += 1) items.push(p)
+    if (right < totalPages - 1) items.push('ellipsis')
+    items.push(totalPages)
+    return items
+  }, [safePage, totalPages])
 
   function openNewAccount(provider: DnsAccountProvider = 'tencent') {
     setAccountModal({
@@ -702,115 +732,163 @@ export default function CloudDnsPanel({ onToast, onChanged }: Props) {
             ) : filteredRecords.length === 0 ? (
               <div className="cloud-dns-empty-sm">暂无匹配的解析记录</div>
             ) : (
-              <div className="cloud-dns-table-wrap">
-                <table className="cloud-dns-table">
-                  <thead>
-                    <tr>
-                      <th>主机记录</th>
-                      <th>类型</th>
-                      <th>记录值</th>
-                      <th>{selectedAccount.provider === 'tencent' ? '线路' : '代理'}</th>
-                      <th>TTL</th>
-                      <th>状态</th>
-                      <th style={{ textAlign: 'right' }}>操作</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredRecords.map((rec) => {
-                      const isToggling = togglingRecordId === rec.id
-                      const canCfProxy =
-                        selectedAccount.provider === 'cloudflare' &&
-                        ['A', 'AAAA', 'CNAME'].includes(rec.type.toUpperCase())
-                      return (
-                        <tr key={rec.id} className={!rec.enabled ? 'is-disabled' : ''}>
-                          <td>
-                            <div className="mono-strong">{rec.name}</div>
-                            {rec.remark && <div className="muted-xs">{rec.remark}</div>}
-                          </td>
-                          <td>
-                            <Badge tone="blue" dot={false}>
-                              {rec.type}
-                            </Badge>
-                          </td>
-                          <td className="cloud-dns-val-cell">
-                            <code title={rec.value}>{rec.value}</code>
-                            {rec.mx !== undefined && (
-                              <span className="muted-xs" style={{ marginLeft: 6 }}>
-                                MX:{rec.mx}
-                              </span>
-                            )}
-                          </td>
-                          <td>
-                            {selectedAccount.provider === 'tencent' ? (
-                              <span>{rec.line || '默认'}</span>
-                            ) : canCfProxy ? (
-                              <button
-                                type="button"
-                                className={`cf-proxy-btn${rec.proxied ? ' on' : ''}`}
-                                disabled={isToggling}
-                                onClick={() => void toggleRecordState(rec)}
-                                title={rec.proxied ? '点击关闭代理（仅 DNS）' : '点击开启 Cloudflare 代理'}
-                              >
-                                <Cloud size={12} />
-                                {rec.proxied ? '已代理' : '仅 DNS'}
-                              </button>
-                            ) : (
-                              <span className="muted-xs">仅 DNS</span>
-                            )}
-                          </td>
-                          <td className="mono-muted">
-                            {rec.provider === 'cloudflare' && rec.ttl === 1 ? 'Auto' : `${rec.ttl}s`}
-                          </td>
-                          <td>
-                            {rec.enabled ? (
-                              <Badge tone="green">正常</Badge>
-                            ) : (
-                              <Badge tone="gray">已暂停</Badge>
-                            )}
-                          </td>
-                          <td>
-                            <div className="cloud-dns-row-ops">
-                              {selectedAccount.provider === 'tencent' && (
+              <>
+                <div className="cloud-dns-table-wrap">
+                  <table className="cloud-dns-table">
+                    <thead>
+                      <tr>
+                        <th>主机记录</th>
+                        <th>类型</th>
+                        <th>记录值</th>
+                        <th>{selectedAccount.provider === 'tencent' ? '线路' : '代理'}</th>
+                        <th>TTL</th>
+                        <th>状态</th>
+                        <th style={{ textAlign: 'right' }}>操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pagedRecords.map((rec) => {
+                        const isToggling = togglingRecordId === rec.id
+                        const canCfProxy =
+                          selectedAccount.provider === 'cloudflare' &&
+                          ['A', 'AAAA', 'CNAME'].includes(rec.type.toUpperCase())
+                        return (
+                          <tr key={rec.id} className={!rec.enabled ? 'is-disabled' : ''}>
+                            <td>
+                              <div className="mono-strong">{rec.name}</div>
+                              {rec.remark && <div className="muted-xs">{rec.remark}</div>}
+                            </td>
+                            <td>
+                              <Badge tone="blue" dot={false}>
+                                {rec.type}
+                              </Badge>
+                            </td>
+                            <td className="cloud-dns-val-cell">
+                              <code title={rec.value}>{rec.value}</code>
+                              {rec.mx !== undefined && (
+                                <span className="muted-xs" style={{ marginLeft: 6 }}>
+                                  MX:{rec.mx}
+                                </span>
+                              )}
+                            </td>
+                            <td>
+                              {selectedAccount.provider === 'tencent' ? (
+                                <span>{rec.line || '默认'}</span>
+                              ) : canCfProxy ? (
+                                <button
+                                  type="button"
+                                  className={`cf-proxy-btn${rec.proxied ? ' on' : ''}`}
+                                  disabled={isToggling}
+                                  onClick={() => void toggleRecordState(rec)}
+                                  title={rec.proxied ? '点击关闭代理（仅 DNS）' : '点击开启 Cloudflare 代理'}
+                                >
+                                  <Cloud size={12} />
+                                  {rec.proxied ? '已代理' : '仅 DNS'}
+                                </button>
+                              ) : (
+                                <span className="muted-xs">仅 DNS</span>
+                              )}
+                            </td>
+                            <td className="mono-muted">
+                              {rec.provider === 'cloudflare' && rec.ttl === 1 ? 'Auto' : `${rec.ttl}s`}
+                            </td>
+                            <td>
+                              {rec.enabled ? (
+                                <Badge tone="green">正常</Badge>
+                              ) : (
+                                <Badge tone="gray">已暂停</Badge>
+                              )}
+                            </td>
+                            <td>
+                              <div className="cloud-dns-row-ops">
+                                {selectedAccount.provider === 'tencent' && (
+                                  <button
+                                    type="button"
+                                    className="btn ghost icon sm"
+                                    disabled={isToggling}
+                                    title={rec.enabled ? '暂停解析' : '启用解析'}
+                                    onClick={() => void toggleRecordState(rec)}
+                                  >
+                                    {isToggling ? (
+                                      <LoaderCircle size={13} className="spin" />
+                                    ) : rec.enabled ? (
+                                      <Pause size={13} />
+                                    ) : (
+                                      <Play size={13} />
+                                    )}
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   className="btn ghost icon sm"
-                                  disabled={isToggling}
-                                  title={rec.enabled ? '暂停解析' : '启用解析'}
-                                  onClick={() => void toggleRecordState(rec)}
+                                  title="编辑记录"
+                                  onClick={() => openEditRecord(rec)}
                                 >
-                                  {isToggling ? (
-                                    <LoaderCircle size={13} className="spin" />
-                                  ) : rec.enabled ? (
-                                    <Pause size={13} />
-                                  ) : (
-                                    <Play size={13} />
-                                  )}
+                                  <Edit3 size={13} />
                                 </button>
-                              )}
-                              <button
-                                type="button"
-                                className="btn ghost icon sm"
-                                title="编辑记录"
-                                onClick={() => openEditRecord(rec)}
-                              >
-                                <Edit3 size={13} />
-                              </button>
-                              <button
-                                type="button"
-                                className="btn ghost icon sm"
-                                title="删除记录"
-                                onClick={() => requestDeleteRecord(rec)}
-                              >
-                                <Trash2 size={13} />
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
+                                <button
+                                  type="button"
+                                  className="btn ghost icon sm"
+                                  title="删除记录"
+                                  onClick={() => requestDeleteRecord(rec)}
+                                >
+                                  <Trash2 size={13} />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                {totalPages > 1 && (
+                  <div className="cloud-dns-pager" aria-label="解析记录分页">
+                    <span className="cloud-dns-pager-info">
+                      共 {filteredRecords.length} 条 · 第{' '}
+                      {(safePage - 1) * RECORDS_PAGE_SIZE + 1}–
+                      {Math.min(safePage * RECORDS_PAGE_SIZE, filteredRecords.length)} 条（
+                      {safePage} / {totalPages} 页）
+                    </span>
+                    <div className="cloud-dns-pager-controls">
+                      <button
+                        type="button"
+                        className="cloud-dns-page-btn"
+                        disabled={safePage <= 1}
+                        onClick={() => setPage(Math.max(1, safePage - 1))}
+                      >
+                        <ChevronLeft size={13} /> 上一页
+                      </button>
+                      {pageTokens.map((token, idx) =>
+                        token === 'ellipsis' ? (
+                          <span key={`e-${idx}`} className="cloud-dns-page-ellipsis">
+                            …
+                          </span>
+                        ) : (
+                          <button
+                            key={token}
+                            type="button"
+                            className={`cloud-dns-page-btn${token === safePage ? ' on' : ''}`}
+                            aria-current={token === safePage ? 'page' : undefined}
+                            onClick={() => setPage(token)}
+                          >
+                            {token}
+                          </button>
+                        ),
+                      )}
+                      <button
+                        type="button"
+                        className="cloud-dns-page-btn"
+                        disabled={safePage >= totalPages}
+                        onClick={() => setPage(Math.min(totalPages, safePage + 1))}
+                      >
+                        下一页 <ChevronRight size={13} />
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </>
             )}
           </section>
         </div>
