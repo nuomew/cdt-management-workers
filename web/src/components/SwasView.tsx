@@ -139,24 +139,24 @@ export default function SwasView({
         </div>
         <div className="page-actions">
           {servers.length > 0 && (
-            <div className="view-toggle" role="group" aria-label="云厂商筛选">
+            <div className="segmented" role="group" aria-label="云厂商筛选">
               <button
                 type="button"
-                className={`btn sm${providerFilter === 'all' ? ' primary' : ''}`}
+                className={providerFilter === 'all' ? 'on' : ''}
                 onClick={() => setProviderFilter('all')}
               >
                 全部 ({servers.length})
               </button>
               <button
                 type="button"
-                className={`btn sm${providerFilter === 'aliyun' ? ' primary' : ''}`}
+                className={providerFilter === 'aliyun' ? 'on' : ''}
                 onClick={() => setProviderFilter('aliyun')}
               >
                 阿里云 ({aliyunCount})
               </button>
               <button
                 type="button"
-                className={`btn sm${providerFilter === 'tencent' ? ' primary' : ''}`}
+                className={providerFilter === 'tencent' ? 'on' : ''}
                 onClick={() => setProviderFilter('tencent')}
               >
                 腾讯云 ({tencentCount})
@@ -164,10 +164,10 @@ export default function SwasView({
             </div>
           )}
           {servers.length > 1 && (
-            <div className="view-toggle" role="group" aria-label="视图切换">
+            <div className="segmented" role="group" aria-label="视图切换">
               <button
                 type="button"
-                className={`btn sm${viewMode === 'card' ? ' primary' : ''}`}
+                className={viewMode === 'card' ? 'on' : ''}
                 title="卡片视图"
                 onClick={() => setViewMode('card')}
               >
@@ -175,7 +175,7 @@ export default function SwasView({
               </button>
               <button
                 type="button"
-                className={`btn sm${viewMode === 'list' ? ' primary' : ''}`}
+                className={viewMode === 'list' ? 'on' : ''}
                 title="列表视图"
                 onClick={() => setViewMode('list')}
               >

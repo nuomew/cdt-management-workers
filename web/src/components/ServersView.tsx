@@ -120,10 +120,10 @@ export default function ServersView({
         </div>
         <div className="page-actions">
           {servers.length > 1 && (
-            <div className="view-toggle" role="group" aria-label="视图切换">
+            <div className="segmented" role="group" aria-label="视图切换">
               <button
                 type="button"
-                className={`btn sm${viewMode === 'card' ? ' primary' : ''}`}
+                className={viewMode === 'card' ? 'on' : ''}
                 title="卡片视图"
                 onClick={() => setViewMode('card')}
               >
@@ -131,7 +131,7 @@ export default function ServersView({
               </button>
               <button
                 type="button"
-                className={`btn sm${viewMode === 'list' ? ' primary' : ''}`}
+                className={viewMode === 'list' ? 'on' : ''}
                 title="列表视图"
                 onClick={() => setViewMode('list')}
               >
