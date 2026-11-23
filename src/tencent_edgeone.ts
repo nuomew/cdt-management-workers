@@ -468,6 +468,8 @@ export async function createAccelerationDomain(
       throw new Error(`加速域名 ${domainName} 已存在`);
     }
     const nowIso = new Date().toISOString();
+    const simulateExpiring = domainName.startsWith("expiring.");
+    const simulateExpiringFree = domainName.startsWith("expfree.");
     z.domains.set(domainName, {
       zoneId,
       domainName,
@@ -482,8 +484,26 @@ export async function createAccelerationDomain(
       httpOriginPort: httpPort,
       httpsOriginPort: httpsPort,
       ipv6Status,
-      certMode: "none",
-      certificates: [],
+      certMode: simulateExpiring
+        ? "sslcert"
+        : simulateExpiringFree
+          ? "eofreecert"
+          : "none",
+      certificates:
+        simulateExpiring || simulateExpiringFree
+          ? [
+              {
+                certId: simulateExpiring ? `eoExpOld_${domainName.slice(0, 12)}` : "eoFreeExp01",
+                alias: simulateExpiring ? "Expiring External Cert" : "Expiring EdgeOne Free Cert",
+                type: simulateExpiring ? "managed" : "default",
+                expireTime: new Date(Date.now() + 3 * 86400_000).toISOString(),
+                deployTime: new Date(Date.now() - 86 * 86400_000).toISOString(),
+                signAlgo: "RSA 2048",
+                commonName: domainName,
+                status: "deployed",
+              },
+            ]
+          : [],
       createdOn: nowIso,
       modifiedOn: nowIso,
     });
@@ -1034,3 +1054,101 @@ export async function getZoneAnalytics(
     series,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Auto-Certificate Policy & Watched Scope Persistence (stored in `settings`)
+// ---------------------------------------------------------------------------
+
+const AUTO_CERT_ENABLED_KEY = "edgeone_auto_cert_enabled";
+const AUTO_CERT_DAYS_KEY = "edgeone_auto_cert_days";
+const WATCHED_SCOPES_KEY = "edgeone_watched_scopes";
+
+export interface EdgeOneAutoCertConfig {
+  enabled: boolean;
+  days: number;
+}
+
+export interface EdgeOneWatchedScope {
+  accountId: number;
+  site: EdgeOneSite;
+}
+
+/**
+ * Read EdgeOne automatic expiring-certificate replacement/application policy.
+ * Enabled by default with a 7-day threshold so expiring CDN hosts are protected
+ * out of the box without manual setup.
+ */
+export async function getEdgeOneAutoCertConfig(env: Env): Promise<EdgeOneAutoCertConfig> {
+  const settings = await repo.getSettings(env);
+  const enabled = (settings[AUTO_CERT_ENABLED_KEY] ?? "1") !== "0";
+  const rawDays = Number(settings[AUTO_CERT_DAYS_KEY] ?? "7");
+  const days = Number.isFinite(rawDays)
+    ? Math.max(1, Math.min(30, Math.trunc(rawDays)))
+    : 7;
+  return { enabled, days };
+}
+
+export async function setEdgeOneAutoCertConfig(
+  env: Env,
+  input: Partial<EdgeOneAutoCertConfig>,
+): Promise<EdgeOneAutoCertConfig> {
+  const current = await getEdgeOneAutoCertConfig(env);
+  const next: EdgeOneAutoCertConfig = {
+    enabled: input.enabled !== undefined ? Boolean(input.enabled) : current.enabled,
+    days:
+      input.days !== undefined
+        ? Math.max(1, Math.min(30, Math.trunc(Number(input.days) || 7)))
+        : current.days,
+  };
+  await repo.setSettings(env, {
+    [AUTO_CERT_ENABLED_KEY]: next.enabled ? "1" : "0",
+    [AUTO_CERT_DAYS_KEY]: String(next.days),
+  });
+  return next;
+}
+
+export async function listWatchedEdgeOneScopes(env: Env): Promise<EdgeOneWatchedScope[]> {
+  const raw = await repo.getSetting(env, WATCHED_SCOPES_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const seen = new Set<string>();
+    const out: EdgeOneWatchedScope[] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      const accountId = Math.trunc(Number((item as Record<string, unknown>)["accountId"] ?? (item as Record<string, unknown>)["account_id"] ?? 0));
+      if (!Number.isFinite(accountId) || accountId <= 0) continue;
+      const site = normalizeSite(String((item as Record<string, unknown>)["site"] ?? "cn"));
+      const key = `${accountId}:${site}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ accountId, site });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Remember an active `(accountId, site)` pair that successfully returned
+ * EdgeOne zones so Cron knows which Tencent site (`cn` vs `intl`) to audit.
+ */
+export async function recordWatchedEdgeOneScope(
+  env: Env,
+  accountId: number,
+  site: EdgeOneSite,
+): Promise<void> {
+  if (!Number.isFinite(accountId) || accountId <= 0) return;
+  const cleanSite = normalizeSite(site);
+  const current = await listWatchedEdgeOneScopes(env);
+  if (current.some((s) => s.accountId === accountId && s.site === cleanSite)) {
+    return;
+  }
+  const next = [...current, { accountId, site: cleanSite }].slice(-32);
+  await repo.setSettings(env, {
+    [WATCHED_SCOPES_KEY]: JSON.stringify(next),
+  });
+}
+

@@ -23,6 +23,9 @@ import { timeAgo } from '../time'
 import type {
   DnsAccount,
   EdgeOneAnalyticsResponse,
+  EdgeOneAutoCertActionResult,
+  EdgeOneAutoCertCheckSummary,
+  EdgeOneAutoCertConfig,
   EdgeOneDomain,
   EdgeOneManagedCertOption,
   EdgeOneSite,
@@ -60,10 +63,45 @@ type DomainFormState = {
 type CertModalState = {
   domain: EdgeOneDomain
   mode: 'sslcert' | 'eofreecert' | 'none'
-  certSource: 'managed' | 'manual'
+  certSource: 'auto_apply' | 'managed' | 'manual'
   sslCertId: number
   manualCertId: string
   autoSync: boolean
+  autoVerifyMode: 'auto' | 'dns_account' | 'tencent_auto'
+  autoDnsAccountId: number
+}
+
+function parseCertExpireDays(d: EdgeOneDomain): {
+  expireTime: string
+  daysLeft: number | null
+  certId: string
+} {
+  let bestMs = 0
+  let bestTime = ''
+  let bestCertId = ''
+  for (const c of d.certificates) {
+    const raw = (c.expireTime || '').trim()
+    let ms = 0
+    if (raw) {
+      const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)
+        ? `${raw.replace(' ', 'T')}+08:00`
+        : raw
+      const parsed = Date.parse(normalized)
+      if (Number.isFinite(parsed)) ms = parsed
+    }
+    if (!bestCertId && c.certId) {
+      bestCertId = c.certId
+      bestMs = ms
+      bestTime = raw
+    } else if (ms > bestMs) {
+      bestMs = ms
+      bestTime = raw
+      if (c.certId) bestCertId = c.certId
+    }
+  }
+  if (!bestMs) return { expireTime: bestTime, daysLeft: null, certId: bestCertId }
+  const daysLeft = Math.ceil((bestMs - Date.now()) / 86_400_000)
+  return { expireTime: bestTime, daysLeft, certId: bestCertId }
 }
 
 function areaLabel(area: string): string {
@@ -294,7 +332,11 @@ function EdgeOneMetricChart({
 
 export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Props) {
   const [accounts, setAccounts] = useState<DnsAccount[]>([])
+  const [dnsAccounts, setDnsAccounts] = useState<DnsAccount[]>([])
   const [managedCerts, setManagedCerts] = useState<EdgeOneManagedCertOption[]>([])
+  const [autoCert, setAutoCert] = useState<EdgeOneAutoCertConfig>({ enabled: true, days: 7 })
+  const [savingAutoCert, setSavingAutoCert] = useState(false)
+  const [checkingAutoCert, setCheckingAutoCert] = useState(false)
   const [selectedAccountId, setSelectedAccountId] = useState<number>(0)
   const [site, setSite] = useState<EdgeOneSite>(() => {
     try {
@@ -366,10 +408,14 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
     try {
       const res = await api<{
         accounts: DnsAccount[]
+        dns_accounts?: DnsAccount[]
+        auto_cert?: EdgeOneAutoCertConfig
         managed_certs: EdgeOneManagedCertOption[]
       }>('/api/v1/edgeone/accounts')
       const list = res.accounts ?? []
       setAccounts(list)
+      setDnsAccounts(res.dns_accounts ?? list)
+      if (res.auto_cert) setAutoCert(res.auto_cert)
       setManagedCerts(res.managed_certs ?? [])
       setSelectedAccountId((prev) => {
         if (prev && list.some((a) => a.id === prev)) return prev
@@ -660,29 +706,157 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
     }
   }
 
+  async function toggleAutoCertEnabled(nextEnabled: boolean) {
+    setSavingAutoCert(true)
+    try {
+      const res = await post<{ ok: boolean; auto_cert: EdgeOneAutoCertConfig }>(
+        '/api/v1/edgeone/auto-cert/config',
+        { enabled: nextEnabled, days: autoCert.days },
+      )
+      setAutoCert(res.auto_cert)
+      onToast(
+        nextEnabled
+          ? `已开启：CDN 域名证书到期 ≤ ${res.auto_cert.days} 天自动申请并替换`
+          : '已关闭 CDN 临期证书自动巡检',
+        'success',
+      )
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : '更新自动申请策略失败', 'error')
+    } finally {
+      setSavingAutoCert(false)
+    }
+  }
+
+  async function runAutoCertCheck() {
+    if (!selectedAccountId || !selectedZoneId) return
+    setCheckingAutoCert(true)
+    try {
+      const res = await post<{ ok: boolean; summary: EdgeOneAutoCertCheckSummary }>(
+        '/api/v1/edgeone/auto-cert/check',
+        {
+          account_id: selectedAccountId,
+          site,
+          zone_id: selectedZoneId,
+        },
+        SLOW_TIMEOUT_MS,
+      )
+      const s = res.summary
+      if (s.errors.length > 0 && s.replaced === 0 && s.applied === 0 && s.renewed === 0) {
+        onToast(`检测完成但有异常：${s.errors[0]}`, 'error')
+      } else if (s.replaced > 0 || s.applied > 0 || s.renewed > 0 || s.pending > 0) {
+        const parts: string[] = []
+        if (s.replaced > 0) parts.push(`已替换 ${s.replaced} 个`)
+        if (s.applied > 0) parts.push(`已申请 ${s.applied} 个`)
+        if (s.renewed > 0) parts.push(`已续签 ${s.renewed} 个`)
+        if (s.pending > 0) parts.push(`待签发 ${s.pending} 个`)
+        onToast(`巡检 ${s.scannedDomains} 个域名：${parts.join('，')}`, 'success')
+      } else {
+        onToast(
+          `已检测 ${s.scannedDomains} 个域名，暂无到期 ≤ ${s.days} 天的临期证书`,
+          'info',
+        )
+      }
+      await Promise.all([loadDomains(), loadBootstrap()])
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : '检测临期证书失败', 'error')
+    } finally {
+      setCheckingAutoCert(false)
+    }
+  }
+
+  async function quickAutoApplyCert(d: EdgeOneDomain) {
+    if (!selectedAccountId || !selectedZoneId) return
+    const exp = parseCertExpireDays(d)
+    setBusyDomain(d.domainName)
+    try {
+      const res = await post<{ ok: boolean; result: EdgeOneAutoCertActionResult }>(
+        `/api/v1/edgeone/zones/${encodeURIComponent(selectedZoneId)}/cert/auto-apply`,
+        {
+          account_id: selectedAccountId,
+          site,
+          zone_name: selectedZone?.zoneName ?? '',
+          domain: d.domainName,
+          old_cert_id: exp.certId,
+          old_cert_mode: d.certMode,
+        },
+        SLOW_TIMEOUT_MS,
+      )
+      onToast(res.result.detail || `已提交 ${d.domainName} 自动申请与替换`, res.result.action === 'skipped' ? 'info' : 'success')
+      await Promise.all([loadDomains(), loadBootstrap()])
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : '自动申请并替换证书失败', 'error')
+    } finally {
+      setBusyDomain('')
+    }
+  }
+
   function openCertModal(d: EdgeOneDomain) {
     const issuedCerts = managedCerts.filter((c) => c.status === 'issued' && c.cert_id)
-    const matched =
+    const exactMatch =
       (d.certBinding && issuedCerts.find((c) => c.id === d.certBinding?.ssl_cert_id)) ||
-      issuedCerts.find((c) => c.domain.toLowerCase() === d.domainName.toLowerCase()) ||
-      issuedCerts[0]
+      issuedCerts.find((c) => c.domain.toLowerCase() === d.domainName.toLowerCase())
+    const fallbackCert = exactMatch || issuedCerts[0]
+    const exp = parseCertExpireDays(d)
+    const expiringNow = exp.daysLeft !== null && exp.daysLeft <= autoCert.days
     const currentMode =
       d.certMode === 'sslcert' || d.certMode === 'eofreecert' || d.certMode === 'none'
         ? d.certMode
         : 'sslcert'
+    const defaultSource: CertModalState['certSource'] =
+      !d.domainName.startsWith('*.') && (!exactMatch || expiringNow)
+        ? 'auto_apply'
+        : fallbackCert
+          ? 'managed'
+          : 'manual'
     setCertModal({
       domain: d,
-      mode: currentMode === 'none' && matched ? 'sslcert' : currentMode,
-      certSource: matched ? 'managed' : 'manual',
-      sslCertId: matched?.id ?? 0,
+      mode: currentMode === 'none' ? 'sslcert' : currentMode,
+      certSource: defaultSource,
+      sslCertId: fallbackCert?.id ?? 0,
       manualCertId: d.certificates[0]?.certId ?? '',
-      autoSync: d.certBinding ? true : Boolean(matched),
+      autoSync: d.certBinding ? true : Boolean(fallbackCert),
+      autoVerifyMode: 'auto',
+      autoDnsAccountId: dnsAccounts[0]?.id ?? selectedAccountId,
     })
   }
 
   async function saveCertModal() {
     if (!certModal || !selectedAccountId || !selectedZoneId) return
     if (certModal.mode === 'sslcert') {
+      if (certModal.certSource === 'auto_apply') {
+        if (certModal.domain.domainName.startsWith('*.')) {
+          onToast('腾讯云免费 DV 证书暂不支持泛域名，请选择已有证书或 EdgeOne 免费证书', 'error')
+          return
+        }
+        setSavingCert(true)
+        try {
+          const exp = parseCertExpireDays(certModal.domain)
+          const res = await post<{ ok: boolean; result: EdgeOneAutoCertActionResult }>(
+            `/api/v1/edgeone/zones/${encodeURIComponent(selectedZoneId)}/cert/auto-apply`,
+            {
+              account_id: selectedAccountId,
+              site,
+              zone_name: selectedZone?.zoneName ?? '',
+              domain: certModal.domain.domainName,
+              old_cert_id: exp.certId,
+              old_cert_mode: certModal.domain.certMode,
+              dns_verify_mode:
+                certModal.autoVerifyMode === 'auto' ? '' : certModal.autoVerifyMode,
+              dns_account_id:
+                certModal.autoVerifyMode === 'dns_account' ? certModal.autoDnsAccountId : 0,
+            },
+            SLOW_TIMEOUT_MS,
+          )
+          onToast(res.result.detail || '已发起自动申请并绑定替换', 'success')
+          setCertModal(null)
+          await Promise.all([loadDomains(), loadBootstrap()])
+        } catch (err) {
+          onToast(err instanceof Error ? err.message : '自动申请并替换证书失败', 'error')
+        } finally {
+          setSavingCert(false)
+        }
+        return
+      }
       if (certModal.certSource === 'managed' && !certModal.sslCertId) {
         onToast('请选择一张已签发的面板托管证书', 'error')
         return
@@ -816,8 +990,9 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
       <div className="page-head">
         <div>
           <h1>CDN服务</h1>
+          <p>管理腾讯云 EdgeOne 加速域名、回源源站、缓存与流量，证书到期自动申请替换。</p>
         </div>
-        <div className="page-actions">
+        <div className="page-actions eo-page-actions">
           {accounts.length > 0 && (
             <select
               className="select eo-acct-select"
@@ -832,22 +1007,14 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
               ))}
             </select>
           )}
-          <div className="tele-seg" role="group" aria-label="EdgeOne 站点区域">
-            <button
-              type="button"
-              className={site === 'cn' ? 'on' : ''}
-              onClick={() => changeSite('cn')}
-            >
-              国内站
-            </button>
-            <button
-              type="button"
-              className={site === 'intl' ? 'on' : ''}
-              onClick={() => changeSite('intl')}
-            >
-              国际站
-            </button>
-          </div>
+          <Segmented<EdgeOneSite>
+            value={site}
+            options={[
+              { value: 'cn', label: '国内站' },
+              { value: 'intl', label: '国际站' },
+            ]}
+            onChange={(v) => changeSite(v)}
+          />
           <button
             type="button"
             className="btn sm"
@@ -882,14 +1049,15 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
       ) : (
         <div className="cloud-dns-workspace">
           {/* 左侧：EdgeOne 站点列表 */}
-          <aside className="card cloud-dns-domains-pane">
-            <div className="cloud-dns-pane-head">
+          <aside className="card cloud-dns-domains">
+            <div className="cloud-dns-panel-head">
               <strong>EdgeOne 站点</strong>
               <span className="muted-xs">{zones.length} 个</span>
             </div>
-            <div className="cloud-dns-search">
+            <div className="cloud-dns-search eo-zone-search">
               <Search size={13} />
               <input
+                className="input"
                 value={zoneKeyword}
                 onChange={(e) => setZoneKeyword(e.target.value)}
                 placeholder="筛选站点名 / ZoneId…"
@@ -915,7 +1083,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                     <button
                       key={z.zoneId}
                       type="button"
-                      className={`cloud-dns-domain-item${active ? ' on' : ''}`}
+                      className={`cloud-dns-domain-item${active ? ' is-active' : ''}`}
                       onClick={() => setSelectedZoneId(z.zoneId)}
                     >
                       <div className="cloud-dns-domain-name">{z.zoneName || z.zoneId}</div>
@@ -931,7 +1099,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
           </aside>
 
           {/* 右侧：站点加速域名 / 缓存刷新与预热 / 流量统计 */}
-          <section className="card cloud-dns-records-pane">
+          <section className="card cloud-dns-records">
             {!selectedZone ? (
               <Empty icon={<CloudLightning size={22} />} title="请先在左侧选择一个 EdgeOne 站点">
                 选中站点后可管理加速域名、回源源站、HTTPS 证书联动、缓存清理预热及流量带宽统计。
@@ -982,10 +1150,38 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                 {/* Tab 1: 加速域名管理 */}
                 {workTab === 'domains' && (
                   <>
-                    <div className="cloud-dns-records-head">
+                    <div className="eo-autocert-bar">
+                      <div className="eo-autocert-left">
+                        <Switch
+                          checked={autoCert.enabled}
+                          disabled={savingAutoCert}
+                          onChange={(v) => void toggleAutoCertEnabled(v)}
+                          label={`证书到期 ≤ ${autoCert.days} 天自动申请并替换`}
+                          hint={`巡检已启用的加速域名，证书剩余不足 ${autoCert.days} 天或已过期时自动复用/申请免费 SSL 证书并替换边缘证书`}
+                        />
+                      </div>
+                      <div className="eo-autocert-right">
+                        <button
+                          type="button"
+                          className="btn sm"
+                          disabled={checkingAutoCert || loadingDomains}
+                          onClick={() => void runAutoCertCheck()}
+                        >
+                          {checkingAutoCert ? (
+                            <LoaderCircle size={12} className="spin" />
+                          ) : (
+                            <Sparkles size={12} />
+                          )}{' '}
+                          立即检测临期证书
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="cloud-dns-records-bar">
                       <div className="cloud-dns-search eo-domain-search">
                         <Search size={13} />
                         <input
+                          className="input"
                           value={domainKeyword}
                           onChange={(e) => {
                             setDomainKeyword(e.target.value)
@@ -994,7 +1190,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                           placeholder="搜索加速域名、源站或 CNAME…"
                         />
                       </div>
-                      <div className="cloud-dns-actions">
+                      <div className="cloud-dns-records-tools">
                         <button
                           type="button"
                           className="btn ghost sm"
@@ -1025,7 +1221,20 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                           {pagedDomains.map((d) => {
                             const st = domainStatusBadge(d.domainStatus)
                             const isBusy = busyDomain === d.domainName
-                            const certInfo = d.certificates[0]
+                            const exp = parseCertExpireDays(d)
+                            const isWildcard = d.domainName.startsWith('*.')
+                            const isExpired = exp.daysLeft !== null && exp.daysLeft <= 0
+                            const isExpiringSoon =
+                              exp.daysLeft !== null && exp.daysLeft > 0 && exp.daysLeft <= autoCert.days
+                            const isCertPending = Boolean(
+                              d.certBinding &&
+                                (d.certBinding.ssl_pending_cert_id ||
+                                  d.certBinding.ssl_status === 'pending_dns' ||
+                                  d.certBinding.ssl_status === 'verifying'),
+                            )
+                            const showQuickReplace =
+                              !isWildcard &&
+                              (isExpired || isExpiringSoon || (d.certMode === 'sslcert' && !exp.certId))
                             return (
                               <div key={d.domainName} className="eo-domain-card">
                                 <div className="eo-domain-top">
@@ -1037,7 +1246,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                                     {d.certMode === 'sslcert' ? (
                                       <Badge tone="green" dot={false}>
                                         <ShieldCheck size={11} style={{ marginRight: 3 }} />
-                                        SSL {certInfo?.certId || '已配置'}
+                                        SSL {exp.certId || '已配置'}
                                       </Badge>
                                     ) : d.certMode === 'eofreecert' ? (
                                       <Badge tone="blue" dot={false}>
@@ -1048,15 +1257,126 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                                         未配置 HTTPS
                                       </Badge>
                                     )}
-                                    {d.certBinding && (
+                                    {isExpired ? (
+                                      <Badge tone="red" dot={false}>
+                                        证书已过期
+                                      </Badge>
+                                    ) : isExpiringSoon ? (
+                                      <Badge tone="amber" dot={false}>
+                                        剩余 {exp.daysLeft} 天
+                                      </Badge>
+                                    ) : null}
+                                    {isCertPending ? (
+                                      <Badge tone="blue" pulse>
+                                        新证签发中 · 自动替换
+                                      </Badge>
+                                    ) : d.certBinding ? (
                                       <Badge tone="green" dot={false}>
                                         <Sparkles size={11} style={{ marginRight: 3 }} />
                                         续签自动同步
                                       </Badge>
-                                    )}
+                                    ) : null}
                                   </div>
+                                </div>
+
+                                <div className="eo-domain-meta">
+                                  <div>
+                                    <span className="cert-meta-k">CNAME 接入地址</span>
+                                    <span className="cert-meta-v mono eo-copy-row">
+                                      <span className="eo-ellipsis" title={d.cname || ''}>
+                                        {d.cname || '-'}
+                                      </span>
+                                      {d.cname && (
+                                        <button
+                                          type="button"
+                                          className="btn ghost icon sm"
+                                          title="复制 CNAME"
+                                          onClick={() => void copyText(d.cname, 'CNAME')}
+                                        >
+                                          <Copy size={11} />
+                                        </button>
+                                      )}
+                                    </span>
+                                  </div>
+                                  <div>
+                                    <span className="cert-meta-k">源站地址</span>
+                                    <span className="cert-meta-v mono eo-ellipsis" title={d.origin || ''}>
+                                      {d.origin || '-'}
+                                      {d.backupOrigin ? `（备：${d.backupOrigin}）` : ''}
+                                    </span>
+                                  </div>
+                                  <div>
+                                    <span className="cert-meta-k">回源协议 / 端口</span>
+                                    <span className="cert-meta-v mono" style={{ whiteSpace: 'nowrap' }}>
+                                      {d.originProtocol} · {d.httpOriginPort} / {d.httpsOriginPort}
+                                    </span>
+                                  </div>
+                                  <div>
+                                    <span className="cert-meta-k">证书到期 / 联动</span>
+                                    <span className="cert-meta-v">
+                                      {d.certBinding ? (
+                                        <span className="eo-binding-inline">
+                                          <span className="eo-ellipsis">
+                                            {isCertPending
+                                              ? `审核中（${d.certBinding.ssl_pending_cert_id || d.certBinding.ssl_cert_current_id}）`
+                                              : exp.expireTime
+                                                ? `${exp.expireTime.slice(0, 10)}${exp.daysLeft !== null ? ` · 剩 ${Math.max(0, exp.daysLeft)} 天` : ''}`
+                                                : d.certBinding.last_deployed_at
+                                                  ? `${timeAgo(d.certBinding.last_deployed_at)}已同步`
+                                                  : '已开启自动续签'}
+                                          </span>
+                                          <button
+                                            type="button"
+                                            className="btn ghost icon sm"
+                                            title="取消续签自动同步"
+                                            disabled={isBusy}
+                                            onClick={() => void unbindAutoSync(d.certBinding!.id, d.domainName)}
+                                          >
+                                            <Unlink size={11} />
+                                          </button>
+                                        </span>
+                                      ) : exp.expireTime ? (
+                                        `${exp.expireTime.slice(0, 10)}${
+                                          exp.daysLeft !== null
+                                            ? exp.daysLeft <= 0
+                                              ? ' · 已过期'
+                                              : ` · 剩 ${exp.daysLeft} 天`
+                                            : ''
+                                        }`
+                                      ) : (
+                                        '未配置证书'
+                                      )}
+                                    </span>
+                                  </div>
+                                </div>
+
+                                <div className="eo-domain-foot">
+                                  <span className="muted-xs">
+                                    {d.certBinding
+                                      ? `已绑定托管证书，到期前 ${autoCert.days} 天自动续签同步`
+                                      : autoCert.enabled && !isWildcard && d.certMode !== 'none'
+                                        ? `巡检保护中：到期 ≤ ${autoCert.days} 天自动申请替换`
+                                        : isWildcard
+                                          ? '泛域名需手动配置或使用 EdgeOne 免费证书'
+                                          : '点击「证书」可一键自动申请并开启续签同步'}
+                                  </span>
 
                                   <div className="eo-domain-actions">
+                                    {showQuickReplace && (
+                                      <button
+                                        type="button"
+                                        className="btn primary sm"
+                                        disabled={isBusy}
+                                        onClick={() => void quickAutoApplyCert(d)}
+                                      >
+                                        {isBusy ? (
+                                          <LoaderCircle size={12} className="spin" />
+                                        ) : (
+                                          <Sparkles size={12} />
+                                        )}{' '}
+                                        自动申请替换
+                                      </button>
+                                    )}
                                     <button
                                       type="button"
                                       className="btn ghost sm"
@@ -1098,66 +1418,6 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                                     >
                                       <Trash2 size={13} />
                                     </button>
-                                  </div>
-                                </div>
-
-                                <div className="eo-domain-meta">
-                                  <div>
-                                    <span className="cert-meta-k">CNAME 接入地址</span>
-                                    <span className="cert-meta-v mono eo-copy-row">
-                                      <span>{d.cname || '-'}</span>
-                                      {d.cname && (
-                                        <button
-                                          type="button"
-                                          className="btn ghost icon sm"
-                                          title="复制 CNAME"
-                                          onClick={() => void copyText(d.cname, 'CNAME')}
-                                        >
-                                          <Copy size={11} />
-                                        </button>
-                                      )}
-                                    </span>
-                                  </div>
-                                  <div>
-                                    <span className="cert-meta-k">源站地址</span>
-                                    <span className="cert-meta-v mono">
-                                      {d.origin || '-'}
-                                      {d.backupOrigin ? `（备：${d.backupOrigin}）` : ''}
-                                    </span>
-                                  </div>
-                                  <div>
-                                    <span className="cert-meta-k">回源协议 / 端口</span>
-                                    <span className="cert-meta-v mono">
-                                      {d.originProtocol} · HTTP:{d.httpOriginPort} / HTTPS:{d.httpsOriginPort}
-                                    </span>
-                                  </div>
-                                  <div>
-                                    <span className="cert-meta-k">证书联动状态</span>
-                                    <span className="cert-meta-v">
-                                      {d.certBinding ? (
-                                        <span className="eo-binding-inline">
-                                          <span>
-                                            绑定「{d.certBinding.ssl_domain || `#${d.certBinding.ssl_cert_id}`}」
-                                            {d.certBinding.last_deployed_at
-                                              ? ` · ${timeAgo(d.certBinding.last_deployed_at)}已同步`
-                                              : ''}
-                                          </span>
-                                          <button
-                                            type="button"
-                                            className="btn ghost icon sm"
-                                            title="取消续签自动同步"
-                                            disabled={isBusy}
-                                            onClick={() => void unbindAutoSync(d.certBinding!.id, d.domainName)}
-                                          >
-                                            <Unlink size={11} />
-                                          </button>
-                                        </span>
-                                      ) : certInfo?.expireTime ? (
-                                        `到期：${certInfo.expireTime.slice(0, 10)}`
-                                      ) : (
-                                        '未绑定自动续签同步'
-                                      )}
-                                    </span>
                                   </div>
                                 </div>
                               </div>
@@ -1267,7 +1527,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                                   <button
                                     key={d.domainName}
                                     type="button"
-                                    className="btn ghost sm"
+                                    className="eo-chip"
                                     onClick={() => {
                                       const line =
                                         cacheAction === 'purge_host'
@@ -1321,22 +1581,14 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
 
                     <div className="eo-task-section">
                       <div className="eo-task-head">
-                        <div className="tele-seg" role="group" aria-label="任务历史类型">
-                          <button
-                            type="button"
-                            className={taskKind === 'purge' ? 'on' : ''}
-                            onClick={() => setTaskKind('purge')}
-                          >
-                            刷新历史（近 7 天）
-                          </button>
-                          <button
-                            type="button"
-                            className={taskKind === 'prefetch' ? 'on' : ''}
-                            onClick={() => setTaskKind('prefetch')}
-                          >
-                            预热历史（近 7 天）
-                          </button>
-                        </div>
+                        <Segmented<'purge' | 'prefetch'>
+                          value={taskKind}
+                          options={[
+                            { value: 'purge', label: '刷新历史（近 7 天）' },
+                            { value: 'prefetch', label: '预热历史（近 7 天）' },
+                          ]}
+                          onChange={(v) => setTaskKind(v)}
+                        />
                         <button
                           type="button"
                           className="btn ghost sm"
@@ -1354,7 +1606,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                       ) : tasks.length === 0 ? (
                         <div className="cloud-dns-empty-sm">近 7 天暂无该类型的缓存任务记录。</div>
                       ) : (
-                        <div className="table-scroll">
+                        <div className="cloud-dns-table-wrap">
                           <table className="cloud-dns-table">
                             <thead>
                               <tr>
@@ -1398,22 +1650,14 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                 {workTab === 'analytics' && (
                   <div className="eo-analytics-wrap">
                     <div className="eo-analytics-bar">
-                      <div className="tele-seg" role="group" aria-label="统计时间窗口">
-                        <button
-                          type="button"
-                          className={analyticsRange === '24h' ? 'on' : ''}
-                          onClick={() => setAnalyticsRange('24h')}
-                        >
-                          近 24 小时
-                        </button>
-                        <button
-                          type="button"
-                          className={analyticsRange === '7d' ? 'on' : ''}
-                          onClick={() => setAnalyticsRange('7d')}
-                        >
-                          近 7 天
-                        </button>
-                      </div>
+                      <Segmented<'24h' | '7d'>
+                        value={analyticsRange}
+                        options={[
+                          { value: '24h', label: '近 24 小时' },
+                          { value: '7d', label: '近 7 天' },
+                        ]}
+                        onChange={(v) => setAnalyticsRange(v)}
+                      />
                       <select
                         className="select eo-domain-filter"
                         value={analyticsDomain}
@@ -1670,7 +1914,10 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                 disabled={savingCert}
                 onClick={() => void saveCertModal()}
               >
-                {savingCert && <LoaderCircle size={13} className="spin" />} 应用证书配置
+                {savingCert && <LoaderCircle size={13} className="spin" />}{' '}
+                {certModal.mode === 'sslcert' && certModal.certSource === 'auto_apply'
+                  ? '立即自动申请并替换'
+                  : '应用证书配置'}
               </button>
             </>
           }
@@ -1693,24 +1940,66 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
               <>
                 <div className="field">
                   <label>证书来源</label>
-                  <Segmented<'managed' | 'manual'>
+                  <Segmented<'auto_apply' | 'managed' | 'manual'>
                     value={certModal.certSource}
                     options={[
-                      { value: 'managed', label: `面板「证书服务」(${issuedManagedCerts.length})` },
-                      { value: 'manual', label: '手动填写腾讯云 CertId' },
+                      { value: 'auto_apply', label: '自动申请并替换' },
+                      { value: 'managed', label: `面板证书 (${issuedManagedCerts.length})` },
+                      { value: 'manual', label: '手动 CertId' },
                     ]}
                     onChange={(v) => setCertModal({ ...certModal, certSource: v })}
                   />
                 </div>
 
-                {certModal.certSource === 'managed' ? (
+                {certModal.certSource === 'auto_apply' ? (
+                  <>
+                    <div className="eo-cert-modal-note">
+                      将优先复用同账号下有效期大于 {autoCert.days} 天的已有证书；若无可用新证，则自动向腾讯云申请免费 443 DV 证书、自动完成 DNS 验证，并在签发后自动部署替换此 EdgeOne 加速域名，之后到期前 {autoCert.days} 天继续自动续签并替换。
+                    </div>
+
+                    <div className="field">
+                      <label>DNS 自动验证方式</label>
+                      <Segmented<'auto' | 'dns_account' | 'tencent_auto'>
+                        value={certModal.autoVerifyMode}
+                        options={[
+                          { value: 'auto', label: '自动匹配解析账号（推荐）' },
+                          { value: 'dns_account', label: '指定云解析账号' },
+                          { value: 'tencent_auto', label: '腾讯云同账号 DNS_AUTO' },
+                        ]}
+                        onChange={(v) => setCertModal({ ...certModal, autoVerifyMode: v })}
+                      />
+                    </div>
+
+                    {certModal.autoVerifyMode === 'dns_account' && (
+                      <div className="field">
+                        <label>用于自动写入验证记录的 DNS 账号</label>
+                        <select
+                          className="select"
+                          value={certModal.autoDnsAccountId}
+                          onChange={(e) =>
+                            setCertModal({
+                              ...certModal,
+                              autoDnsAccountId: Number(e.target.value),
+                            })
+                          }
+                        >
+                          {dnsAccounts.map((a) => (
+                            <option key={a.id} value={a.id}>
+                              {a.provider === 'cloudflare' ? 'Cloudflare' : '腾讯云 DNSPod'} · {a.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                  </>
+                ) : certModal.certSource === 'managed' ? (
                   <>
                     <div className="field">
                       <label>选择已签发证书</label>
                       {issuedManagedCerts.length === 0 ? (
                         <div className="notice amber">
                           <span>
-                            面板「证书服务」中还没有已签发证书。
+                            面板「证书服务」中还没有已签发证书，可直接切换到「自动申请并替换」一键申请。
                             {onGoCerts && (
                               <button
                                 type="button"
@@ -1721,7 +2010,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                                   onGoCerts()
                                 }}
                               >
-                                去申请 443 证书
+                                前往证书服务
                               </button>
                             )}
                           </span>
@@ -1747,7 +2036,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                     <Switch
                       checked={certModal.autoSync}
                       onChange={(v) => setCertModal({ ...certModal, autoSync: v })}
-                      label="证书到期前 7 天自动续签后，自动同步部署到此 EdgeOne 加速域名"
+                      label={`证书到期前 ${autoCert.days} 天自动续签后，自动同步部署到此 EdgeOne 加速域名`}
                       hint="开启后，当「证书服务」自动续签签发新证书时，后台会自动调用 EdgeOne ModifyHostsCertificate 替换边缘证书"
                     />
                   </>
@@ -1768,7 +2057,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
 
             {certModal.mode === 'eofreecert' && (
               <div className="hint">
-                将使用 EdgeOne 平台自动申请并托管的免费边缘证书（需确保域名已完成 CNAME/NS 接入与归属权验证）。
+                将使用 EdgeOne 平台自动申请并托管的免费边缘证书（需确保域名已完成 CNAME/NS 接入与归属权验证）。若到期前 {autoCert.days} 天仍未自动续期，开启自动申请策略后后台也会兜底自动申请替换。
               </div>
             )}
           </div>

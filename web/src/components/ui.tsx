@@ -195,11 +195,13 @@ export function Switch({
   onChange,
   label,
   hint,
+  disabled = false,
 }: {
   checked: boolean
   onChange: (value: boolean) => void
   label: string
   hint?: string
+  disabled?: boolean
 }) {
   return (
     <div className="toggle-row">
@@ -212,8 +214,9 @@ export function Switch({
         role="switch"
         aria-checked={checked}
         aria-label={label}
+        disabled={disabled}
         className={`switch${checked ? ' on' : ''}`}
-        onClick={() => onChange(!checked)}
+        onClick={() => !disabled && onChange(!checked)}
       />
     </div>
   )

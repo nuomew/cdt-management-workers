@@ -119,6 +119,14 @@ export async function runReconcile(env: Env): Promise<void> {
     console.error("SSL certificate reconcile failed", e);
   }
 
+  // Tencent Cloud EdgeOne CDN certificates: scan active zones (~30 min) and
+  // auto-apply / auto-replace edge certificates expiring within 7 days.
+  try {
+    await tencentSsl.reconcileEdgeOneCertificates(runtimeEnv);
+  } catch (e) {
+    console.error("EdgeOne certificate reconcile failed", e);
+  }
+
   // Lightweight application servers: read-only status + traffic package refresh.
   try {
     await swas.refreshAllSwasServers(runtimeEnv);

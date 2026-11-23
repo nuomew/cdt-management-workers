@@ -14,12 +14,25 @@ import * as notify from "./notify";
 import * as repo from "./repo";
 import type {
   DnsAccountRecord,
+  EdgeOneSite,
   SslCertStatus,
   SslCertificateRecord,
   SslVerifyMode,
 } from "./repo";
 import { signTencentV3 } from "./tencent_lighthouse";
-import { syncRenewedCertificateToEdgeOne } from "./tencent_edgeone";
+import {
+  deployBindingNow,
+  getEdgeOneAutoCertConfig,
+  listAccelerationDomains,
+  listWatchedEdgeOneScopes,
+  listZones,
+  modifyHostsCertificate,
+  normalizeSite as normalizeEdgeOneSite,
+  recordWatchedEdgeOneScope,
+  resolveEdgeOneCreds,
+  syncRenewedCertificateToEdgeOne,
+  type EdgeOneDomain,
+} from "./tencent_edgeone";
 
 const SSL_HOST = "ssl.tencentcloudapi.com";
 const SSL_SERVICE = "ssl";
@@ -28,8 +41,10 @@ const HTTP_TIMEOUT_MS = 18_000;
 
 const VERIFY_POLL_FLAG = "ssl_verify_last_run";
 const RENEW_SCAN_FLAG = "ssl_renew_last_run";
+const EO_CERT_SCAN_FLAG = "eo_cert_reconcile_last_run";
 const VERIFY_POLL_INTERVAL_SECONDS = 120; // 2 min
 const RENEW_SCAN_INTERVAL_SECONDS = 900; // 15 min
+const EO_CERT_SCAN_INTERVAL_SECONDS = 1800; // 30 min
 const RENEW_RETRY_COOLDOWN_SECONDS = 6 * 3600; // 6 h between automatic retry attempts
 
 export interface TencentCreds {
@@ -1678,3 +1693,861 @@ export async function reconcileCertificates(
 
   return summary;
 }
+
+// ---------------------------------------------------------------------------
+// EdgeOne CDN Expiring-Certificate Auto-Apply & Auto-Replacement Engine
+// ---------------------------------------------------------------------------
+
+export interface EdgeOneAutoCertActionResult {
+  domain: string;
+  action: "replaced" | "applied" | "renewed" | "pending" | "skipped";
+  deployed: boolean;
+  certId?: string;
+  sslCertRowId?: number;
+  detail: string;
+}
+
+export interface ReconcileEdgeOneCertsSummary {
+  enabled: boolean;
+  days: number;
+  scannedScopes: number;
+  scannedDomains: number;
+  expiringFound: number;
+  replaced: number;
+  applied: number;
+  renewed: number;
+  pending: number;
+  skipped: number;
+  results: EdgeOneAutoCertActionResult[];
+  errors: string[];
+}
+
+interface EdgeOneScanCaches {
+  dnsAccounts?: DnsAccountRecord[];
+  dnsDomainsByAccount: Map<number, dnsProviders.CloudDnsDomain[]>;
+  remoteCertsByAccount: Map<number, TencentCertSummary[]>;
+}
+
+function createScanCaches(): EdgeOneScanCaches {
+  return {
+    dnsDomainsByAccount: new Map(),
+    remoteCertsByAccount: new Map(),
+  };
+}
+
+/**
+ * Inspect the EdgeOne host's currently attached edge certificates and return
+ * the latest effective expiry timestamp plus whether a deployment is already
+ * in progress on Tencent Cloud's side.
+ */
+function inspectEdgeHostCertState(domain: EdgeOneDomain): {
+  deploying: boolean;
+  primaryCertId: string;
+  maxExpireTs: number;
+} {
+  let deploying = false;
+  let primaryCertId = "";
+  let maxExpireTs = 0;
+
+  for (const c of domain.certificates) {
+    const st = (c.status || "").toLowerCase();
+    if (st === "deploying" || st === "processing") {
+      deploying = true;
+    }
+    const expTs = parseTencentTimeToEpoch(c.expireTime || "");
+    if (!primaryCertId && c.certId) {
+      primaryCertId = c.certId;
+      maxExpireTs = expTs;
+    } else if (expTs > maxExpireTs) {
+      maxExpireTs = expTs;
+      if (c.certId) primaryCertId = c.certId;
+    }
+  }
+  return { deploying, primaryCertId, maxExpireTs };
+}
+
+/**
+ * Automatically locate the best DNS verification mode and account for a domain
+ * across all saved Tencent DNSPod and Cloudflare accounts in the panel.
+ * Falls back to `tencent_auto` (same-account DNS_AUTO) if no hosted zone matches.
+ */
+async function autoDetectDnsVerifyForDomain(
+  env: Env,
+  tencentAccountId: number,
+  domain: string,
+  caches: EdgeOneScanCaches,
+  explicit?: { dnsVerifyMode?: SslVerifyMode; dnsAccountId?: number },
+): Promise<{ mode: SslVerifyMode; dnsAccountId: number }> {
+  if (explicit?.dnsVerifyMode) {
+    return {
+      mode: explicit.dnsVerifyMode,
+      dnsAccountId:
+        explicit.dnsVerifyMode === "dns_account"
+          ? explicit.dnsAccountId || tencentAccountId
+          : 0,
+    };
+  }
+  if (explicit?.dnsAccountId && explicit.dnsAccountId > 0) {
+    return { mode: "dns_account", dnsAccountId: explicit.dnsAccountId };
+  }
+
+  if (!caches.dnsAccounts) {
+    caches.dnsAccounts = await repo.listDnsAccounts(env, { decryptSecret: true });
+  }
+
+  // Prefer the same Tencent account first, then other Tencent DNSPod accounts, then Cloudflare.
+  const ordered = [...caches.dnsAccounts].sort((a, b) => {
+    const score = (x: DnsAccountRecord) =>
+      x.id === tencentAccountId ? 0 : x.provider === "tencent" ? 1 : 2;
+    return score(a) - score(b);
+  });
+
+  const cleanTarget = domain.trim().toLowerCase().replace(/\.+$/, "");
+  let bestMatch: { accountId: number; rootLen: number } | null = null;
+
+  for (const acct of ordered) {
+    let domains = caches.dnsDomainsByAccount.get(acct.id);
+    if (!domains) {
+      try {
+        domains = await dnsProviders.listDomains(env, acct);
+      } catch {
+        domains = [];
+      }
+      caches.dnsDomainsByAccount.set(acct.id, domains);
+    }
+    for (const item of domains) {
+      const candidate = item.name.trim().toLowerCase().replace(/\.+$/, "");
+      if (!candidate) continue;
+      if (cleanTarget === candidate || cleanTarget.endsWith(`.${candidate}`)) {
+        if (!bestMatch || candidate.length > bestMatch.rootLen) {
+          bestMatch = { accountId: acct.id, rootLen: candidate.length };
+        }
+      }
+    }
+    // Exact or same-account match found immediately; keep checking only if not same account.
+    if (bestMatch && bestMatch.accountId === tencentAccountId) break;
+  }
+
+  if (bestMatch) {
+    return { mode: "dns_account", dnsAccountId: bestMatch.accountId };
+  }
+  if (isDryRun(env) && tencentAccountId > 0) {
+    return { mode: "dns_account", dnsAccountId: tencentAccountId };
+  }
+  return { mode: "tencent_auto", dnsAccountId: 0 };
+}
+
+async function getCachedRemoteTencentCerts(
+  env: Env,
+  tencentAccountId: number,
+  creds: TencentCreds,
+  caches: EdgeOneScanCaches,
+): Promise<TencentCertSummary[]> {
+  let list = caches.remoteCertsByAccount.get(tencentAccountId);
+  if (list) return list;
+  try {
+    list = await listTencentCertificates(env, creds, { limit: 100 });
+  } catch {
+    list = [];
+  }
+  caches.remoteCertsByAccount.set(tencentAccountId, list);
+  return list;
+}
+
+/**
+ * Ensure a single EdgeOne acceleration domain has a healthy SSL certificate
+ * (> threshold days remaining) by reusing/deploying an existing valid cert,
+ * renewing a managed cert, importing a valid remote Tencent cert, or applying
+ * a brand-new free DV certificate with automated DNS validation and binding it
+ * for automatic edge deployment upon issuance.
+ */
+export async function ensureEdgeOneDomainCert(
+  env: Env,
+  params: {
+    accountId: number;
+    site: EdgeOneSite;
+    zoneId: string;
+    zoneName: string;
+    domain: string;
+    oldEdgeCertId?: string;
+    oldEdgeCertMode?: string;
+    thresholdDays?: number;
+    force?: boolean;
+    dnsVerifyMode?: SslVerifyMode;
+    dnsAccountId?: number;
+    reason?: "auto" | "manual";
+  },
+  caches: EdgeOneScanCaches = createScanCaches(),
+): Promise<EdgeOneAutoCertActionResult> {
+  const domain = params.domain.trim().toLowerCase();
+  const reason = params.reason ?? (params.force ? "manual" : "auto");
+  const thresholdDays = Math.max(1, Math.min(30, Math.trunc(params.thresholdDays ?? 7)));
+  const thresholdSec = thresholdDays * 86400;
+  const now = nowSeconds();
+  const oldEdgeCertId = (params.oldEdgeCertId ?? "").trim();
+  const oldEdgeCertMode = (params.oldEdgeCertMode ?? "").trim().toLowerCase();
+
+  if (!domain || domain.startsWith("*.")) {
+    return {
+      domain,
+      action: "skipped",
+      deployed: false,
+      detail: "泛域名不支持腾讯云免费 DV 证书自动申请，请手动配置证书或使用 EdgeOne 免费证书",
+    };
+  }
+
+  const eoCreds = await resolveEdgeOneCreds(env, params.accountId, params.site);
+  const sslCreds: TencentCreds = {
+    secretId: eoCreds.secretId,
+    secretKey: eoCreds.secretKey,
+    sourceLabel: eoCreds.label,
+  };
+
+  // Helper to mark superseded external sslcert for cleanup ONLY AFTER replacement succeeds.
+  const queueOldEdgeCertCleanup = async (sslRowId: number, newCertId: string) => {
+    if (oldEdgeCertMode !== "sslcert" || !oldEdgeCertId || oldEdgeCertId === newCertId) {
+      return;
+    }
+    const row = await repo.getSslCertificate(env, sslRowId, false);
+    if (row && !row.replaced_cert_id) {
+      await repo.updateSslCertificate(env, sslRowId, { replaced_cert_id: oldEdgeCertId });
+    }
+  };
+
+  const allManaged = await repo.listSslCertificates(env, false);
+  const sameDomainCerts = allManaged.filter(
+    (c) =>
+      c.domain.toLowerCase() === domain &&
+      c.tencent_account_id === params.accountId,
+  );
+
+  // 1. Reuse an already-issued healthy local managed cert (> thresholdDays remaining).
+  const healthyManaged = sameDomainCerts
+    .filter(
+      (c) =>
+        c.status === "issued" &&
+        Boolean(c.cert_id) &&
+        c.cert_id !== oldEdgeCertId &&
+        c.cert_end_ts > now + thresholdSec,
+    )
+    .sort((a, b) => b.cert_end_ts - a.cert_end_ts)[0];
+
+  if (healthyManaged) {
+    await modifyHostsCertificate(
+      env,
+      eoCreds,
+      params.zoneId,
+      [domain],
+      "sslcert",
+      healthyManaged.cert_id,
+    );
+    await repo.upsertEdgeOneCertBinding(env, {
+      ssl_cert_id: healthyManaged.id,
+      tencent_account_id: params.accountId,
+      site: params.site,
+      zone_id: params.zoneId,
+      zone_name: params.zoneName,
+      domain,
+      last_deployed_cert_id: healthyManaged.cert_id,
+      last_deployed_at: now,
+      last_error: "",
+    });
+    if (!healthyManaged.auto_renew || healthyManaged.renew_before_days < thresholdDays) {
+      await repo.updateSslCertificate(env, healthyManaged.id, {
+        auto_renew: true,
+        renew_before_days: Math.max(healthyManaged.renew_before_days || 7, thresholdDays),
+      });
+    }
+    await queueOldEdgeCertCleanup(healthyManaged.id, healthyManaged.cert_id);
+    await repo.addEvent(
+      env,
+      "ssl",
+      messages.ev("EdgeOne 临期证书已自动替换", messages.objServer(domain)),
+      {
+        detail: `已复用面板有效证书 ${healthyManaged.cert_id} 替换 EdgeOne 证书（原证书 ${oldEdgeCertId || "无"}），并开启续签自动同步`,
+      },
+    );
+    await notifyCertEvent(env, "ssl_issued", `✅ EdgeOne 证书已自动替换：${domain}`, [
+      `域名：${domain}`,
+      `站点：${params.zoneName || params.zoneId}`,
+      `新证书 ID：${healthyManaged.cert_id}`,
+      `有效期至：${healthyManaged.cert_end_time || "-"}`,
+    ]);
+    return {
+      domain,
+      action: "replaced",
+      deployed: true,
+      certId: healthyManaged.cert_id,
+      sslCertRowId: healthyManaged.id,
+      detail: `已复用有效证书 ${healthyManaged.cert_id} 自动替换并开启续签联动`,
+    };
+  }
+
+  // 2. If there is already an in-flight application/renewal for this domain, bind it and advance verification.
+  const inFlightManaged = sameDomainCerts.find(
+    (c) =>
+      Boolean(c.pending_cert_id) ||
+      c.status === "pending_dns" ||
+      c.status === "verifying",
+  );
+  if (inFlightManaged) {
+    const binding = await repo.upsertEdgeOneCertBinding(env, {
+      ssl_cert_id: inFlightManaged.id,
+      tencent_account_id: params.accountId,
+      site: params.site,
+      zone_id: params.zoneId,
+      zone_name: params.zoneName,
+      domain,
+      last_deployed_cert_id: oldEdgeCertId,
+      last_deployed_at: 0,
+      last_error: "",
+    });
+    const refreshed = await refreshManagedCertificate(env, inFlightManaged.id, {
+      forceWriteDns: false,
+      triggerVerify: true,
+    });
+    const finalCert = refreshed.certificate;
+    if (finalCert.status === "issued" && finalCert.cert_id && finalCert.cert_id !== oldEdgeCertId) {
+      // Ensure it is deployed on EdgeOne even if refreshManagedCertificate didn't consider it justIssued.
+      const latestBinding = await repo.getEdgeOneCertBinding(env, binding.id);
+      if (!latestBinding || latestBinding.last_deployed_cert_id !== finalCert.cert_id) {
+        await deployBindingNow(env, binding, finalCert.cert_id);
+      }
+      await queueOldEdgeCertCleanup(finalCert.id, finalCert.cert_id);
+      return {
+        domain,
+        action: "replaced",
+        deployed: true,
+        certId: finalCert.cert_id,
+        sslCertRowId: finalCert.id,
+        detail: `在途证书 ${finalCert.cert_id} 已签发并自动替换到 EdgeOne`,
+      };
+    }
+    return {
+      domain,
+      action: "pending",
+      deployed: false,
+      certId: finalCert.pending_cert_id || finalCert.cert_id,
+      sslCertRowId: finalCert.id,
+      detail: `已有证书 ${finalCert.pending_cert_id || finalCert.cert_id} 正在验证签发，已绑定签发后自动替换`,
+    };
+  }
+
+  // 3. Check Tencent Cloud remote SSL list for an already-issued healthy certificate we can import & deploy directly.
+  const remoteCerts = await getCachedRemoteTencentCerts(env, params.accountId, sslCreds, caches);
+  const healthyRemote = remoteCerts
+    .filter(
+      (r) =>
+        r.domain.toLowerCase() === domain &&
+        r.status === 1 &&
+        Boolean(r.certificateId) &&
+        r.certificateId !== oldEdgeCertId &&
+        r.certEndTs > now + thresholdSec,
+    )
+    .sort((a, b) => b.certEndTs - a.certEndTs)[0];
+
+  if (healthyRemote) {
+    const verify = await autoDetectDnsVerifyForDomain(env, params.accountId, domain, caches, {
+      dnsVerifyMode: params.dnsVerifyMode,
+      dnsAccountId: params.dnsAccountId,
+    });
+    let row = await repo.getSslCertificateByCertId(env, healthyRemote.certificateId, false);
+    let rowId = row?.id ?? 0;
+    if (!row) {
+      rowId = await repo.createSslCertificate(env, {
+        domain,
+        tencent_account_id: params.accountId,
+        dns_verify_mode: verify.mode,
+        dns_account_id: verify.dnsAccountId,
+        cert_id: healthyRemote.certificateId,
+        encrypt_algo: healthyRemote.encryptAlgorithm.toUpperCase() === "ECC" ? "ECC" : "RSA",
+        status: "issued",
+        tencent_status: healthyRemote.status,
+        status_name: healthyRemote.statusName || "已颁发",
+        cert_begin_time: healthyRemote.certBeginTime,
+        cert_end_time: healthyRemote.certEndTime,
+        cert_end_ts: healthyRemote.certEndTs,
+        auto_renew: true,
+        renew_before_days: thresholdDays,
+        clean_dns_after_issue: true,
+        remark: "EdgeOne 自动导入复用",
+        last_checked_at: now,
+      });
+    }
+    await modifyHostsCertificate(
+      env,
+      eoCreds,
+      params.zoneId,
+      [domain],
+      "sslcert",
+      healthyRemote.certificateId,
+    );
+    await repo.upsertEdgeOneCertBinding(env, {
+      ssl_cert_id: rowId,
+      tencent_account_id: params.accountId,
+      site: params.site,
+      zone_id: params.zoneId,
+      zone_name: params.zoneName,
+      domain,
+      last_deployed_cert_id: healthyRemote.certificateId,
+      last_deployed_at: now,
+      last_error: "",
+    });
+    await queueOldEdgeCertCleanup(rowId, healthyRemote.certificateId);
+    await repo.addEvent(
+      env,
+      "ssl",
+      messages.ev("EdgeOne 临期证书已自动替换", messages.objServer(domain)),
+      {
+        detail: `已从腾讯云 SSL 导入并部署现有有效证书 ${healthyRemote.certificateId}，替代临期证书 ${oldEdgeCertId || "无"}`,
+      },
+    );
+    return {
+      domain,
+      action: "replaced",
+      deployed: true,
+      certId: healthyRemote.certificateId,
+      sslCertRowId: rowId,
+      detail: `已复用腾讯云账号内有效证书 ${healthyRemote.certificateId} 并自动替换`,
+    };
+  }
+
+  // 4. If a managed cert already exists locally for this domain (expiring/expired/failed), bind and renew it.
+  const renewableManaged = sameDomainCerts
+    .slice()
+    .sort((a, b) => b.cert_end_ts - a.cert_end_ts || b.id - a.id)[0];
+
+  if (renewableManaged) {
+    if (
+      !params.force &&
+      renewableManaged.last_renew_at > 0 &&
+      now - renewableManaged.last_renew_at < RENEW_RETRY_COOLDOWN_SECONDS
+    ) {
+      return {
+        domain,
+        action: "skipped",
+        deployed: false,
+        sslCertRowId: renewableManaged.id,
+        detail: "6 小时内已尝试过自动续签，等待冷却结束或手动触发",
+      };
+    }
+
+    // Upgrade manual DNS verification to automated DNS account / DNS_AUTO if possible.
+    const patch: Partial<repo.SslCertificateCreateInput> = {
+      auto_renew: true,
+      renew_before_days: Math.max(renewableManaged.renew_before_days || 7, thresholdDays),
+    };
+    if (renewableManaged.dns_verify_mode === "manual" || params.dnsVerifyMode || params.dnsAccountId) {
+      const verify = await autoDetectDnsVerifyForDomain(env, params.accountId, domain, caches, {
+        dnsVerifyMode: params.dnsVerifyMode,
+        dnsAccountId: params.dnsAccountId,
+      });
+      patch.dns_verify_mode = verify.mode;
+      patch.dns_account_id = verify.dnsAccountId;
+    }
+    await repo.updateSslCertificate(env, renewableManaged.id, patch);
+
+    // Bind BEFORE renewing so immediate issuance inside renewManagedCertificate auto-pushes to EdgeOne.
+    const binding = await repo.upsertEdgeOneCertBinding(env, {
+      ssl_cert_id: renewableManaged.id,
+      tencent_account_id: params.accountId,
+      site: params.site,
+      zone_id: params.zoneId,
+      zone_name: params.zoneName,
+      domain,
+      last_deployed_cert_id: oldEdgeCertId,
+      last_deployed_at: 0,
+      last_error: "",
+    });
+
+    const renewed = await renewManagedCertificate(env, renewableManaged.id, reason);
+    const issuedNow =
+      renewed.certificate.status === "issued" &&
+      renewed.certificate.cert_id === renewed.newCertId;
+
+    if (issuedNow) {
+      const latestBinding = await repo.getEdgeOneCertBinding(env, binding.id);
+      if (!latestBinding || latestBinding.last_deployed_cert_id !== renewed.newCertId) {
+        await deployBindingNow(env, binding, renewed.newCertId);
+      }
+      await queueOldEdgeCertCleanup(renewableManaged.id, renewed.newCertId);
+    }
+
+    return {
+      domain,
+      action: issuedNow ? "replaced" : "renewed",
+      deployed: issuedNow,
+      certId: renewed.newCertId,
+      sslCertRowId: renewableManaged.id,
+      detail: issuedNow
+        ? `已自动续签新证书 ${renewed.newCertId} 并替换至 EdgeOne`
+        : `已发起自动续签（新证书 ${renewed.newCertId}），签发后将自动替换至 EdgeOne`,
+    };
+  }
+
+  // 5. No local or healthy remote cert exists: automatically apply a new free 443 DV cert.
+  const cooldownFlag = `eo_auto_apply:${params.accountId}:${domain}`;
+  if (!params.force) {
+    const age = await repo.flagAge(env, cooldownFlag);
+    if (age >= 0 && age < RENEW_RETRY_COOLDOWN_SECONDS) {
+      return {
+        domain,
+        action: "skipped",
+        deployed: false,
+        detail: "6 小时内已尝试过自动申请，等待下次巡检或手动触发",
+      };
+    }
+  }
+
+  const verify = await autoDetectDnsVerifyForDomain(env, params.accountId, domain, caches, {
+    dnsVerifyMode: params.dnsVerifyMode,
+    dnsAccountId: params.dnsAccountId,
+  });
+
+  await repo.clearFlag(env, cooldownFlag);
+  await repo.setFlag(env, cooldownFlag);
+
+  const applied = await applyManagedCertificate(env, {
+    domain,
+    tencent_account_id: params.accountId,
+    dns_verify_mode: verify.mode,
+    dns_account_id: verify.dnsAccountId,
+    encrypt_algo: "RSA",
+    auto_renew: true,
+    renew_before_days: thresholdDays,
+    clean_dns_after_issue: true,
+    remark: `EdgeOne 自动申请 (${params.zoneName || params.zoneId})`,
+  });
+
+  const issuedNow =
+    applied.certificate.status === "issued" && Boolean(applied.certificate.cert_id);
+
+  if (issuedNow) {
+    await modifyHostsCertificate(
+      env,
+      eoCreds,
+      params.zoneId,
+      [domain],
+      "sslcert",
+      applied.certificate.cert_id,
+    );
+    await repo.upsertEdgeOneCertBinding(env, {
+      ssl_cert_id: applied.certificate.id,
+      tencent_account_id: params.accountId,
+      site: params.site,
+      zone_id: params.zoneId,
+      zone_name: params.zoneName,
+      domain,
+      last_deployed_cert_id: applied.certificate.cert_id,
+      last_deployed_at: now,
+      last_error: "",
+    });
+    await queueOldEdgeCertCleanup(applied.certificate.id, applied.certificate.cert_id);
+    await repo.addEvent(
+      env,
+      "ssl",
+      messages.ev("EdgeOne 临期证书已自动申请并替换", messages.objServer(domain)),
+      {
+        detail: `已为 EdgeOne 域名自动申请免费证书 ${applied.certificate.cert_id} 并完成替换（原证书 ${oldEdgeCertId || "无"}），后续到期前 ${thresholdDays} 天将继续自动续签同步`,
+      },
+    );
+    await notifyCertEvent(env, "ssl_issued", `✅ EdgeOne 证书已自动申请并替换：${domain}`, [
+      `域名：${domain}`,
+      `站点：${params.zoneName || params.zoneId}`,
+      `新证书 ID：${applied.certificate.cert_id}`,
+      `有效期至：${applied.certificate.cert_end_time || "-"}`,
+      `续签策略：到期前 ${thresholdDays} 天自动续签并同步 EdgeOne`,
+    ]);
+    return {
+      domain,
+      action: "applied",
+      deployed: true,
+      certId: applied.certificate.cert_id,
+      sslCertRowId: applied.certificate.id,
+      detail: `已自动申请新证书 ${applied.certificate.cert_id} 并替换至 EdgeOne`,
+    };
+  }
+
+  // Still verifying/pending: create binding now so 2-min SSL Cron pushes it automatically upon issuance.
+  await repo.upsertEdgeOneCertBinding(env, {
+    ssl_cert_id: applied.certificate.id,
+    tencent_account_id: params.accountId,
+    site: params.site,
+    zone_id: params.zoneId,
+    zone_name: params.zoneName,
+    domain,
+    last_deployed_cert_id: oldEdgeCertId,
+    last_deployed_at: 0,
+    last_error: "",
+  });
+
+  await repo.addEvent(
+    env,
+    "ssl",
+    messages.ev("EdgeOne 临期证书已发起自动申请", messages.objServer(domain)),
+    {
+      detail: `检测到 EdgeOne 域名证书临期（≤ ${thresholdDays} 天），已自动申请证书 ${applied.certificate.cert_id} 并绑定签发后自动替换`,
+    },
+  );
+
+  return {
+    domain,
+    action: "applied",
+    deployed: false,
+    certId: applied.certificate.cert_id,
+    sslCertRowId: applied.certificate.id,
+    detail: `已自动提交免费证书申请（${applied.certificate.cert_id}），验证签发后将自动替换至 EdgeOne`,
+  };
+}
+
+/**
+ * Scheduled & on-demand EdgeOne certificate audit engine:
+ * Scans active EdgeOne zones/domains (every ~30 min in Cron, or immediately when
+ * `force: true`). Whenever an online non-wildcard CDN domain's edge certificate
+ * is expired or expiring within `days` (default 7), automatically replaces it
+ * with an existing valid cert or applies a new free SSL cert and binds it for
+ * automatic deployment and future renewals.
+ */
+export async function reconcileEdgeOneCertificates(
+  env: Env,
+  opts?: {
+    force?: boolean;
+    accountId?: number;
+    site?: EdgeOneSite;
+    zoneId?: string;
+  },
+): Promise<ReconcileEdgeOneCertsSummary> {
+  const force = Boolean(opts?.force);
+  const cfg = await getEdgeOneAutoCertConfig(env);
+  const summary: ReconcileEdgeOneCertsSummary = {
+    enabled: cfg.enabled,
+    days: cfg.days,
+    scannedScopes: 0,
+    scannedDomains: 0,
+    expiringFound: 0,
+    replaced: 0,
+    applied: 0,
+    renewed: 0,
+    pending: 0,
+    skipped: 0,
+    results: [],
+    errors: [],
+  };
+
+  if (!force && !cfg.enabled) {
+    return summary;
+  }
+
+  if (!force) {
+    const age = await repo.flagAge(env, EO_CERT_SCAN_FLAG);
+    if (age >= 0 && age < EO_CERT_SCAN_INTERVAL_SECONDS) {
+      return summary;
+    }
+  }
+
+  // Build deduplicated list of (accountId, site) scopes to audit.
+  const scopeList: Array<{ accountId: number; site: EdgeOneSite }> = [];
+  const scopeSeen = new Set<string>();
+  const addScope = (accountId: number, site: EdgeOneSite) => {
+    if (!Number.isFinite(accountId) || accountId <= 0) return;
+    const cleanSite = normalizeEdgeOneSite(site);
+    const key = `${accountId}:${cleanSite}`;
+    if (scopeSeen.has(key)) return;
+    scopeSeen.add(key);
+    scopeList.push({ accountId, site: cleanSite });
+  };
+
+  if (opts?.accountId && opts.accountId > 0) {
+    addScope(opts.accountId, normalizeEdgeOneSite(opts.site));
+  } else {
+    const [watched, bindings, tencentAccounts] = await Promise.all([
+      listWatchedEdgeOneScopes(env),
+      repo.listEdgeOneCertBindings(env),
+      repo.listDnsAccounts(env, { provider: "tencent", decryptSecret: false }),
+    ]);
+    const accountsWithKnownScope = new Set<number>();
+    for (const s of watched) {
+      addScope(s.accountId, s.site);
+      accountsWithKnownScope.add(s.accountId);
+    }
+    for (const b of bindings) {
+      addScope(b.tencent_account_id, b.site);
+      accountsWithKnownScope.add(b.tencent_account_id);
+    }
+    // For Tencent accounts never opened in the CDN UI yet, probe cn & intl once;
+    // any site that returns real zones will be remembered automatically.
+    for (const acct of tencentAccounts) {
+      if (!accountsWithKnownScope.has(acct.id)) {
+        addScope(acct.id, "cn");
+        addScope(acct.id, "intl");
+      }
+    }
+  }
+
+  if (scopeList.length === 0) {
+    return summary;
+  }
+
+  const now = nowSeconds();
+  const thresholdSec = cfg.days * 86400;
+  const caches = createScanCaches();
+  const allManaged = await repo.listSslCertificates(env, false);
+  const managedById = new Map(allManaged.map((c) => [c.id, c]));
+
+  for (const scope of scopeList) {
+    let creds;
+    try {
+      creds = await resolveEdgeOneCreds(env, scope.accountId, scope.site);
+    } catch {
+      continue;
+    }
+
+    let zones;
+    try {
+      zones = await listZones(env, creds);
+    } catch (err) {
+      if (force && opts?.accountId) {
+        summary.errors.push(
+          `读取 EdgeOne 站点失败: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      continue;
+    }
+
+    if (zones.length === 0) continue;
+    summary.scannedScopes += 1;
+    await recordWatchedEdgeOneScope(env, scope.accountId, scope.site);
+
+    const targetZones = opts?.zoneId
+      ? zones.filter((z) => z.zoneId === opts.zoneId)
+      : zones;
+
+    for (const zone of targetZones) {
+      if (zone.paused) continue;
+      let domains: EdgeOneDomain[];
+      let bindings: repo.EdgeOneCertBindingRecord[];
+      try {
+        [domains, bindings] = await Promise.all([
+          listAccelerationDomains(env, creds, zone.zoneId),
+          repo.listEdgeOneCertBindings(env, {
+            tencentAccountId: scope.accountId,
+            site: scope.site,
+            zoneId: zone.zoneId,
+          }),
+        ]);
+      } catch (err) {
+        summary.errors.push(
+          `站点 ${zone.zoneName || zone.zoneId} 获取域名失败: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        continue;
+      }
+
+      const bindingByHost = new Map(
+        bindings.map((b) => [b.domain.toLowerCase(), b]),
+      );
+
+      for (const dom of domains) {
+        summary.scannedDomains += 1;
+        if (dom.domainStatus !== "online") continue;
+        if (dom.domainName.startsWith("*.")) continue;
+
+        const hostKey = dom.domainName.toLowerCase();
+        const edgeState = inspectEdgeHostCertState(dom);
+        if (edgeState.deploying) continue;
+
+        const existingBinding = bindingByHost.get(hostKey) ?? null;
+
+        // First: if already bound to a managed cert whose issued cert_id is newer than
+        // what is currently deployed on EdgeOne, sync it immediately even if > 7 days left.
+        if (existingBinding) {
+          const boundCert = managedById.get(existingBinding.ssl_cert_id);
+          if (
+            boundCert &&
+            boundCert.status === "issued" &&
+            boundCert.cert_id &&
+            boundCert.cert_id !== edgeState.primaryCertId &&
+            boundCert.cert_end_ts > Math.max(now, edgeState.maxExpireTs)
+          ) {
+            try {
+              await deployBindingNow(env, existingBinding, boundCert.cert_id);
+              summary.replaced += 1;
+              summary.results.push({
+                domain: dom.domainName,
+                action: "replaced",
+                deployed: true,
+                certId: boundCert.cert_id,
+                sslCertRowId: boundCert.id,
+                detail: `已将已签发的新托管证书 ${boundCert.cert_id} 补推部署到 EdgeOne`,
+              });
+              continue;
+            } catch (err) {
+              summary.errors.push(
+                `${dom.domainName} 补推证书失败: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+            }
+          }
+        }
+
+        // Check whether edge certificate is expired or expiring within threshold days (default 7).
+        const isSslCertMode = dom.certMode === "sslcert";
+        const isFreeCertMode = dom.certMode === "eofreecert";
+        if (!isSslCertMode && !isFreeCertMode) continue;
+
+        const isExpiring = isSslCertMode
+          ? edgeState.maxExpireTs === 0 || edgeState.maxExpireTs <= now + thresholdSec
+          : edgeState.maxExpireTs > 0 && edgeState.maxExpireTs <= now + thresholdSec;
+
+        if (!isExpiring) continue;
+        summary.expiringFound += 1;
+
+        try {
+          const res = await ensureEdgeOneDomainCert(
+            env,
+            {
+              accountId: scope.accountId,
+              site: scope.site,
+              zoneId: zone.zoneId,
+              zoneName: zone.zoneName,
+              domain: dom.domainName,
+              oldEdgeCertId: edgeState.primaryCertId,
+              oldEdgeCertMode: dom.certMode,
+              thresholdDays: cfg.days,
+              force,
+              reason: force ? "manual" : "auto",
+            },
+            caches,
+          );
+          summary.results.push(res);
+          if (res.action === "replaced") summary.replaced += 1;
+          else if (res.action === "applied") {
+            summary.applied += 1;
+            if (res.deployed) summary.replaced += 1;
+          } else if (res.action === "renewed") summary.renewed += 1;
+          else if (res.action === "pending") summary.pending += 1;
+          else summary.skipped += 1;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          summary.errors.push(`${dom.domainName}: ${msg}`);
+          await repo.addEvent(
+            env,
+            "ssl",
+            messages.ev("EdgeOne 临期证书自动处理失败", messages.objServer(dom.domainName)),
+            { level: "error", detail: msg },
+          );
+        }
+      }
+    }
+  }
+
+  if (!opts?.accountId) {
+    await repo.clearFlag(env, EO_CERT_SCAN_FLAG);
+    await repo.setFlag(env, EO_CERT_SCAN_FLAG);
+  }
+
+  return summary;
+}
+

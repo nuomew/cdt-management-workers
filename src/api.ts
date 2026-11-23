@@ -4395,13 +4395,18 @@ function parseEdgeOneZoneId(raw: string | undefined): string {
 
 app.get("/api/v1/edgeone/accounts", async (c) => {
   await requireAdmin(c);
-  const tencentAccounts = (
-    await repo.listDnsAccounts(c.env, { provider: "tencent", decryptSecret: false })
-  ).map(sanitizeDnsAccount);
-  const certs = await repo.listSslCertificates(c.env, false);
-  const bindings = await repo.listEdgeOneCertBindings(c.env);
+  const [allDnsAccounts, certs, bindings, autoCert] = await Promise.all([
+    repo.listDnsAccounts(c.env, { decryptSecret: false }),
+    repo.listSslCertificates(c.env, false),
+    repo.listEdgeOneCertBindings(c.env),
+    tencentEdgeOne.getEdgeOneAutoCertConfig(c.env),
+  ]);
+  const sanitizedDns = allDnsAccounts.map(sanitizeDnsAccount);
+  const tencentAccounts = sanitizedDns.filter((a) => a.provider === "tencent");
   return c.json({
     accounts: tencentAccounts,
+    dns_accounts: sanitizedDns,
+    auto_cert: autoCert,
     managed_certs: certs.map((item) => ({
       id: item.id,
       domain: item.domain,
@@ -4423,6 +4428,9 @@ app.get("/api/v1/edgeone/zones", async (c) => {
   try {
     const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
     const items = await tencentEdgeOne.listZones(c.env, creds);
+    if (items.length > 0) {
+      await tencentEdgeOne.recordWatchedEdgeOneScope(c.env, accountId, site);
+    }
     return c.json({ items, site });
   } catch (err) {
     throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
@@ -4453,6 +4461,8 @@ app.get("/api/v1/edgeone/zones/:zoneId/domains", async (c) => {
               ...binding,
               ssl_domain: sslCert?.domain ?? "",
               ssl_cert_current_id: sslCert?.cert_id ?? "",
+              ssl_status: sslCert?.status ?? "",
+              ssl_pending_cert_id: sslCert?.pending_cert_id ?? "",
               ssl_auto_renew: sslCert?.auto_renew ?? false,
             }
           : null,
@@ -4763,6 +4773,114 @@ app.delete("/api/v1/edgeone/bindings/:id", async (c) => {
   if (!existing) throw httpErr(404, "not_found", "自动同步绑定不存在");
   await repo.deleteEdgeOneCertBinding(c.env, id);
   return c.json({ ok: true });
+});
+
+app.post("/api/v1/edgeone/auto-cert/config", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const hasEnabled = payload["enabled"] !== undefined && payload["enabled"] !== null;
+  const hasDays = payload["days"] !== undefined && payload["days"] !== null;
+  if (!hasEnabled && !hasDays) {
+    throw invalid("请提供要更新的自动申请配置项");
+  }
+  const days = hasDays ? asInt(payload["days"], "提前触发天数") : undefined;
+  if (days !== undefined && (days < 1 || days > 30)) {
+    throw invalid("提前触发天数应在 1–30 天之间");
+  }
+  const config = await tencentEdgeOne.setEdgeOneAutoCertConfig(c.env, {
+    enabled: hasEnabled ? Boolean(payload["enabled"]) : undefined,
+    days,
+  });
+  await repo.addEvent(
+    c.env,
+    "ssl",
+    messages.ev("EdgeOne 自动证书策略已更新", "CDN服务"),
+    {
+      detail: config.enabled
+        ? `已开启：CDN 域名证书到期 ${config.days} 天内自动申请并替换`
+        : "已关闭 EdgeOne 临期证书自动巡检",
+    },
+  );
+  return c.json({ ok: true, auto_cert: config });
+});
+
+app.post("/api/v1/edgeone/auto-cert/check", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const accountIdRaw = payload["account_id"];
+  const accountId =
+    accountIdRaw !== undefined && accountIdRaw !== null && String(accountIdRaw).trim() !== ""
+      ? parseEdgeOneAccountId(accountIdRaw as number | string)
+      : undefined;
+  const site =
+    payload["site"] !== undefined && payload["site"] !== null
+      ? tencentEdgeOne.normalizeSite(strOf(payload["site"]))
+      : undefined;
+  const zoneIdRaw = strOf(payload["zone_id"]).trim();
+  const zoneId = zoneIdRaw ? parseEdgeOneZoneId(zoneIdRaw) : undefined;
+
+  try {
+    const summary = await tencentSsl.reconcileEdgeOneCertificates(c.env, {
+      force: true,
+      accountId,
+      site,
+      zoneId,
+    });
+    return c.json({ ok: true, summary });
+  } catch (err) {
+    throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/edgeone/zones/:zoneId/cert/auto-apply", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const zoneId = parseEdgeOneZoneId(c.req.param("zoneId"));
+  const payload = await jsonBody(c);
+  const accountId = parseEdgeOneAccountId(payload["account_id"] as number | string | undefined);
+  const site = tencentEdgeOne.normalizeSite(strOf(payload["site"]));
+  const domain = strOf(payload["domain"]).trim().toLowerCase();
+  const zoneName = strOf(payload["zone_name"]).trim();
+  const oldEdgeCertId = strOf(payload["old_cert_id"]).trim();
+  const oldEdgeCertMode = strOf(payload["old_cert_mode"]).trim().toLowerCase();
+  if (!domain) throw invalid("请指定需要自动申请证书的加速域名");
+
+  const dnsVerifyModeRaw = strOf(payload["dns_verify_mode"]).trim();
+  let dnsVerifyMode: repo.SslVerifyMode | undefined;
+  if (dnsVerifyModeRaw) {
+    if (
+      dnsVerifyModeRaw !== "dns_account" &&
+      dnsVerifyModeRaw !== "tencent_auto" &&
+      dnsVerifyModeRaw !== "manual"
+    ) {
+      throw invalid("不支持的 DNS 验证方式");
+    }
+    dnsVerifyMode = dnsVerifyModeRaw;
+  }
+  const dnsAccountId = Math.trunc(numOf(payload["dns_account_id"], 0));
+
+  try {
+    const cfg = await tencentEdgeOne.getEdgeOneAutoCertConfig(c.env);
+    const result = await tencentSsl.ensureEdgeOneDomainCert(c.env, {
+      accountId,
+      site,
+      zoneId,
+      zoneName,
+      domain,
+      oldEdgeCertId,
+      oldEdgeCertMode,
+      thresholdDays: cfg.days,
+      force: true,
+      dnsVerifyMode,
+      dnsAccountId: dnsAccountId > 0 ? dnsAccountId : undefined,
+      reason: "manual",
+    });
+    return c.json({ ok: true, result });
+  } catch (err) {
+    throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
+  }
 });
 
 app.get("/api/v1/edgeone/zones/:zoneId/analytics", async (c) => {

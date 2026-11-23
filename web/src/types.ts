@@ -954,7 +954,38 @@ export type EdgeOneCertBinding = {
   last_error: string
   ssl_domain?: string
   ssl_cert_current_id?: string
+  ssl_status?: SslCertStatus | ''
+  ssl_pending_cert_id?: string
   ssl_auto_renew?: boolean
+}
+
+export type EdgeOneAutoCertConfig = {
+  enabled: boolean
+  days: number
+}
+
+export type EdgeOneAutoCertActionResult = {
+  domain: string
+  action: 'replaced' | 'applied' | 'renewed' | 'pending' | 'skipped'
+  deployed: boolean
+  certId?: string
+  sslCertRowId?: number
+  detail: string
+}
+
+export type EdgeOneAutoCertCheckSummary = {
+  enabled: boolean
+  days: number
+  scannedScopes: number
+  scannedDomains: number
+  expiringFound: number
+  replaced: number
+  applied: number
+  renewed: number
+  pending: number
+  skipped: number
+  results: EdgeOneAutoCertActionResult[]
+  errors: string[]
 }
 
 export type EdgeOneZone = {
