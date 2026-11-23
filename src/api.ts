@@ -62,6 +62,7 @@ import * as tencentSsl from "./tencent_ssl";
 import * as tencentEdgeOne from "./tencent_edgeone";
 import * as nps from "./nps";
 import * as ddnsIp from "./ddns_ip";
+import * as ddnsSsh from "./ddns_ssh";
 import {
   BRAND,
   CSRF_COOKIE,
@@ -6157,6 +6158,11 @@ function serializeDdnsIpMonitor(
     latency_cm_ms: m.latency_cm_ms,
     latency_updated_at: m.latency_updated_at,
     latency_source: m.latency_source,
+    ssh_port: m.ssh_port,
+    ssh_username: m.ssh_username,
+    ssh_auth_type: m.ssh_auth_type,
+    has_ssh_secret: m.has_ssh_secret,
+    has_ssh_passphrase: m.has_ssh_passphrase,
     remark: m.remark,
     online,
     install_cmd: `curl -fsSL "${installUrl}" | sudo sh`,
@@ -6494,6 +6500,63 @@ app.post("/api/v1/ddns-ip/monitors/:monitorId/probe", async (c) => {
   } catch (err) {
     throw httpErr(400, "ddns_ip_probe_error", err instanceof Error ? err.message : String(err));
   }
+});
+
+app.get("/api/v1/ddns-ip/monitors/:monitorId/ssh", async (c) => {
+  await requireAdmin(c);
+  const monitorId = paramInt(c, "monitorId");
+  const monitor = await repo.getDdnsIpMonitor(c.env, monitorId, false, true);
+  if (!monitor) throw httpErr(404, "not_found", "DDNS IP 监控记录不存在");
+  return ddnsSsh.upgradeDdnsIpSshWebSocket(c.req.raw, c.env, monitor);
+});
+
+app.patch("/api/v1/ddns-ip/monitors/:monitorId/ssh-config", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const monitorId = paramInt(c, "monitorId");
+  const existing = await repo.getDdnsIpMonitor(c.env, monitorId, false, false);
+  if (!existing) throw httpErr(404, "not_found", "DDNS IP 监控记录不存在");
+
+  const payload = await jsonBody(c);
+  const patch: Parameters<typeof repo.updateDdnsIpSshConfig>[2] = {};
+  if (payload["ssh_port"] !== undefined) {
+    const port = Math.trunc(numOf(payload["ssh_port"], existing.ssh_port));
+    if (port < 1 || port > 65535 || port === 25) {
+      throw invalid("SSH 端口无效（须为 1–65535 且不能为 25）");
+    }
+    patch.ssh_port = port;
+  }
+  if (payload["ssh_username"] !== undefined) {
+    const user = strOf(payload["ssh_username"]).trim();
+    if (!user || user.length > 64 || /[\r\n\0]/.test(user)) {
+      throw invalid("SSH 用户名格式无效");
+    }
+    patch.ssh_username = user;
+  }
+  if (payload["ssh_auth_type"] !== undefined) {
+    patch.ssh_auth_type =
+      strOf(payload["ssh_auth_type"]).trim() === "private_key" ? "private_key" : "password";
+  }
+  if (boolOf(payload["clear_secret"])) {
+    patch.clear_secret = true;
+  } else {
+    if (typeof payload["ssh_secret"] === "string" && payload["ssh_secret"].length > 0) {
+      patch.ssh_secret = payload["ssh_secret"];
+    }
+    if (typeof payload["ssh_passphrase"] === "string") {
+      patch.ssh_passphrase = payload["ssh_passphrase"];
+    }
+  }
+
+  await repo.updateDdnsIpSshConfig(c.env, monitorId, patch);
+  const updated = (await repo.getDdnsIpMonitor(c.env, monitorId, true, false))!;
+  const account = await repo.getDnsAccount(c.env, updated.dns_account_id, false);
+  const accountMap = new Map(account ? [[account.id, account]] : []);
+  const origin = new URL(c.req.url).origin;
+  return c.json({
+    ok: true,
+    item: serializeDdnsIpMonitor(updated, origin, accountMap),
+  });
 });
 
 app.post("/api/v1/ddns-ip/monitors/:monitorId/rotate-token", async (c) => {

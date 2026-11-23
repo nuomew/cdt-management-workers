@@ -333,6 +333,11 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     latency_cm_ms     REAL,
     latency_updated_at INTEGER NOT NULL DEFAULT 0,
     latency_source    TEXT    NOT NULL DEFAULT '',
+    ssh_port          INTEGER NOT NULL DEFAULT 22,
+    ssh_username      TEXT    NOT NULL DEFAULT 'root',
+    ssh_auth_type     TEXT    NOT NULL DEFAULT 'password',
+    ssh_secret_enc    TEXT    NOT NULL DEFAULT '',
+    ssh_passphrase_enc TEXT   NOT NULL DEFAULT '',
     remark            TEXT    NOT NULL DEFAULT '',
     created_at        INTEGER NOT NULL DEFAULT 0,
     updated_at        INTEGER NOT NULL DEFAULT 0,
@@ -434,6 +439,26 @@ export function ensureSchema(db: D1Database | undefined): Promise<void> {
       [
         "latency_source",
         "ALTER TABLE ddns_ip_monitors ADD COLUMN latency_source TEXT NOT NULL DEFAULT ''",
+      ],
+      [
+        "ssh_port",
+        "ALTER TABLE ddns_ip_monitors ADD COLUMN ssh_port INTEGER NOT NULL DEFAULT 22",
+      ],
+      [
+        "ssh_username",
+        "ALTER TABLE ddns_ip_monitors ADD COLUMN ssh_username TEXT NOT NULL DEFAULT 'root'",
+      ],
+      [
+        "ssh_auth_type",
+        "ALTER TABLE ddns_ip_monitors ADD COLUMN ssh_auth_type TEXT NOT NULL DEFAULT 'password'",
+      ],
+      [
+        "ssh_secret_enc",
+        "ALTER TABLE ddns_ip_monitors ADD COLUMN ssh_secret_enc TEXT NOT NULL DEFAULT ''",
+      ],
+      [
+        "ssh_passphrase_enc",
+        "ALTER TABLE ddns_ip_monitors ADD COLUMN ssh_passphrase_enc TEXT NOT NULL DEFAULT ''",
       ],
     ];
     for (const [colName, ddl] of ddnsUpgrades) {

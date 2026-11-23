@@ -28,6 +28,7 @@ import type {
   DnsAccount,
 } from '../types'
 import { Badge, Empty, Modal, Segmented, Switch } from './ui'
+import DdnsSshOverlay from './DdnsSshOverlay'
 
 type ConfirmRequest = {
   title: string
@@ -160,6 +161,7 @@ export default function DdnsIpView({
     editing: null,
   })
   const [installModalItem, setInstallModalItem] = useState<DdnsIpMonitorItem | null>(null)
+  const [sshItem, setSshItem] = useState<DdnsIpMonitorItem | null>(null)
 
   const copyText = useCallback(
     async (text: string, key: string, label: string) => {
@@ -183,6 +185,9 @@ export default function DdnsIpView({
       setDnsAccounts(res.dns_accounts)
       setInstallModalItem((prev) =>
         prev ? res.items.find((x) => x.id === prev.id) ?? null : null,
+      )
+      setSshItem((prev) =>
+        prev ? res.items.find((x) => x.id === prev.id) ?? prev : null,
       )
     } catch (err) {
       onToast(err instanceof Error ? err.message : '加载 DDNS IP 列表失败', 'error')
@@ -654,9 +659,10 @@ export default function DdnsIpView({
                         <button
                           type="button"
                           className="btn primary sm"
-                          onClick={() => setInstallModalItem(it)}
+                          onClick={() => setSshItem(it)}
+                          title="打开浏览器 SSH 远程终端连接到该服务器"
                         >
-                          <Terminal size={12} /> 一键安装命令
+                          <Terminal size={12} /> 远程终端
                         </button>
                         <button
                           type="button"
@@ -793,6 +799,19 @@ export default function DdnsIpView({
           onCopy={copyText}
           onRotateToken={() => rotateToken(installModalItem)}
           onClose={() => setInstallModalItem(null)}
+        />
+      )}
+
+      {/* Full-Screen Web SSH Remote Terminal Overlay */}
+      {sshItem && (
+        <DdnsSshOverlay
+          monitor={sshItem}
+          onToast={onToast}
+          onMonitorUpdated={(updated) => {
+            setItems((prev) => prev.map((x) => (x.id === updated.id ? updated : x)))
+            setSshItem(updated)
+          }}
+          onClose={() => setSshItem(null)}
         />
       )}
     </div>

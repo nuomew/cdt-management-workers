@@ -1237,6 +1237,7 @@ export type NpsBootstrapResponse = {
 /* ----------------------------------------------------- DDNS IP (Dynamic IPv4) */
 
 export type DdnsIpStatus = 'waiting' | 'synced' | 'unchanged' | 'error' | 'disabled'
+export type DdnsIpSshAuthType = 'password' | 'private_key'
 
 export type DdnsIpMonitorItem = {
   id: number
@@ -1267,6 +1268,11 @@ export type DdnsIpMonitorItem = {
   latency_cm_ms: number | null
   latency_updated_at: number
   latency_source: string
+  ssh_port: number
+  ssh_username: string
+  ssh_auth_type: DdnsIpSshAuthType
+  has_ssh_secret: boolean
+  has_ssh_passphrase: boolean
   remark: string
   online: boolean
   install_cmd: string

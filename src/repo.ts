@@ -3747,6 +3747,7 @@ export async function deleteNpsCertBindingByHost(
 // ---------------------------------------------------------------------------
 
 export type DdnsIpStatus = "waiting" | "synced" | "unchanged" | "error" | "disabled";
+export type DdnsIpSshAuthType = "password" | "private_key";
 
 export interface DdnsIpMonitorRecord {
   id: number;
@@ -3777,6 +3778,15 @@ export interface DdnsIpMonitorRecord {
   latency_cm_ms: number | null;
   latency_updated_at: number;
   latency_source: string;
+  ssh_port: number;
+  ssh_username: string;
+  ssh_auth_type: DdnsIpSshAuthType;
+  has_ssh_secret: boolean;
+  has_ssh_passphrase: boolean;
+  /** Decrypted SSH password/private key (empty unless `decryptSsh: true`). */
+  ssh_secret: string;
+  /** Decrypted SSH private key passphrase (empty unless `decryptSsh: true`). */
+  ssh_passphrase: string;
   remark: string;
   created_at: number;
   updated_at: number;
@@ -3820,17 +3830,32 @@ async function normalizeDdnsIpRow(
   env: Env,
   row: Row,
   decryptToken: boolean,
+  decryptSsh = false,
 ): Promise<DdnsIpMonitorRecord> {
   const rawEnc = asStr(row["token_enc"]);
   let token = "";
   if (decryptToken && rawEnc) {
     token = await decrypt(rawEnc, env.ENCRYPTION_KEY);
   }
+  const rawSshSecretEnc = asStr(row["ssh_secret_enc"]);
+  const rawSshPassEnc = asStr(row["ssh_passphrase_enc"]);
+  let sshSecret = "";
+  let sshPassphrase = "";
+  if (decryptSsh && rawSshSecretEnc) {
+    sshSecret = await decrypt(rawSshSecretEnc, env.ENCRYPTION_KEY);
+  }
+  if (decryptSsh && rawSshPassEnc) {
+    sshPassphrase = await decrypt(rawSshPassEnc, env.ENCRYPTION_KEY);
+  }
   const stRaw = asStr(row["last_status"], "waiting").toLowerCase();
   const status: DdnsIpStatus =
     stRaw === "synced" || stRaw === "unchanged" || stRaw === "error" || stRaw === "disabled"
       ? stRaw
       : "waiting";
+  const sshAuthRaw = asStr(row["ssh_auth_type"], "password").toLowerCase();
+  const sshAuthType: DdnsIpSshAuthType = sshAuthRaw === "private_key" ? "private_key" : "password";
+  const sshPortRaw = asInt(row["ssh_port"], 22);
+  const sshPort = sshPortRaw >= 1 && sshPortRaw <= 65535 ? sshPortRaw : 22;
   return {
     id: asInt(row["id"]),
     label: asStr(row["label"]),
@@ -3859,6 +3884,13 @@ async function normalizeDdnsIpRow(
     latency_cm_ms: asNullableLatency(row["latency_cm_ms"]),
     latency_updated_at: asInt(row["latency_updated_at"]),
     latency_source: asStr(row["latency_source"]),
+    ssh_port: sshPort,
+    ssh_username: asStr(row["ssh_username"], "root") || "root",
+    ssh_auth_type: sshAuthType,
+    has_ssh_secret: Boolean(rawSshSecretEnc),
+    has_ssh_passphrase: Boolean(rawSshPassEnc),
+    ssh_secret: sshSecret,
+    ssh_passphrase: sshPassphrase,
     remark: asStr(row["remark"]),
     created_at: asInt(row["created_at"]),
     updated_at: asInt(row["updated_at"]),
@@ -3872,7 +3904,7 @@ export async function listDdnsIpMonitors(
   const rows = await query<Row>(env.DB, "SELECT * FROM ddns_ip_monitors ORDER BY id DESC");
   const out: DdnsIpMonitorRecord[] = [];
   for (const r of rows) {
-    out.push(await normalizeDdnsIpRow(env, r, Boolean(opts?.decryptToken)));
+    out.push(await normalizeDdnsIpRow(env, r, Boolean(opts?.decryptToken), false));
   }
   return out;
 }
@@ -3881,10 +3913,11 @@ export async function getDdnsIpMonitor(
   env: Env,
   id: number,
   decryptToken = false,
+  decryptSsh = false,
 ): Promise<DdnsIpMonitorRecord | null> {
   const row = await queryOne<Row>(env.DB, "SELECT * FROM ddns_ip_monitors WHERE id=?", [id]);
   if (!row) return null;
-  return normalizeDdnsIpRow(env, row, decryptToken);
+  return normalizeDdnsIpRow(env, row, decryptToken, decryptSsh);
 }
 
 export async function getDdnsIpMonitorByToken(
@@ -4127,6 +4160,59 @@ export async function rotateDdnsIpMonitorToken(env: Env, id: number): Promise<st
     [tokenEnc, tokenHash, nowSeconds(), id],
   );
   return token;
+}
+
+export async function updateDdnsIpSshConfig(
+  env: Env,
+  id: number,
+  patch: {
+    ssh_port?: number;
+    ssh_username?: string;
+    ssh_auth_type?: DdnsIpSshAuthType;
+    ssh_secret?: string;
+    ssh_passphrase?: string;
+    clear_secret?: boolean;
+  },
+): Promise<void> {
+  const existing = await queryOne<Row>(env.DB, "SELECT id FROM ddns_ip_monitors WHERE id=?", [id]);
+  if (!existing) throw new Error("DDNS IP 监控记录不存在");
+  const sets: string[] = [];
+  const params: (string | number)[] = [];
+  if (patch.ssh_port !== undefined) {
+    const port = Math.max(1, Math.min(65535, Math.trunc(patch.ssh_port)));
+    sets.push("ssh_port=?");
+    params.push(port);
+  }
+  if (patch.ssh_username !== undefined) {
+    const user = patch.ssh_username.trim().slice(0, 64) || "root";
+    sets.push("ssh_username=?");
+    params.push(user);
+  }
+  if (patch.ssh_auth_type !== undefined) {
+    sets.push("ssh_auth_type=?");
+    params.push(patch.ssh_auth_type === "private_key" ? "private_key" : "password");
+  }
+  if (patch.clear_secret) {
+    sets.push("ssh_secret_enc=?", "ssh_passphrase_enc=?");
+    params.push("", "");
+  } else {
+    if (patch.ssh_secret !== undefined && patch.ssh_secret.length > 0) {
+      sets.push("ssh_secret_enc=?");
+      params.push(await encrypt(patch.ssh_secret, env.ENCRYPTION_KEY));
+    }
+    if (patch.ssh_passphrase !== undefined) {
+      sets.push("ssh_passphrase_enc=?");
+      params.push(
+        patch.ssh_passphrase.length > 0
+          ? await encrypt(patch.ssh_passphrase, env.ENCRYPTION_KEY)
+          : "",
+      );
+    }
+  }
+  if (sets.length === 0) return;
+  sets.push("updated_at=?");
+  params.push(nowSeconds(), id);
+  await execute(env.DB, `UPDATE ddns_ip_monitors SET ${sets.join(", ")} WHERE id=?`, params);
 }
 
 export async function deleteDdnsIpMonitor(env: Env, id: number): Promise<void> {
