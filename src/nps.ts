@@ -936,17 +936,30 @@ export async function deleteClient(
   }
 }
 
+const ALL_TUNNEL_MODES: readonly NpsTunnelMode[] = [
+  "tcp",
+  "udp",
+  "socks5",
+  "httpProxy",
+  "secret",
+  "p2p",
+  "file",
+];
+
 export async function listTunnels(
   env: Env,
   server: NpsServerRecord,
   opts?: { clientId?: number; type?: string; search?: string },
 ): Promise<{ total: number; items: NpsTunnelItem[] }> {
+  const typeFilter = (opts?.type ?? "").trim();
+  const clientId = opts?.clientId && opts.clientId > 0 ? Math.trunc(opts.clientId) : 0;
+  const search = (opts?.search ?? "").trim();
+
   if (isDryRun(env)) {
     const st = getDryNps(server);
-    const typeFilter = (opts?.type ?? "").trim();
-    const kw = (opts?.search ?? "").trim().toLowerCase();
+    const kw = search.toLowerCase();
     const items = [...st.tunnels.values()].filter((t) => {
-      if (opts?.clientId && t.clientId !== opts.clientId) return false;
+      if (clientId > 0 && t.clientId !== clientId) return false;
       if (typeFilter && t.mode !== typeFilter) return false;
       if (
         kw &&
@@ -958,12 +971,51 @@ export async function listTunnels(
     });
     return { total: items.length, items };
   }
+
+  // Upstream `yisier/nps` (`server/server.go:GetTunnel`) filters out every tunnel
+  // when BOTH `type == ""` AND `client_id == 0`:
+  //   `if (... ) || (typeVal == "" && clientId != v.Client.Id) { return true }`
+  // Therefore, when listing all tunnels across all clients without a specific
+  // protocol filter, query every valid NPS tunnel mode in parallel and merge.
+  if (!typeFilter && clientId === 0) {
+    // Pre-warm clock offset or web session once so parallel calls do not stampede auth.
+    const baseUrl = normalizeNpsBaseUrl(server.base_url);
+    if (server.auth_mode === "web_login") {
+      await loginWebSession(server, baseUrl);
+    } else {
+      await getServerClockOffset(baseUrl);
+    }
+
+    const pages = await Promise.all(
+      ALL_TUNNEL_MODES.map((mode) =>
+        npsPost(server, "/index/gettunnel", {
+          offset: 0,
+          limit: 500,
+          client_id: 0,
+          type: mode,
+          search,
+        }),
+      ),
+    );
+
+    const byId = new Map<number, NpsTunnelItem>();
+    for (const resp of pages) {
+      for (const item of asArr<Record<string, unknown>>(resp["rows"]).map(parseTunnelItem)) {
+        if (item.id > 0) {
+          byId.set(item.id, item);
+        }
+      }
+    }
+    const items = [...byId.values()].sort((a, b) => a.id - b.id);
+    return { total: items.length, items };
+  }
+
   const resp = await npsPost(server, "/index/gettunnel", {
     offset: 0,
     limit: 500,
-    client_id: opts?.clientId || 0,
-    type: (opts?.type ?? "").trim(),
-    search: (opts?.search ?? "").trim(),
+    client_id: clientId,
+    type: typeFilter,
+    search,
   });
   const rows = asArr<Record<string, unknown>>(resp["rows"]).map(parseTunnelItem);
   return { total: asNum(resp["total"], rows.length), items: rows };
