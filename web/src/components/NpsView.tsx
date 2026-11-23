@@ -6,6 +6,7 @@ import {
   CloudLightning,
   Copy,
   Edit3,
+  ExternalLink,
   Eye,
   EyeOff,
   Globe2,
@@ -129,6 +130,45 @@ function tunnelModeBadge(mode: NpsTunnelMode): { label: string; tone: 'blue' | '
   if (mode === 'p2p') return { label: 'P2P', tone: 'blue' }
   if (mode === 'secret') return { label: 'SECRET', tone: 'gray' }
   return { label: mode.toUpperCase(), tone: 'gray' }
+}
+
+function isWildcardBindHost(host: string): boolean {
+  const h = host.trim().toLowerCase()
+  return !h || h === '0.0.0.0' || h === '::' || h === '[::]' || h === '*'
+}
+
+function formatHostForEndpoint(host: string): string {
+  const h = host.trim()
+  if (!h) return ''
+  // Wrap bare IPv6 literals in brackets for host:port notation
+  if (h.includes(':') && !h.startsWith('[')) return `[${h}]`
+  return h
+}
+
+function resolveTunnelEndpoint(
+  serverIp: string,
+  bridge: NpsBridgeInfo | null,
+  baseUrl: string,
+  port: number,
+): { host: string; endpoint: string; openUrl: string } {
+  if (!port || port <= 0) return { host: '', endpoint: '—', openUrl: '' }
+  let host = !isWildcardBindHost(serverIp) ? serverIp.trim() : ''
+  if (!host && baseUrl) {
+    try {
+      const parsed = new URL(baseUrl).hostname
+      if (!isWildcardBindHost(parsed)) host = parsed
+    } catch {
+      // ignore invalid baseUrl
+    }
+  }
+  if (!host && bridge?.ip && !isWildcardBindHost(bridge.ip)) {
+    host = bridge.ip.trim()
+  }
+  const formattedHost = formatHostForEndpoint(host)
+  const endpoint = formattedHost ? `${formattedHost}:${port}` : `:${port}`
+  const proto = port === 443 || port === 8443 ? 'https' : 'http'
+  const openUrl = formattedHost ? `${proto}://${endpoint}` : ''
+  return { host: formattedHost, endpoint, openUrl }
 }
 
 function buildNpcCommand(bridge: NpsBridgeInfo | null, baseUrl: string, verifyKey: string): string {
@@ -1046,7 +1086,12 @@ export default function NpsView({
                             {pagedTunnels.map((t) => {
                               const mb = tunnelModeBadge(t.mode)
                               const cli = clientNameMap.get(t.clientId)
-                              const portLabel = t.port > 0 ? `${t.serverIp ? `${t.serverIp}:` : ':'}${t.port}` : '—'
+                              const { endpoint, openUrl } = resolveTunnelEndpoint(
+                                t.serverIp,
+                                bridge,
+                                currentServer.base_url,
+                                t.port,
+                              )
                               const busy = busyKey === `tun-toggle-${t.id}`
                               return (
                                 <tr key={t.id}>
@@ -1057,22 +1102,33 @@ export default function NpsView({
                                   </td>
                                   <td>
                                     <div className="nps-mono-cell">
-                                      <code>{portLabel}</code>
+                                      <code>{endpoint}</code>
                                       {t.port > 0 && (
-                                        <button
-                                          type="button"
-                                          className="btn ghost icon sm"
-                                          onClick={() =>
-                                            void copyText(
-                                              `${t.serverIp || bridge?.ip || ''}:${t.port}`,
-                                              `port-${t.id}`,
-                                              '监听地址',
-                                            )
-                                          }
-                                          title="复制监听地址"
-                                        >
-                                          {copiedKey === `port-${t.id}` ? <Check size={11} /> : <Copy size={11} />}
-                                        </button>
+                                        <>
+                                          <button
+                                            type="button"
+                                            className="btn ghost icon sm"
+                                            onClick={() =>
+                                              void copyText(endpoint, `port-${t.id}`, '访问地址')
+                                            }
+                                            title={`复制访问地址 ${endpoint}`}
+                                          >
+                                            {copiedKey === `port-${t.id}` ? <Check size={11} /> : <Copy size={11} />}
+                                          </button>
+                                          {openUrl && (
+                                            <a
+                                              href={openUrl}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="btn ghost icon sm"
+                                              style={{ textDecoration: 'none' }}
+                                              title={`新窗口打开 ${openUrl}`}
+                                              aria-label={`新窗口打开 ${openUrl}`}
+                                            >
+                                              <ExternalLink size={11} />
+                                            </a>
+                                          )}
+                                        </>
                                       )}
                                     </div>
                                   </td>
