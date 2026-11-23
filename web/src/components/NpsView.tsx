@@ -744,13 +744,15 @@ export default function NpsView({
                       </button>
                     )}
                   </div>
-                  <button
-                    type="button"
-                    className="btn primary sm"
-                    onClick={() => setClientModal({ open: true, editing: null })}
-                  >
-                    <Plus size={13} /> 新增客户端
-                  </button>
+                  <div className="nps-head-actions">
+                    <button
+                      type="button"
+                      className="btn primary sm"
+                      onClick={() => setClientModal({ open: true, editing: null })}
+                    >
+                      <Plus size={13} /> 新增客户端
+                    </button>
+                  </div>
                 </div>
 
                 {clients.length === 0 ? (
@@ -918,21 +920,7 @@ export default function NpsView({
                     <h3>端口映射规则</h3>
                     <span className="nps-count-pill">{filteredTunnels.length}</span>
                   </div>
-                  <div className="nps-toolbar-right">
-                    <Segmented
-                      value={protoFilter}
-                      options={TUNNEL_FILTER_OPTIONS}
-                      onChange={setProtoFilter}
-                    />
-                    <div className="nps-search-wrap">
-                      <Search size={13} />
-                      <input
-                        className="input nps-search-input"
-                        placeholder="搜索端口 / 目标 / 备注…"
-                        value={searchText}
-                        onChange={(e) => setSearchText(e.target.value)}
-                      />
-                    </div>
+                  <div className="nps-head-actions">
                     <button
                       type="button"
                       className="btn primary sm"
@@ -947,6 +935,23 @@ export default function NpsView({
                     >
                       <Plus size={13} /> 添加端口映射
                     </button>
+                  </div>
+                </div>
+
+                <div className="nps-filter-bar">
+                  <Segmented
+                    value={protoFilter}
+                    options={TUNNEL_FILTER_OPTIONS}
+                    onChange={setProtoFilter}
+                  />
+                  <div className="nps-search-wrap">
+                    <Search size={13} />
+                    <input
+                      className="input nps-search-input"
+                      placeholder="搜索端口 / 目标 / 备注…"
+                      value={searchText}
+                      onChange={(e) => setSearchText(e.target.value)}
+                    />
                   </div>
                 </div>
 
@@ -1091,31 +1096,7 @@ export default function NpsView({
                   <h3>域名绑定与 HTTPS 证书联动</h3>
                   <span className="nps-count-pill">{filteredHosts.length}</span>
                 </div>
-                <div className="nps-toolbar-right">
-                  {clients.length > 0 && (
-                    <select
-                      className="select nps-client-filter"
-                      value={clientFilter}
-                      onChange={(e) => setClientFilter(Number(e.target.value))}
-                      aria-label="按客户端筛选"
-                    >
-                      <option value={0}>全部客户端</option>
-                      {clients.map((c) => (
-                        <option key={c.id} value={c.id}>
-                          #{c.id} {c.remark || `客户端 #${c.id}`}
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                  <div className="nps-search-wrap">
-                    <Search size={13} />
-                    <input
-                      className="input nps-search-input"
-                      placeholder="搜索域名 / 目标 / 备注…"
-                      value={searchText}
-                      onChange={(e) => setSearchText(e.target.value)}
-                    />
-                  </div>
+                <div className="nps-head-actions">
                   <button
                     type="button"
                     className="btn ghost sm"
@@ -1144,6 +1125,33 @@ export default function NpsView({
                   >
                     <Plus size={13} /> 新增域名绑定
                   </button>
+                </div>
+              </div>
+
+              <div className="nps-filter-bar">
+                {clients.length > 0 && (
+                  <select
+                    className="select nps-client-filter"
+                    value={clientFilter}
+                    onChange={(e) => setClientFilter(Number(e.target.value))}
+                    aria-label="按客户端筛选"
+                  >
+                    <option value={0}>全部客户端</option>
+                    {clients.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        #{c.id} {c.remark || `客户端 #${c.id}`}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <div className="nps-search-wrap">
+                  <Search size={13} />
+                  <input
+                    className="input nps-search-input"
+                    placeholder="搜索域名 / 目标 / 备注…"
+                    value={searchText}
+                    onChange={(e) => setSearchText(e.target.value)}
+                  />
                 </div>
               </div>
 
