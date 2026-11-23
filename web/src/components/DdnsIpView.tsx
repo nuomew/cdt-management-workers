@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Check,
+  ChevronLeft,
+  ChevronRight,
   Copy,
   Edit3,
   Globe2,
@@ -42,6 +44,8 @@ interface DdnsIpViewProps {
   onChanged?: () => void
 }
 
+const MONITORS_PAGE_SIZE = 3
+
 const INTERVAL_PRESETS = [
   { value: '30', label: '30 秒' },
   { value: '60', label: '60 秒' },
@@ -50,6 +54,33 @@ const INTERVAL_PRESETS = [
 ]
 
 const DNSPOD_LINE_OPTIONS = ['默认', '电信', '联通', '移动', '教育网', '境外']
+
+function buildPageTokens(current: number, total: number): (number | 'ellipsis')[] {
+  if (total <= 7) {
+    return Array.from({ length: total }, (_, idx) => idx + 1)
+  }
+  const pages = new Set<number>([1, total, current, current - 1, current + 1])
+  if (current <= 3) {
+    pages.add(2)
+    pages.add(3)
+    pages.add(4)
+  } else if (current >= total - 2) {
+    pages.add(total - 1)
+    pages.add(total - 2)
+    pages.add(total - 3)
+  }
+  const sorted = Array.from(pages)
+    .filter((p) => p >= 1 && p <= total)
+    .sort((a, b) => a - b)
+  const result: (number | 'ellipsis')[] = []
+  for (let i = 0; i < sorted.length; i += 1) {
+    if (i > 0 && sorted[i] - sorted[i - 1] > 1) {
+      result.push('ellipsis')
+    }
+    result.push(sorted[i])
+  }
+  return result
+}
 
 function formatTime(ts: number): string {
   if (!ts) return '尚未上报'
@@ -108,6 +139,7 @@ export default function DdnsIpView({
   const [items, setItems] = useState<DdnsIpMonitorItem[]>([])
   const [dnsAccounts, setDnsAccounts] = useState<DnsAccount[]>([])
   const [searchText, setSearchText] = useState('')
+  const [page, setPage] = useState(1)
   const [copiedKey, setCopiedKey] = useState('')
   const [busyKey, setBusyKey] = useState('')
 
@@ -171,6 +203,26 @@ export default function DdnsIpView({
         .includes(kw),
     )
   }, [items, searchText])
+
+  const totalPages = Math.max(1, Math.ceil(filteredItems.length / MONITORS_PAGE_SIZE))
+  const safePage = Math.min(page, totalPages)
+
+  useEffect(() => {
+    setPage(1)
+  }, [searchText])
+
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages)
+  }, [page, totalPages])
+
+  const pagedItems = useMemo(
+    () =>
+      filteredItems.slice(
+        (safePage - 1) * MONITORS_PAGE_SIZE,
+        safePage * MONITORS_PAGE_SIZE,
+      ),
+    [filteredItems, safePage],
+  )
 
   const toggleEnabled = async (it: DdnsIpMonitorItem) => {
     const key = `toggle-${it.id}`
@@ -374,8 +426,9 @@ export default function DdnsIpView({
               />
             </div>
           ) : (
+            <>
             <div className="nps-host-list">
-              {filteredItems.map((it) => {
+              {pagedItems.map((it) => {
                 const isToggling = busyKey === `toggle-${it.id}`
                 const isSyncing = busyKey === `sync-${it.id}`
                 return (
@@ -397,15 +450,15 @@ export default function DdnsIpView({
                         {!it.enabled ? (
                           <Badge tone="gray">已暂停</Badge>
                         ) : it.online ? (
-                          <Badge tone="green">
+                          <span className="badge ddns-ip-status-online">
+                            <i className="dot" />
                             <Wifi size={10} /> 监控在线
-                          </Badge>
-                        ) : it.last_seen_at > 0 ? (
-                          <Badge tone="amber">
-                            <WifiOff size={10} /> 心跳超时
-                          </Badge>
+                          </span>
                         ) : (
-                          <Badge tone="blue">等待首次上报</Badge>
+                          <span className="badge ddns-ip-status-offline">
+                            <i className="dot" />
+                            <WifiOff size={10} /> {it.last_seen_at > 0 ? '监控离线' : '监控离线 · 待上报'}
+                          </span>
                         )}
                         <Badge
                           tone={it.account_provider === 'cloudflare' ? 'amber' : 'blue'}
@@ -581,6 +634,53 @@ export default function DdnsIpView({
                 )
               })}
             </div>
+            {totalPages > 1 && (
+              <div className="card certs-pager" style={{ marginTop: 0 }}>
+                <div className="cloud-dns-pager" role="navigation" aria-label="DDNS IP 监控列表分页">
+                  <span className="cloud-dns-pager-info">
+                    共 {filteredItems.length} 条 · 第 {(safePage - 1) * MONITORS_PAGE_SIZE + 1}–
+                    {Math.min(safePage * MONITORS_PAGE_SIZE, filteredItems.length)} 条（{safePage} /{' '}
+                    {totalPages} 页）
+                  </span>
+                  <div className="cloud-dns-pager-controls">
+                    <button
+                      type="button"
+                      className="cloud-dns-page-btn"
+                      disabled={safePage <= 1}
+                      onClick={() => setPage(Math.max(1, safePage - 1))}
+                    >
+                      <ChevronLeft size={13} /> 上一页
+                    </button>
+                    {buildPageTokens(safePage, totalPages).map((tok, idx) =>
+                      tok === 'ellipsis' ? (
+                        <span key={`e-${idx}`} className="cloud-dns-page-ellipsis">
+                          …
+                        </span>
+                      ) : (
+                        <button
+                          key={tok}
+                          type="button"
+                          className={`cloud-dns-page-btn${tok === safePage ? ' on' : ''}`}
+                          aria-current={tok === safePage ? 'page' : undefined}
+                          onClick={() => setPage(tok)}
+                        >
+                          {tok}
+                        </button>
+                      ),
+                    )}
+                    <button
+                      type="button"
+                      className="cloud-dns-page-btn"
+                      disabled={safePage >= totalPages}
+                      onClick={() => setPage(Math.min(totalPages, safePage + 1))}
+                    >
+                      下一页 <ChevronRight size={13} />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+            </>
           )}
         </section>
       )}
