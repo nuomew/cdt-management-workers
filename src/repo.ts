@@ -2868,6 +2868,7 @@ export async function updateDnsAccount(
 }
 
 export async function deleteDnsAccount(env: Env, id: number): Promise<void> {
+  await execute(env.DB, "DELETE FROM ddns_ip_monitors WHERE dns_account_id=?", [id]);
   await execute(env.DB, "DELETE FROM dns_accounts WHERE id=?", [id]);
 }
 
@@ -3740,4 +3741,353 @@ export async function deleteNpsCertBindingByHost(
     [npsServerId, npsHostId],
   );
 }
+
+// ---------------------------------------------------------------------------
+// Dynamic IPv4 DDNS Monitors (ddns_ip_monitors)
+// ---------------------------------------------------------------------------
+
+export type DdnsIpStatus = "waiting" | "synced" | "unchanged" | "error" | "disabled";
+
+export interface DdnsIpMonitorRecord {
+  id: number;
+  label: string;
+  dns_account_id: number;
+  root_domain: string;
+  zone_id: string;
+  sub_domain: string;
+  fqdn: string;
+  ttl: number;
+  proxied: boolean;
+  line: string;
+  interval_seconds: number;
+  /** Decrypted reporting token (empty unless `decryptToken: true` was requested). */
+  token: string;
+  token_hash: string;
+  enabled: boolean;
+  record_id: string;
+  current_ip: string;
+  resolved_ip: string;
+  hostname: string;
+  last_seen_at: number;
+  last_changed_at: number;
+  last_status: DdnsIpStatus;
+  last_error: string;
+  remark: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface DdnsIpMonitorInput {
+  label?: string;
+  dns_account_id: number;
+  root_domain: string;
+  zone_id?: string;
+  sub_domain: string;
+  fqdn: string;
+  ttl?: number;
+  proxied?: boolean;
+  line?: string;
+  interval_seconds?: number;
+  enabled?: boolean;
+  remark?: string;
+}
+
+export function generateDdnsIpToken(): string {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export async function sha256Hex(input: string): Promise<string> {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function normalizeDdnsIpRow(
+  env: Env,
+  row: Row,
+  decryptToken: boolean,
+): Promise<DdnsIpMonitorRecord> {
+  const rawEnc = asStr(row["token_enc"]);
+  let token = "";
+  if (decryptToken && rawEnc) {
+    token = await decrypt(rawEnc, env.ENCRYPTION_KEY);
+  }
+  const stRaw = asStr(row["last_status"], "waiting").toLowerCase();
+  const status: DdnsIpStatus =
+    stRaw === "synced" || stRaw === "unchanged" || stRaw === "error" || stRaw === "disabled"
+      ? stRaw
+      : "waiting";
+  return {
+    id: asInt(row["id"]),
+    label: asStr(row["label"]),
+    dns_account_id: asInt(row["dns_account_id"]),
+    root_domain: asStr(row["root_domain"]).trim().toLowerCase(),
+    zone_id: asStr(row["zone_id"]),
+    sub_domain: asStr(row["sub_domain"], "@"),
+    fqdn: asStr(row["fqdn"]).trim().toLowerCase(),
+    ttl: asInt(row["ttl"], 600),
+    proxied: asInt(row["proxied"]) === 1,
+    line: asStr(row["line"], "默认"),
+    interval_seconds: Math.max(30, Math.min(3600, asInt(row["interval_seconds"], 60))),
+    token,
+    token_hash: asStr(row["token_hash"]),
+    enabled: asInt(row["enabled"], 1) === 1,
+    record_id: asStr(row["record_id"]),
+    current_ip: asStr(row["current_ip"]),
+    resolved_ip: asStr(row["resolved_ip"]),
+    hostname: asStr(row["hostname"]),
+    last_seen_at: asInt(row["last_seen_at"]),
+    last_changed_at: asInt(row["last_changed_at"]),
+    last_status: status,
+    last_error: asStr(row["last_error"]),
+    remark: asStr(row["remark"]),
+    created_at: asInt(row["created_at"]),
+    updated_at: asInt(row["updated_at"]),
+  };
+}
+
+export async function listDdnsIpMonitors(
+  env: Env,
+  opts?: { decryptToken?: boolean },
+): Promise<DdnsIpMonitorRecord[]> {
+  const rows = await query<Row>(env.DB, "SELECT * FROM ddns_ip_monitors ORDER BY id DESC");
+  const out: DdnsIpMonitorRecord[] = [];
+  for (const r of rows) {
+    out.push(await normalizeDdnsIpRow(env, r, Boolean(opts?.decryptToken)));
+  }
+  return out;
+}
+
+export async function getDdnsIpMonitor(
+  env: Env,
+  id: number,
+  decryptToken = false,
+): Promise<DdnsIpMonitorRecord | null> {
+  const row = await queryOne<Row>(env.DB, "SELECT * FROM ddns_ip_monitors WHERE id=?", [id]);
+  if (!row) return null;
+  return normalizeDdnsIpRow(env, row, decryptToken);
+}
+
+export async function getDdnsIpMonitorByToken(
+  env: Env,
+  rawToken: string,
+): Promise<DdnsIpMonitorRecord | null> {
+  const clean = rawToken.trim();
+  if (!clean) return null;
+  const hash = await sha256Hex(clean);
+  const row = await queryOne<Row>(
+    env.DB,
+    "SELECT * FROM ddns_ip_monitors WHERE token_hash=?",
+    [hash],
+  );
+  if (!row) return null;
+  // Constant-time verification against decrypted token in addition to SHA-256 index lookup.
+  const record = await normalizeDdnsIpRow(env, row, true);
+  if (!record.token || record.token.length !== clean.length) return null;
+  let diff = 0;
+  for (let i = 0; i < clean.length; i += 1) {
+    diff |= clean.charCodeAt(i) ^ record.token.charCodeAt(i);
+  }
+  return diff === 0 ? record : null;
+}
+
+export async function createDdnsIpMonitor(
+  env: Env,
+  input: DdnsIpMonitorInput,
+): Promise<{ id: number; token: string }> {
+  const now = nowSeconds();
+  const token = generateDdnsIpToken();
+  const tokenEnc = await encrypt(token, env.ENCRYPTION_KEY);
+  const tokenHash = await sha256Hex(token);
+  const interval = Math.max(30, Math.min(3600, Math.trunc(input.interval_seconds ?? 60)));
+  const res = await execute(
+    env.DB,
+    `INSERT INTO ddns_ip_monitors
+       (label, dns_account_id, root_domain, zone_id, sub_domain, fqdn, ttl, proxied, line,
+        interval_seconds, token_enc, token_hash, enabled, last_status, remark, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      (input.label ?? "").trim(),
+      input.dns_account_id,
+      input.root_domain.trim().toLowerCase(),
+      (input.zone_id ?? "").trim(),
+      input.sub_domain.trim() || "@",
+      input.fqdn.trim().toLowerCase(),
+      Math.max(1, Math.trunc(input.ttl ?? 600)),
+      input.proxied ? 1 : 0,
+      (input.line ?? "默认").trim() || "默认",
+      interval,
+      tokenEnc,
+      tokenHash,
+      input.enabled === false ? 0 : 1,
+      input.enabled === false ? "disabled" : "waiting",
+      (input.remark ?? "").trim(),
+      now,
+      now,
+    ],
+  );
+  return { id: res.lastInsertRowId, token };
+}
+
+export async function updateDdnsIpMonitor(
+  env: Env,
+  id: number,
+  patch: Partial<DdnsIpMonitorInput>,
+): Promise<void> {
+  const existing = await queryOne<Row>(env.DB, "SELECT * FROM ddns_ip_monitors WHERE id=?", [id]);
+  if (!existing) throw new Error("DDNS IP 监控记录不存在");
+  const sets: string[] = [];
+  const params: (string | number)[] = [];
+  let domainChanged = false;
+
+  if (patch.label !== undefined) {
+    sets.push("label=?");
+    params.push(patch.label.trim());
+  }
+  if (patch.dns_account_id !== undefined) {
+    if (patch.dns_account_id !== asInt(existing["dns_account_id"])) domainChanged = true;
+    sets.push("dns_account_id=?");
+    params.push(patch.dns_account_id);
+  }
+  if (patch.root_domain !== undefined) {
+    const clean = patch.root_domain.trim().toLowerCase();
+    if (clean !== asStr(existing["root_domain"]).toLowerCase()) domainChanged = true;
+    sets.push("root_domain=?");
+    params.push(clean);
+  }
+  if (patch.zone_id !== undefined) {
+    sets.push("zone_id=?");
+    params.push(patch.zone_id.trim());
+  }
+  if (patch.sub_domain !== undefined) {
+    const clean = patch.sub_domain.trim() || "@";
+    if (clean !== asStr(existing["sub_domain"])) domainChanged = true;
+    sets.push("sub_domain=?");
+    params.push(clean);
+  }
+  if (patch.fqdn !== undefined) {
+    const clean = patch.fqdn.trim().toLowerCase();
+    if (clean !== asStr(existing["fqdn"]).toLowerCase()) domainChanged = true;
+    sets.push("fqdn=?");
+    params.push(clean);
+  }
+  if (patch.ttl !== undefined) {
+    sets.push("ttl=?");
+    params.push(Math.max(1, Math.trunc(patch.ttl)));
+  }
+  if (patch.proxied !== undefined) {
+    sets.push("proxied=?");
+    params.push(patch.proxied ? 1 : 0);
+  }
+  if (patch.line !== undefined) {
+    sets.push("line=?");
+    params.push(patch.line.trim() || "默认");
+  }
+  if (patch.interval_seconds !== undefined) {
+    sets.push("interval_seconds=?");
+    params.push(Math.max(30, Math.min(3600, Math.trunc(patch.interval_seconds))));
+  }
+  if (patch.enabled !== undefined) {
+    sets.push("enabled=?");
+    params.push(patch.enabled ? 1 : 0);
+    if (!patch.enabled) {
+      sets.push("last_status=?");
+      params.push("disabled");
+    } else if (asStr(existing["last_status"]) === "disabled") {
+      sets.push("last_status=?");
+      params.push(asStr(existing["resolved_ip"]) ? "synced" : "waiting");
+    }
+  }
+  if (patch.remark !== undefined) {
+    sets.push("remark=?");
+    params.push(patch.remark.trim());
+  }
+  if (domainChanged) {
+    sets.push("record_id=?", "resolved_ip=?");
+    params.push("", "");
+  }
+  if (sets.length === 0) return;
+  sets.push("updated_at=?");
+  params.push(nowSeconds(), id);
+  await execute(env.DB, `UPDATE ddns_ip_monitors SET ${sets.join(", ")} WHERE id=?`, params);
+}
+
+export async function updateDdnsIpMonitorRuntime(
+  env: Env,
+  id: number,
+  patch: {
+    record_id?: string;
+    zone_id?: string;
+    current_ip?: string;
+    resolved_ip?: string;
+    hostname?: string;
+    last_seen_at?: number;
+    last_changed_at?: number;
+    last_status?: DdnsIpStatus;
+    last_error?: string;
+  },
+): Promise<void> {
+  const sets: string[] = [];
+  const params: (string | number)[] = [];
+  if (patch.record_id !== undefined) {
+    sets.push("record_id=?");
+    params.push(patch.record_id);
+  }
+  if (patch.zone_id !== undefined) {
+    sets.push("zone_id=?");
+    params.push(patch.zone_id);
+  }
+  if (patch.current_ip !== undefined) {
+    sets.push("current_ip=?");
+    params.push(patch.current_ip);
+  }
+  if (patch.resolved_ip !== undefined) {
+    sets.push("resolved_ip=?");
+    params.push(patch.resolved_ip);
+  }
+  if (patch.hostname !== undefined) {
+    sets.push("hostname=?");
+    params.push(patch.hostname.slice(0, 128));
+  }
+  if (patch.last_seen_at !== undefined) {
+    sets.push("last_seen_at=?");
+    params.push(patch.last_seen_at);
+  }
+  if (patch.last_changed_at !== undefined) {
+    sets.push("last_changed_at=?");
+    params.push(patch.last_changed_at);
+  }
+  if (patch.last_status !== undefined) {
+    sets.push("last_status=?");
+    params.push(patch.last_status);
+  }
+  if (patch.last_error !== undefined) {
+    sets.push("last_error=?");
+    params.push(patch.last_error.slice(0, 500));
+  }
+  if (sets.length === 0) return;
+  sets.push("updated_at=?");
+  params.push(nowSeconds(), id);
+  await execute(env.DB, `UPDATE ddns_ip_monitors SET ${sets.join(", ")} WHERE id=?`, params);
+}
+
+export async function rotateDdnsIpMonitorToken(env: Env, id: number): Promise<string> {
+  const existing = await queryOne<Row>(env.DB, "SELECT id FROM ddns_ip_monitors WHERE id=?", [id]);
+  if (!existing) throw new Error("DDNS IP 监控记录不存在");
+  const token = generateDdnsIpToken();
+  const tokenEnc = await encrypt(token, env.ENCRYPTION_KEY);
+  const tokenHash = await sha256Hex(token);
+  await execute(
+    env.DB,
+    "UPDATE ddns_ip_monitors SET token_enc=?, token_hash=?, updated_at=? WHERE id=?",
+    [tokenEnc, tokenHash, nowSeconds(), id],
+  );
+  return token;
+}
+
+export async function deleteDdnsIpMonitor(env: Env, id: number): Promise<void> {
+  await execute(env.DB, "DELETE FROM ddns_ip_monitors WHERE id=?", [id]);
+}
+
 

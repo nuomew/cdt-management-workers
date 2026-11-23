@@ -61,6 +61,7 @@ import * as dnsProviders from "./dns_providers";
 import * as tencentSsl from "./tencent_ssl";
 import * as tencentEdgeOne from "./tencent_edgeone";
 import * as nps from "./nps";
+import * as ddnsIp from "./ddns_ip";
 import {
   BRAND,
   CSRF_COOKIE,
@@ -1048,6 +1049,7 @@ app.get("/api/v1/overview", async (c) => {
   const dnsAccounts = await repo.listDnsAccounts(env);
   const sslCerts = await repo.listSslCertificates(env);
   const npsServers = await repo.listNpsServers(env);
+  const ddnsIpMonitors = await repo.listDdnsIpMonitors(env);
   const managed = managedMap(groups, keepalives);
   const books = await dns.recordBooks(env);
   const cards = await dns.booksForCards(env, now.epoch, books);
@@ -1077,6 +1079,7 @@ app.get("/api/v1/overview", async (c) => {
     dns_accounts_count: dnsAccounts.length,
     ssl_certs_count: sslCerts.length,
     nps_servers_count: npsServers.length,
+    ddns_ip_count: ddnsIpMonitors.length,
     notifications: {
       channels,
       telegram: channels.includes("telegram"),
@@ -6096,6 +6099,429 @@ app.post("/api/v1/nps/certs/reconcile", async (c) => {
   } catch (err) {
     throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
   }
+});
+
+// -- DDNS IP (Dynamic Public IPv4 Monitor & Auto-DNS Sync) ----------------------
+
+function extractDdnsIpToken(c: Ctx, body?: AnyRow): string {
+  const fromQuery = (c.req.query("token") ?? "").trim();
+  if (fromQuery) return fromQuery;
+  const auth = (c.req.header("authorization") ?? "").trim();
+  if (auth.toLowerCase().startsWith("bearer ")) {
+    const bearer = auth.slice(7).trim();
+    if (bearer) return bearer;
+  }
+  const fromHeader = (c.req.header("x-ddns-token") ?? "").trim();
+  if (fromHeader) return fromHeader;
+  return body ? strOf(body["token"]).trim() : "";
+}
+
+function serializeDdnsIpMonitor(
+  m: repo.DdnsIpMonitorRecord,
+  origin: string,
+  accountMap: Map<number, repo.DnsAccountRecord>,
+) {
+  const acct = accountMap.get(m.dns_account_id);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const onlineWindow = Math.max(180, m.interval_seconds * 3 + 30);
+  const online = Boolean(m.last_seen_at > 0 && nowSec - m.last_seen_at <= onlineWindow);
+  const installUrl = `${origin}/api/v1/ddns-ip/install.sh?token=${encodeURIComponent(m.token)}`;
+  const uninstallUrl = `${origin}/api/v1/ddns-ip/install.sh?token=${encodeURIComponent(m.token)}&action=uninstall`;
+  const reportUrl = `${origin}/api/v1/ddns-ip/report?token=${encodeURIComponent(m.token)}`;
+  return {
+    id: m.id,
+    label: m.label,
+    dns_account_id: m.dns_account_id,
+    account_label: acct?.label ?? `#${m.dns_account_id}`,
+    account_provider: acct?.provider ?? "tencent",
+    root_domain: m.root_domain,
+    zone_id: m.zone_id,
+    sub_domain: m.sub_domain,
+    fqdn: m.fqdn,
+    ttl: m.ttl,
+    proxied: m.proxied,
+    line: m.line,
+    interval_seconds: m.interval_seconds,
+    token: m.token,
+    enabled: m.enabled,
+    record_id: m.record_id,
+    current_ip: m.current_ip,
+    resolved_ip: m.resolved_ip,
+    hostname: m.hostname,
+    last_seen_at: m.last_seen_at,
+    last_changed_at: m.last_changed_at,
+    last_status: m.last_status,
+    last_error: m.last_error,
+    remark: m.remark,
+    online,
+    install_cmd: `curl -fsSL "${installUrl}" | sudo sh`,
+    uninstall_cmd: `curl -fsSL "${uninstallUrl}" | sudo sh`,
+    report_cmd: `curl -4fsS "${reportUrl}"`,
+    report_url: reportUrl,
+    created_at: m.created_at,
+    updated_at: m.updated_at,
+  };
+}
+
+// Public endpoint: echo caller's public IPv4 (used by `curl -4` agent probe).
+app.get("/api/v1/ddns-ip/ip", (c) => {
+  const ip = ddnsIp.extractRequestIpv4(c.req.raw);
+  if (!ip) {
+    return c.text("no_ipv4_detected", 400, { "Cache-Control": "no-store" });
+  }
+  return c.text(`${ip}\n`, 200, { "Cache-Control": "no-store" });
+});
+
+// Public token-authenticated endpoint: generate POSIX one-click install/uninstall script.
+app.get("/api/v1/ddns-ip/install.sh", async (c) => {
+  const token = extractDdnsIpToken(c);
+  if (!token) {
+    return c.text("# Missing DDNS IP token\nexit 1\n", 401, { "Cache-Control": "no-store" });
+  }
+  const monitor = await repo.getDdnsIpMonitorByToken(c.env, token);
+  if (!monitor) {
+    return c.text("# Invalid or rotated DDNS IP token\nexit 1\n", 401, {
+      "Cache-Control": "no-store",
+    });
+  }
+  const action = (c.req.query("action") ?? "").trim().toLowerCase() === "uninstall"
+    ? "uninstall"
+    : "install";
+  const origin = new URL(c.req.url).origin;
+  const script = ddnsIp.renderLinuxInstallScript(origin, monitor, action);
+  return new Response(script, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
+});
+
+async function handleDdnsIpReport(c: Ctx) {
+  let body: AnyRow = {};
+  if (c.req.method === "POST") {
+    body = await jsonBody(c).catch(() => ({} as AnyRow));
+  }
+  const token = extractDdnsIpToken(c, body);
+  if (!token) {
+    throw httpErr(401, "unauthorized", "缺少 DDNS IP 上报密钥 token");
+  }
+  const monitor = await repo.getDdnsIpMonitorByToken(c.env, token);
+  if (!monitor) {
+    throw httpErr(401, "unauthorized", "DDNS IP 上报密钥无效或已重置");
+  }
+
+  const explicitIp = (c.req.query("ip") ?? strOf(body["ip"])).trim();
+  const detectedIp = ddnsIp.extractRequestIpv4(c.req.raw);
+  const targetIp = explicitIp || detectedIp;
+  if (!targetIp || !ddnsIp.isValidIpv4(targetIp)) {
+    throw invalid(
+      "未能识别到有效公网 IPv4（若本机优先走 IPv6，请使用 curl -4 或通过 ?ip=x.x.x.x 参数传入 IPv4）",
+    );
+  }
+  const hostname = (c.req.query("host") ?? c.req.query("hostname") ?? strOf(body["hostname"])).trim();
+  const force = boolOf(c.req.query("force") ?? body["force"]);
+
+  try {
+    const result = await ddnsIp.syncDdnsIpMonitor(c.env, monitor, targetIp, {
+      hostname,
+      force,
+      source: "agent",
+    });
+    return c.json(result);
+  } catch (err) {
+    throw httpErr(400, "ddns_ip_error", err instanceof Error ? err.message : String(err));
+  }
+}
+
+app.get("/api/v1/ddns-ip/report", handleDdnsIpReport);
+app.post("/api/v1/ddns-ip/report", handleDdnsIpReport);
+
+// Admin endpoints for DDNS IP management UI
+app.get("/api/v1/ddns-ip/monitors", async (c) => {
+  await requireAdmin(c);
+  const [monitors, accounts] = await Promise.all([
+    repo.listDdnsIpMonitors(c.env, { decryptToken: true }),
+    repo.listDnsAccounts(c.env, { decryptSecret: false }),
+  ]);
+  const accountMap = new Map(accounts.map((a) => [a.id, a]));
+  const origin = new URL(c.req.url).origin;
+  return c.json({
+    items: monitors.map((m) => serializeDdnsIpMonitor(m, origin, accountMap)),
+    dns_accounts: accounts.map(sanitizeDnsAccount),
+    origin,
+  });
+});
+
+app.post("/api/v1/ddns-ip/monitors", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const dnsAccountId = asInt(payload["dns_account_id"], "云解析账号");
+  const account = await repo.getDnsAccount(c.env, dnsAccountId, true);
+  if (!account) throw invalid("所选云解析账号不存在");
+
+  let normalized;
+  try {
+    normalized = ddnsIp.normalizeSubDomainAndFqdn(
+      strOf(payload["sub_domain"]),
+      strOf(payload["root_domain"]),
+    );
+  } catch (err) {
+    throw invalid(err instanceof Error ? err.message : String(err));
+  }
+
+  // Resolve and verify zone ownership under the selected DNS account.
+  let zoneId = strOf(payload["zone_id"]).trim();
+  if (!zoneId) {
+    try {
+      const resolved = await dnsProviders.resolveDomainZone(c.env, account, normalized.fqdn);
+      zoneId = resolved.zoneId;
+    } catch (err) {
+      throw invalid(err instanceof Error ? err.message : "所选云解析账号下未找到该域名");
+    }
+  }
+
+  const defaultTtl = account.provider === "cloudflare" ? 1 : 600;
+  const ttl = Math.max(1, Math.min(86400, Math.trunc(numOf(payload["ttl"], defaultTtl))));
+  const intervalSeconds = Math.max(
+    30,
+    Math.min(3600, Math.trunc(numOf(payload["interval_seconds"], 60))),
+  );
+  const label = strOf(payload["label"]).trim();
+  const remark = strOf(payload["remark"]).trim();
+  const proxied = account.provider === "cloudflare" && boolOf(payload["proxied"]);
+  const line = account.provider === "tencent" ? strOf(payload["line"]).trim() || "默认" : "";
+  const enabled = payload["enabled"] === undefined ? true : boolOf(payload["enabled"]);
+
+  let created: { id: number; token: string };
+  try {
+    created = await repo.createDdnsIpMonitor(c.env, {
+      label,
+      dns_account_id: dnsAccountId,
+      root_domain: normalized.rootDomain,
+      zone_id: zoneId,
+      sub_domain: normalized.subDomain,
+      fqdn: normalized.fqdn,
+      ttl,
+      proxied,
+      line,
+      interval_seconds: intervalSeconds,
+      enabled,
+      remark,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("UNIQUE")) {
+      throw invalid(`该云解析账号下已存在域名 ${normalized.fqdn} 的 DDNS IP 绑定`);
+    }
+    throw invalid(msg);
+  }
+
+  let initialSync: ddnsIp.DdnsIpSyncResult | null = null;
+  let initialSyncError = "";
+  const initialIp = strOf(payload["initial_ip"]).trim();
+  if (initialIp) {
+    const row = (await repo.getDdnsIpMonitor(c.env, created.id, true))!;
+    try {
+      initialSync = await ddnsIp.syncDdnsIpMonitor(c.env, row, initialIp, {
+        force: true,
+        source: "manual",
+      });
+    } catch (err) {
+      initialSyncError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  await repo.addEvent(
+    c.env,
+    "dns",
+    messages.ev("DDNS IP 绑定已创建", messages.objServer(normalized.fqdn)),
+    {
+      detail: `${label ? `[${label}] ` : ""}云解析账号「${account.label}」· 间隔 ${intervalSeconds} 秒`,
+    },
+  );
+
+  const saved = (await repo.getDdnsIpMonitor(c.env, created.id, true))!;
+  const origin = new URL(c.req.url).origin;
+  const accountMap = new Map([[account.id, account]]);
+  return c.json({
+    ok: true,
+    id: created.id,
+    item: serializeDdnsIpMonitor(saved, origin, accountMap),
+    sync_result: initialSync,
+    sync_error: initialSyncError,
+  });
+});
+
+app.patch("/api/v1/ddns-ip/monitors/:monitorId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const monitorId = paramInt(c, "monitorId");
+  const existing = await repo.getDdnsIpMonitor(c.env, monitorId, true);
+  if (!existing) throw httpErr(404, "not_found", "DDNS IP 监控记录不存在");
+
+  const payload = await jsonBody(c);
+  const nextAccountId =
+    payload["dns_account_id"] !== undefined
+      ? asInt(payload["dns_account_id"], "云解析账号")
+      : existing.dns_account_id;
+  const account = await repo.getDnsAccount(c.env, nextAccountId, true);
+  if (!account) throw invalid("所选云解析账号不存在");
+
+  const patch: Partial<repo.DdnsIpMonitorInput> = {};
+  if (payload["label"] !== undefined) patch.label = strOf(payload["label"]).trim();
+  if (payload["remark"] !== undefined) patch.remark = strOf(payload["remark"]).trim();
+  if (payload["enabled"] !== undefined) patch.enabled = boolOf(payload["enabled"]);
+  if (payload["interval_seconds"] !== undefined) {
+    patch.interval_seconds = Math.max(
+      30,
+      Math.min(3600, Math.trunc(numOf(payload["interval_seconds"], existing.interval_seconds))),
+    );
+  }
+  if (payload["ttl"] !== undefined) {
+    patch.ttl = Math.max(1, Math.min(86400, Math.trunc(numOf(payload["ttl"], existing.ttl))));
+  }
+  if (payload["proxied"] !== undefined) {
+    patch.proxied = account.provider === "cloudflare" && boolOf(payload["proxied"]);
+  }
+  if (payload["line"] !== undefined) {
+    patch.line = account.provider === "tencent" ? strOf(payload["line"]).trim() || "默认" : "";
+  }
+
+  const domainFieldsTouched =
+    payload["dns_account_id"] !== undefined ||
+    payload["root_domain"] !== undefined ||
+    payload["sub_domain"] !== undefined;
+  if (domainFieldsTouched) {
+    let normalized;
+    try {
+      normalized = ddnsIp.normalizeSubDomainAndFqdn(
+        payload["sub_domain"] !== undefined ? strOf(payload["sub_domain"]) : existing.sub_domain,
+        payload["root_domain"] !== undefined ? strOf(payload["root_domain"]) : existing.root_domain,
+      );
+    } catch (err) {
+      throw invalid(err instanceof Error ? err.message : String(err));
+    }
+    let zoneId = strOf(payload["zone_id"]).trim();
+    if (!zoneId) {
+      try {
+        const resolved = await dnsProviders.resolveDomainZone(c.env, account, normalized.fqdn);
+        zoneId = resolved.zoneId;
+      } catch (err) {
+        throw invalid(err instanceof Error ? err.message : "所选云解析账号下未找到该域名");
+      }
+    }
+    patch.dns_account_id = nextAccountId;
+    patch.root_domain = normalized.rootDomain;
+    patch.zone_id = zoneId;
+    patch.sub_domain = normalized.subDomain;
+    patch.fqdn = normalized.fqdn;
+  }
+
+  try {
+    await repo.updateDdnsIpMonitor(c.env, monitorId, patch);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("UNIQUE")) {
+      throw invalid(`该云解析账号下已存在相同域名的 DDNS IP 绑定`);
+    }
+    throw invalid(msg);
+  }
+
+  const updated = (await repo.getDdnsIpMonitor(c.env, monitorId, true))!;
+  const origin = new URL(c.req.url).origin;
+  const accountMap = new Map([[account.id, account]]);
+  return c.json({
+    ok: true,
+    item: serializeDdnsIpMonitor(updated, origin, accountMap),
+  });
+});
+
+app.post("/api/v1/ddns-ip/monitors/:monitorId/sync", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const monitorId = paramInt(c, "monitorId");
+  const monitor = await repo.getDdnsIpMonitor(c.env, monitorId, true);
+  if (!monitor) throw httpErr(404, "not_found", "DDNS IP 监控记录不存在");
+
+  const payload = await jsonBody(c).catch(() => ({} as AnyRow));
+  const ip = strOf(payload["ip"]).trim() || monitor.current_ip;
+  if (!ip) {
+    throw invalid("当前尚未收到服务器 IPv4 上报，请先在目标服务器运行一键安装命令或填写 IPv4");
+  }
+  try {
+    const result = await ddnsIp.syncDdnsIpMonitor(c.env, monitor, ip, {
+      force: true,
+      source: "manual",
+    });
+    return c.json({ ok: true, result });
+  } catch (err) {
+    throw httpErr(400, "ddns_ip_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/ddns-ip/monitors/:monitorId/rotate-token", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const monitorId = paramInt(c, "monitorId");
+  const existing = await repo.getDdnsIpMonitor(c.env, monitorId, false);
+  if (!existing) throw httpErr(404, "not_found", "DDNS IP 监控记录不存在");
+
+  await repo.rotateDdnsIpMonitorToken(c.env, monitorId);
+  const updated = (await repo.getDdnsIpMonitor(c.env, monitorId, true))!;
+  const account = await repo.getDnsAccount(c.env, updated.dns_account_id, false);
+  const accountMap = new Map(account ? [[account.id, account]] : []);
+  const origin = new URL(c.req.url).origin;
+
+  await repo.addEvent(
+    c.env,
+    "dns",
+    messages.ev("DDNS IP 上报密钥已重置", messages.objServer(updated.fqdn)),
+    { level: "warn", detail: "旧安装脚本中的密钥已失效，请在目标服务器重新运行新的一键安装命令" },
+  );
+
+  return c.json({
+    ok: true,
+    item: serializeDdnsIpMonitor(updated, origin, accountMap),
+  });
+});
+
+app.delete("/api/v1/ddns-ip/monitors/:monitorId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const monitorId = paramInt(c, "monitorId");
+  const existing = await repo.getDdnsIpMonitor(c.env, monitorId, false);
+  if (!existing) throw httpErr(404, "not_found", "DDNS IP 监控记录不存在");
+
+  const deleteRemote = boolOf(c.req.query("delete_record"));
+  let remoteDeleted = false;
+  if (deleteRemote && existing.record_id) {
+    const account = await repo.getDnsAccount(c.env, existing.dns_account_id, true);
+    if (account) {
+      await dnsProviders
+        .deleteRecord(c.env, account, existing.root_domain, existing.zone_id, existing.record_id)
+        .then(() => {
+          remoteDeleted = true;
+        })
+        .catch(() => {});
+    }
+  }
+
+  await repo.deleteDdnsIpMonitor(c.env, monitorId);
+  await repo.addEvent(
+    c.env,
+    "dns",
+    messages.ev("DDNS IP 绑定已删除", messages.objServer(existing.fqdn)),
+    {
+      level: "warn",
+      detail: remoteDeleted
+        ? `已删除绑定并同步删除云端 A 记录（#${existing.record_id}）`
+        : "仅移除面板监控绑定，云端现有解析记录保持不变",
+    },
+  );
+  return c.json({ ok: true, remote_deleted: remoteDeleted });
 });
 
 export default app;

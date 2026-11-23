@@ -13,6 +13,7 @@ import {
   LoaderCircle,
   LogOut,
   Network,
+  Radio,
   RefreshCw,
   Repeat,
   Server as ServerIcon,
@@ -60,6 +61,7 @@ import GroupDialog from './components/GroupDialog'
 import SettingsDrawer from './components/SettingsDrawer'
 import ConfirmDialog from './components/ConfirmDialog'
 import DNSView from './components/DNSView'
+import DdnsIpView from './components/DdnsIpView'
 import CertsView from './components/CertsView'
 import EdgeOneView from './components/EdgeOneView'
 import NpsView from './components/NpsView'
@@ -75,6 +77,7 @@ type View =
   | 'servers'
   | 'swas'
   | 'dns'
+  | 'ddns_ip'
   | 'certs'
   | 'cdn'
   | 'nps_tunnels'
@@ -135,6 +138,7 @@ const NAV_SECTIONS: NavSection[] = [
     icon: Globe2,
     children: [
       { key: 'dns', label: '域名解析', icon: Globe2 },
+      { key: 'ddns_ip', label: 'DDNS IP', icon: Radio },
       { key: 'certs', label: '证书服务', icon: ShieldCheck },
       { key: 'cdn', label: 'CDN服务', icon: CloudLightning },
     ],
@@ -155,6 +159,7 @@ function navCount(key: View, overview: Overview): number {
   if (key === 'keepalive') return overview.keepalives.length
   if (key === 'shift') return overview.groups.length
   if (key === 'dns') return (overview.dns_accounts_count ?? 0) || (overview.dns?.records.length ?? 0)
+  if (key === 'ddns_ip') return overview.ddns_ip_count ?? 0
   if (key === 'certs') return overview.ssl_certs_count ?? 0
   if (key === 'nps_tunnels') return overview.nps_servers_count ?? 0
   return 0
@@ -1103,6 +1108,15 @@ export default function App() {
             onOpenSettings={() => setView('settings')}
             onToast={toast}
             onCloudChanged={() => void loadAll()}
+          />
+        )}
+
+        {view === 'ddns_ip' && (
+          <DdnsIpView
+            onToast={toast}
+            onConfirm={setConfirmBox}
+            onGoDnsAccounts={() => setView('dns')}
+            onChanged={() => void loadAll()}
           />
         )}
 

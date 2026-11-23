@@ -196,6 +196,7 @@ export type Overview = {
   dns_accounts_count?: number
   ssl_certs_count?: number
   nps_servers_count?: number
+  ddns_ip_count?: number
   notifications: {
     channels: string[]
     telegram: boolean
@@ -1231,6 +1232,50 @@ export type NpsBootstrapResponse = {
   managed_certs: NpsManagedCertOption[]
   bindings: NpsHostCertBinding[]
   edgeone_bindings: EdgeOneCertBinding[]
+}
+
+/* ----------------------------------------------------- DDNS IP (Dynamic IPv4) */
+
+export type DdnsIpStatus = 'waiting' | 'synced' | 'unchanged' | 'error' | 'disabled'
+
+export type DdnsIpMonitorItem = {
+  id: number
+  label: string
+  dns_account_id: number
+  account_label: string
+  account_provider: DnsAccountProvider
+  root_domain: string
+  zone_id: string
+  sub_domain: string
+  fqdn: string
+  ttl: number
+  proxied: boolean
+  line: string
+  interval_seconds: number
+  token: string
+  enabled: boolean
+  record_id: string
+  current_ip: string
+  resolved_ip: string
+  hostname: string
+  last_seen_at: number
+  last_changed_at: number
+  last_status: DdnsIpStatus
+  last_error: string
+  remark: string
+  online: boolean
+  install_cmd: string
+  uninstall_cmd: string
+  report_cmd: string
+  report_url: string
+  created_at: number
+  updated_at: number
+}
+
+export type DdnsIpMonitorsResponse = {
+  items: DdnsIpMonitorItem[]
+  dns_accounts: DnsAccount[]
+  origin: string
 }
 
 

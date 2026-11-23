@@ -30,13 +30,14 @@ const REQUIRED_TABLES = [
   "edgeone_cert_bindings",
   "nps_servers",
   "nps_cert_bindings",
+  "ddns_ip_monitors",
   "events",
   "flags",
   "revoked_sessions",
   "traffic_samples",
 ] as const;
 
-// Consolidated DDL matching migrations/0001_schema.sql .. 0007_nps.sql so a
+// Consolidated DDL matching migrations/0001_schema.sql .. 0008_ddns_ip.sql so a
 // freshly auto-provisioned or upgraded D1 database works without manual SQL setup.
 const SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS settings (
@@ -304,6 +305,36 @@ const SCHEMA_STATEMENTS: readonly string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_nps_bindings_ssl ON nps_cert_bindings(ssl_cert_id)`,
   `CREATE INDEX IF NOT EXISTS idx_nps_bindings_server ON nps_cert_bindings(nps_server_id, domain)`,
+  `CREATE TABLE IF NOT EXISTS ddns_ip_monitors (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    label             TEXT    NOT NULL DEFAULT '',
+    dns_account_id    INTEGER NOT NULL,
+    root_domain       TEXT    NOT NULL,
+    zone_id           TEXT    NOT NULL DEFAULT '',
+    sub_domain        TEXT    NOT NULL DEFAULT '@',
+    fqdn              TEXT    NOT NULL,
+    ttl               INTEGER NOT NULL DEFAULT 600,
+    proxied           INTEGER NOT NULL DEFAULT 0,
+    line              TEXT    NOT NULL DEFAULT '默认',
+    interval_seconds  INTEGER NOT NULL DEFAULT 60,
+    token_enc         TEXT    NOT NULL DEFAULT '',
+    token_hash        TEXT    NOT NULL DEFAULT '',
+    enabled           INTEGER NOT NULL DEFAULT 1,
+    record_id         TEXT    NOT NULL DEFAULT '',
+    current_ip        TEXT    NOT NULL DEFAULT '',
+    resolved_ip       TEXT    NOT NULL DEFAULT '',
+    hostname          TEXT    NOT NULL DEFAULT '',
+    last_seen_at      INTEGER NOT NULL DEFAULT 0,
+    last_changed_at   INTEGER NOT NULL DEFAULT 0,
+    last_status       TEXT    NOT NULL DEFAULT 'waiting',
+    last_error        TEXT    NOT NULL DEFAULT '',
+    remark            TEXT    NOT NULL DEFAULT '',
+    created_at        INTEGER NOT NULL DEFAULT 0,
+    updated_at        INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(dns_account_id, fqdn)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_ddns_ip_token_hash ON ddns_ip_monitors(token_hash)`,
+  `CREATE INDEX IF NOT EXISTS idx_ddns_ip_account ON ddns_ip_monitors(dns_account_id)`,
 ];
 
 const TABLE_CHECK_SQL = `SELECT count(*) AS cnt FROM sqlite_master WHERE type='table' AND name IN (${REQUIRED_TABLES.map((t) => `'${t}'`).join(",")})`;
