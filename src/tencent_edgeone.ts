@@ -163,6 +163,15 @@ function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
 
+/**
+ * Formats a Unix epoch timestamp (in seconds) as strict UTC ISO-8601 without
+ * fractional milliseconds (`YYYY-MM-DDThh:mm:ssZ`), as required by Tencent Cloud
+ * EdgeOne `Timestamp ISO8601` parameters.
+ */
+export function formatTeoIsoTime(epochSec: number): string {
+  return new Date(Math.floor(epochSec) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 export async function resolveEdgeOneCreds(
   env: Env,
   accountId: number,
@@ -807,13 +816,13 @@ export async function listCacheTasks(
   }
 
   // EdgeOne restricts DescribePurgeTasks / DescribePrefetchTasks window to <= 7 days.
-  const endMs = Date.now();
-  const startMs = endMs - 6 * 86400_000;
+  const endSec = nowSeconds();
+  const startSec = endSec - 6 * 86400;
   const action = kind === "prefetch" ? "DescribePrefetchTasks" : "DescribePurgeTasks";
   const resp = await teoRpc(creds, action, {
     ZoneId: zoneId,
-    StartTime: new Date(startMs).toISOString(),
-    EndTime: new Date(endMs).toISOString(),
+    StartTime: formatTeoIsoTime(startSec),
+    EndTime: formatTeoIsoTime(endSec),
     Offset: 0,
     Limit: Math.max(1, Math.min(200, limit)),
   });
@@ -994,13 +1003,13 @@ export async function getZoneAnalytics(
   range: "24h" | "7d",
   domainFilter?: string,
 ): Promise<EdgeOneAnalyticsResult> {
-  // EdgeOne analytics has ~10 min reporting delay; end at now - 5 min for stable buckets.
-  const endSec = Math.floor((Date.now() - 5 * 60_000) / 1000);
+  // EdgeOne L7 analytics has ~10 min latency; align EndTime to whole minutes at least 10 min ago.
+  const endSec = Math.floor((Date.now() - 10 * 60_000) / 60_000) * 60;
   const spanSec = range === "7d" ? 7 * 86400 : 24 * 3600;
   const startSec = endSec - spanSec;
-  const interval = range === "7d" ? "hour" : "hour";
-  const startTime = new Date(startSec * 1000).toISOString();
-  const endTime = new Date(endSec * 1000).toISOString();
+  const interval = "hour";
+  const startTime = formatTeoIsoTime(startSec);
+  const endTime = formatTeoIsoTime(endSec);
 
   if (isDryRun(env)) {
     const count = range === "7d" ? 28 : 24;
@@ -1038,20 +1047,14 @@ export async function getZoneAnalytics(
     };
   }
 
-  const params: Record<string, unknown> = {
+  const baseParams: Record<string, unknown> = {
     StartTime: startTime,
     EndTime: endTime,
     ZoneIds: [zoneId],
     Interval: interval,
-    MetricNames: [
-      "l7Flow_flux",
-      "l7Flow_outBandwidth",
-      "l7Flow_request",
-      "l7Flow_avgResponseTime",
-    ],
   };
   if (domainFilter?.trim()) {
-    params["Filters"] = [
+    baseParams["Filters"] = [
       {
         Key: "domain",
         Operator: "equals",
@@ -1060,7 +1063,47 @@ export async function getZoneAnalytics(
     ];
   }
 
-  const resp = await teoRpc(creds, "DescribeTimingL7AnalysisData", params);
+  const coreMetrics = ["l7Flow_flux", "l7Flow_outBandwidth", "l7Flow_request"];
+  const allMetrics = [...coreMetrics, "l7Flow_avgResponseTime"];
+
+  const responses: Record<string, unknown>[] = [];
+  try {
+    responses.push(
+      await teoRpc(creds, "DescribeTimingL7AnalysisData", {
+        ...baseParams,
+        MetricNames: allMetrics,
+      }),
+    );
+  } catch (err) {
+    const tcCode = (err as { tcCode?: string } | null)?.tcCode ?? "";
+    const isInvalidParam =
+      tcCode === "InvalidParameter" ||
+      tcCode.startsWith("InvalidParameter.") ||
+      tcCode === "InvalidParameterValue" ||
+      tcCode.startsWith("InvalidParameterValue.");
+    if (!isInvalidParam) throw err;
+
+    // Some EdgeOne plans or metric-group rules reject combining avgResponseTime with
+    // traffic/bandwidth/request metrics in a single call; retry core metrics and fetch
+    // response time separately on a best-effort basis.
+    responses.push(
+      await teoRpc(creds, "DescribeTimingL7AnalysisData", {
+        ...baseParams,
+        MetricNames: coreMetrics,
+      }),
+    );
+    try {
+      responses.push(
+        await teoRpc(creds, "DescribeTimingL7AnalysisData", {
+          ...baseParams,
+          MetricNames: ["l7Flow_avgResponseTime"],
+        }),
+      );
+    } catch {
+      // Ignore optional latency metric failure so primary traffic charts remain available.
+    }
+  }
+
   const byTs = new Map<number, EdgeOneAnalyticsPoint>();
   let totalFluxBytes = 0;
   let peakBandwidthBps = 0;
@@ -1068,34 +1111,36 @@ export async function getZoneAnalytics(
   let avgRtAcc = 0;
   let avgRtCnt = 0;
 
-  for (const record of asArr<Record<string, unknown>>(resp["Data"])) {
-    for (const tv of asArr<Record<string, unknown>>(record["TypeValue"])) {
-      const metric = asStr(tv["MetricName"]);
-      const sum = asNum(tv["Sum"], 0);
-      const max = asNum(tv["Max"], 0);
-      const avg = asNum(tv["Avg"], 0);
+  for (const resp of responses) {
+    for (const record of asArr<Record<string, unknown>>(resp["Data"])) {
+      for (const tv of asArr<Record<string, unknown>>(record["TypeValue"])) {
+        const metric = asStr(tv["MetricName"]);
+        const sum = asNum(tv["Sum"], 0);
+        const max = asNum(tv["Max"], 0);
+        const avg = asNum(tv["Avg"], 0);
 
-      if (metric === "l7Flow_flux") totalFluxBytes += sum;
-      if (metric === "l7Flow_outBandwidth" && max > peakBandwidthBps) peakBandwidthBps = max;
-      if (metric === "l7Flow_request") totalRequests += sum;
-      if (metric === "l7Flow_avgResponseTime" && avg > 0) {
-        avgRtAcc += avg;
-        avgRtCnt += 1;
-      }
-
-      for (const pt of asArr<Record<string, unknown>>(tv["Detail"])) {
-        const ts = asNum(pt["Timestamp"], 0);
-        const val = asNum(pt["Value"], 0);
-        if (!ts) continue;
-        let cur = byTs.get(ts);
-        if (!cur) {
-          cur = { timestamp: ts, flux: 0, bandwidth: 0, requests: 0, avgResponseTime: 0 };
-          byTs.set(ts, cur);
+        if (metric === "l7Flow_flux") totalFluxBytes += sum;
+        if (metric === "l7Flow_outBandwidth" && max > peakBandwidthBps) peakBandwidthBps = max;
+        if (metric === "l7Flow_request") totalRequests += sum;
+        if (metric === "l7Flow_avgResponseTime" && avg > 0) {
+          avgRtAcc += avg;
+          avgRtCnt += 1;
         }
-        if (metric === "l7Flow_flux") cur.flux += val;
-        else if (metric === "l7Flow_outBandwidth") cur.bandwidth = Math.max(cur.bandwidth, val);
-        else if (metric === "l7Flow_request") cur.requests += val;
-        else if (metric === "l7Flow_avgResponseTime") cur.avgResponseTime = val;
+
+        for (const pt of asArr<Record<string, unknown>>(tv["Detail"])) {
+          const ts = asNum(pt["Timestamp"], 0);
+          const val = asNum(pt["Value"], 0);
+          if (!ts) continue;
+          let cur = byTs.get(ts);
+          if (!cur) {
+            cur = { timestamp: ts, flux: 0, bandwidth: 0, requests: 0, avgResponseTime: 0 };
+            byTs.set(ts, cur);
+          }
+          if (metric === "l7Flow_flux") cur.flux += val;
+          else if (metric === "l7Flow_outBandwidth") cur.bandwidth = Math.max(cur.bandwidth, val);
+          else if (metric === "l7Flow_request") cur.requests += val;
+          else if (metric === "l7Flow_avgResponseTime") cur.avgResponseTime = val;
+        }
       }
     }
   }
