@@ -13,6 +13,9 @@ import * as messages from "./messages";
 import * as notify from "./notify";
 import * as repo from "./repo";
 import type { DdnsIpMonitorRecord } from "./repo";
+import { DDNS_AGENT_VERSION, getPythonTerminalAgentTemplate } from "./ddns_agent_py";
+
+export { DDNS_AGENT_VERSION };
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -653,37 +656,55 @@ export function renderLinuxInstallScript(
   const cronExpr = cronMinutes <= 1 ? "* * * * *" : `*/${cronMinutes} * * * *`;
   // Safe ASCII identifier for filenames / unit names
   const unitName = `cdt-ddns-ip-${id}`;
+  const termUnitName = `cdt-ddns-ip-term-${id}`;
   const scriptPath = `/usr/local/bin/${unitName}.sh`;
+  const termScriptPath = `/usr/local/bin/${termUnitName}.py`;
+  const termPidFile = `/var/run/${termUnitName}.pid`;
+  const updateStampFile = `/tmp/.${unitName}.up`;
   const safeToken = monitor.token.replace(/[^a-fA-F0-9_-]/g, "");
   const safeFqdn = monitor.fqdn.replace(/[^a-zA-Z0-9.-]/g, "");
+  const pyAgentTemplate = getPythonTerminalAgentTemplate();
 
   if (action === "uninstall") {
     return `#!/bin/sh
 set -eu
 
 UNIT="${unitName}"
+TERM_UNIT="${termUnitName}"
 SCRIPT_PATH="${scriptPath}"
+TERM_SCRIPT_PATH="${termScriptPath}"
+TERM_PID_FILE="${termPidFile}"
+UPDATE_STAMP_FILE="${updateStampFile}"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "请使用 root 或 sudo 运行卸载命令" >&2
   exit 1
 fi
 
-echo "==> 正在卸载 DDNS IP 监控 (${safeFqdn}, \${UNIT})..."
+echo "==> 正在卸载 DDNS IP 监控与反向远程终端 (${safeFqdn}, \${UNIT})..."
 
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl disable --now "\${UNIT}.timer" 2>/dev/null || true
   systemctl stop "\${UNIT}.service" 2>/dev/null || true
-  rm -f "/etc/systemd/system/\${UNIT}.service" "/etc/systemd/system/\${UNIT}.timer"
+  systemctl disable --now "\${TERM_UNIT}.service" 2>/dev/null || true
+  rm -f "/etc/systemd/system/\${UNIT}.service" "/etc/systemd/system/\${UNIT}.timer" "/etc/systemd/system/\${TERM_UNIT}.service"
   systemctl daemon-reload 2>/dev/null || true
+fi
+
+if [ -f "\${TERM_PID_FILE}" ]; then
+  OLD_PID="$(cat "\${TERM_PID_FILE}" 2>/dev/null || true)"
+  if [ -n "$OLD_PID" ]; then
+    kill "$OLD_PID" 2>/dev/null || true
+  fi
+  rm -f "\${TERM_PID_FILE}"
 fi
 
 if command -v crontab >/dev/null 2>&1; then
   (crontab -l 2>/dev/null | grep -v "# \${UNIT}" || true) | crontab - 2>/dev/null || true
 fi
 
-rm -f "\${SCRIPT_PATH}"
-echo "✅ 已完成卸载 \${UNIT} (${safeFqdn})"
+rm -f "\${SCRIPT_PATH}" "\${TERM_SCRIPT_PATH}" "\${UPDATE_STAMP_FILE}"
+echo "✅ 已完成卸载 \${UNIT} 与反向终端服务 (${safeFqdn})"
 `;
   }
 
@@ -691,10 +712,15 @@ echo "✅ 已完成卸载 \${UNIT} (${safeFqdn})"
 set -eu
 
 UNIT="${unitName}"
+TERM_UNIT="${termUnitName}"
 SCRIPT_PATH="${scriptPath}"
+TERM_SCRIPT_PATH="${termScriptPath}"
+TERM_PID_FILE="${termPidFile}"
+UPDATE_STAMP_FILE="${updateStampFile}"
 PANEL_ORIGIN="${origin}"
 DDNS_TOKEN="${safeToken}"
 DDNS_FQDN="${safeFqdn}"
+AGENT_VERSION="${DDNS_AGENT_VERSION}"
 INTERVAL_SEC="${interval}"
 CRON_EXPR="${cronExpr}"
 
@@ -708,19 +734,23 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> 正在安装 DDNS IP 动态公网 IPv4 + 国内三网延迟监控: \${DDNS_FQDN} (每 \${INTERVAL_SEC} 秒)"
+echo "==> 正在安装 DDNS IP 监控 v\${AGENT_VERSION}（动态 IPv4 + 每次心跳三网延迟 + 免密反向终端）: \${DDNS_FQDN} (每 \${INTERVAL_SEC} 秒)"
 
-mkdir -p /usr/local/bin
+mkdir -p /usr/local/bin /var/run
 cat > "\${SCRIPT_PATH}" <<'CDT_DDNS_AGENT_EOF'
 #!/bin/sh
 set -u
 
 PANEL_ORIGIN="__PANEL_ORIGIN__"
 DDNS_TOKEN="__DDNS_TOKEN__"
+AGENT_VERSION="__AGENT_VERSION__"
+TERM_SCRIPT_PATH="__TERM_SCRIPT_PATH__"
+TERM_PID_FILE="__TERM_PID_FILE__"
+UPDATE_STAMP_FILE="__UPDATE_STAMP_FILE__"
 HOST_NAME="$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-64)"
 
 is_ipv4() {
-  printf '%s' "$1" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+  printf '%s' "$1" | grep -Eq '^[0-9]{1,3}(\\.[0-9]{1,3}){3}$'
 }
 
 fetch_v4() {
@@ -738,7 +768,7 @@ probe_isp_ms() {
       rc=0
       raw="$(curl -4 -o /dev/null -s -w '%{time_namelookup} %{time_connect}' --connect-timeout 3 --max-time 4 "http://\${host}/" 2>/dev/null)" || rc=$?
       if [ "$rc" -eq 0 ] || [ "$rc" -eq 52 ] || [ "$rc" -eq 56 ]; then
-        ms="$(printf '%s\n' "$raw" | awk '{ v = ($2 - $1) * 1000; if (v < 0.1 && $2 > 0) v = $2 * 1000; if (v >= 0.1 && v < 9999) printf "%.1f", v }' 2>/dev/null || true)"
+        ms="$(printf '%s\\n' "$raw" | awk '{ v = ($2 - $1) * 1000; if (v < 0.1 && $2 > 0) v = $2 * 1000; if (v >= 0.1 && v < 9999) printf "%.1f", v }' 2>/dev/null || true)"
         if [ -n "$ms" ]; then
           printf '%s' "$ms"
           return 0
@@ -755,6 +785,52 @@ probe_isp_ms() {
   printf '%s' "-1"
 }
 
+# Keep non-systemd reverse terminal daemon alive on Alpine / OpenWrt / Docker
+ensure_term_daemon() {
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1 || [ ! -x "$TERM_SCRIPT_PATH" ]; then
+    return 0
+  fi
+  if [ -f "$TERM_PID_FILE" ]; then
+    CUR_PID="$(cat "$TERM_PID_FILE" 2>/dev/null || true)"
+    if [ -n "$CUR_PID" ] && kill -0 "$CUR_PID" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  nohup python3 "$TERM_SCRIPT_PATH" >/dev/null 2>&1 &
+  printf '%s' "$!" > "$TERM_PID_FILE"
+}
+
+# Auto-update agent script when panel publishes a newer AGENT_VERSION (300s cooldown)
+maybe_self_update() {
+  REMOTE_VER="$(printf '%s' "$1" | sed -n 's/.*"agent_version"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')"
+  if [ -z "$REMOTE_VER" ] || [ "$REMOTE_VER" = "$AGENT_VERSION" ]; then
+    return 0
+  fi
+  NOW_TS="$(date +%s 2>/dev/null || echo 0)"
+  LAST_TS="$(cat "$UPDATE_STAMP_FILE" 2>/dev/null || echo 0)"
+  if [ "$NOW_TS" -gt 0 ] && [ "$LAST_TS" -gt 0 ] && [ $((NOW_TS - LAST_TS)) -lt 300 ]; then
+    return 0
+  fi
+  printf '%s' "$NOW_TS" > "$UPDATE_STAMP_FILE" 2>/dev/null || true
+  TMP_UP="/tmp/cdt-ddns-up-$$.sh"
+  UP_URL="\${PANEL_ORIGIN}/api/v1/ddns-ip/install.sh?token=\${DDNS_TOKEN}"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --connect-timeout 10 --max-time 30 "$UP_URL" -o "$TMP_UP" 2>/dev/null || { rm -f "$TMP_UP"; return 0; }
+  else
+    wget -qO "$TMP_UP" -T 30 "$UP_URL" 2>/dev/null || { rm -f "$TMP_UP"; return 0; }
+  fi
+  if /bin/sh -n "$TMP_UP" 2>/dev/null; then
+    printf '[cdt-ddns-ip] 检测到新版本 v%s（本地 v%s），正在自动更新...\\n' "$REMOTE_VER" "$AGENT_VERSION"
+    CDT_DDNS_SKIP_FIRST_RUN=1 /bin/sh "$TMP_UP" >/dev/null 2>&1 || true
+  fi
+  rm -f "$TMP_UP"
+}
+
+ensure_term_daemon
+
 # Detect public IPv4 (panel endpoint first via IPv4 socket, then public IPv4 fallbacks)
 PUB_IP=""
 for probe in \\
@@ -762,7 +838,7 @@ for probe in \\
   "https://api4.ipify.org" \\
   "https://4.ipw.cn" \\
   "https://ipv4.icanhazip.com"; do
-  CAND="$(fetch_v4 "$probe" | tr -d ' \r\n\t')"
+  CAND="$(fetch_v4 "$probe" | tr -d ' \\r\\n\\t')"
   if is_ipv4 "$CAND"; then
     PUB_IP="$CAND"
     break
@@ -774,7 +850,7 @@ CT_MS="$(probe_isp_ms gd-ct-v4.ip.zstaticcdn.com sh-ct-v4.ip.zstaticcdn.com bj-c
 CU_MS="$(probe_isp_ms gd-cu-v4.ip.zstaticcdn.com sh-cu-v4.ip.zstaticcdn.com bj-cu-v4.ip.zstaticcdn.com)"
 CM_MS="$(probe_isp_ms gd-cm-v4.ip.zstaticcdn.com sh-cm-v4.ip.zstaticcdn.com bj-cm-v4.ip.zstaticcdn.com)"
 
-REPORT_URL="\${PANEL_ORIGIN}/api/v1/ddns-ip/report?token=\${DDNS_TOKEN}&host=\${HOST_NAME}&ct=\${CT_MS}&cu=\${CU_MS}&cm=\${CM_MS}"
+REPORT_URL="\${PANEL_ORIGIN}/api/v1/ddns-ip/report?token=\${DDNS_TOKEN}&host=\${HOST_NAME}&ct=\${CT_MS}&cu=\${CU_MS}&cm=\${CM_MS}&v=\${AGENT_VERSION}"
 if [ -n "$PUB_IP" ]; then
   REPORT_URL="\${REPORT_URL}&ip=\${PUB_IP}"
 fi
@@ -786,20 +862,31 @@ else
 fi
 
 if [ -n "$RESP" ]; then
-  printf '[cdt-ddns-ip] %s\n' "$RESP"
+  printf '[cdt-ddns-ip] %s\\n' "$RESP"
+  maybe_self_update "$RESP"
 else
-  printf '[cdt-ddns-ip] 上报失败，请检查网络连通性: %s\n' "$PANEL_ORIGIN" >&2
+  printf '[cdt-ddns-ip] 上报失败，请检查网络连通性: %s\\n' "$PANEL_ORIGIN" >&2
   exit 1
 fi
 CDT_DDNS_AGENT_EOF
 
-sed -i "s|__PANEL_ORIGIN__|\${PANEL_ORIGIN}|g; s|__DDNS_TOKEN__|\${DDNS_TOKEN}|g" "\${SCRIPT_PATH}"
+sed -i "s|__PANEL_ORIGIN__|\${PANEL_ORIGIN}|g; s|__DDNS_TOKEN__|\${DDNS_TOKEN}|g; s|__AGENT_VERSION__|\${AGENT_VERSION}|g; s|__TERM_SCRIPT_PATH__|\${TERM_SCRIPT_PATH}|g; s|__TERM_PID_FILE__|\${TERM_PID_FILE}|g; s|__UPDATE_STAMP_FILE__|\${UPDATE_STAMP_FILE}|g" "\${SCRIPT_PATH}"
 chmod 700 "\${SCRIPT_PATH}"
+
+# Install zero-dependency Python 3 reverse WebSocket PTY terminal daemon
+if command -v python3 >/dev/null 2>&1; then
+  cat > "\${TERM_SCRIPT_PATH}" <<'CDT_DDNS_TERM_EOF'
+${pyAgentTemplate}CDT_DDNS_TERM_EOF
+  sed -i "s|__PANEL_ORIGIN__|\${PANEL_ORIGIN}|g; s|__DDNS_TOKEN__|\${DDNS_TOKEN}|g; s|__AGENT_VERSION__|\${AGENT_VERSION}|g" "\${TERM_SCRIPT_PATH}"
+  chmod 700 "\${TERM_SCRIPT_PATH}"
+else
+  echo "⚠️ 未检测到 python3，将跳过免密反向终端守护服务（DDNS IP 与三网延迟监控不受影响）"
+fi
 
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   cat > "/etc/systemd/system/\${UNIT}.service" <<EOF
 [Unit]
-Description=CDT DDNS IPv4 Monitor (\${DDNS_FQDN})
+Description=CDT DDNS IPv4 & 3-ISP Monitor (\${DDNS_FQDN})
 After=network-online.target
 Wants=network-online.target
 
@@ -822,18 +909,55 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+  if [ -x "\${TERM_SCRIPT_PATH}" ]; then
+    cat > "/etc/systemd/system/\${TERM_UNIT}.service" <<EOF
+[Unit]
+Description=CDT DDNS Reverse WebSocket Terminal Agent (\${DDNS_FQDN})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=/root
+WorkingDirectory=/root
+ExecStart=/usr/bin/env python3 \${TERM_SCRIPT_PATH}
+Restart=always
+RestartSec=5
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+
   systemctl daemon-reload
   systemctl enable --now "\${UNIT}.timer"
-  echo "✅ 已启用 systemd 定时任务: \${UNIT}.timer (每 \${INTERVAL_SEC} 秒检测 IPv4 与三网延迟)"
+  echo "✅ 已启用 systemd 定时任务: \${UNIT}.timer (每 \${INTERVAL_SEC} 秒检测 IPv4 与三网延迟，支持自动更新)"
+  if [ -x "\${TERM_SCRIPT_PATH}" ]; then
+    systemctl enable --now "\${TERM_UNIT}.service"
+    systemctl restart "\${TERM_UNIT}.service" 2>/dev/null || true
+    echo "✅ 已启用免密反向终端常驻服务: \${TERM_UNIT}.service (无需开放 SSH 端口)"
+  fi
 elif command -v crontab >/dev/null 2>&1; then
   (crontab -l 2>/dev/null | grep -v "# \${UNIT}" || true; echo "\${CRON_EXPR} \${SCRIPT_PATH} >/dev/null 2>&1 # \${UNIT}") | crontab -
   echo "✅ 已写入 crontab 定时任务: \${CRON_EXPR} (注释标记 # \${UNIT})"
+  if [ -x "\${TERM_SCRIPT_PATH}" ]; then
+    if [ -f "\${TERM_PID_FILE}" ]; then
+      OLD_PID="$(cat "\${TERM_PID_FILE}" 2>/dev/null || true)"
+      [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null || true
+    fi
+    nohup python3 "\${TERM_SCRIPT_PATH}" >/dev/null 2>&1 &
+    printf '%s' "$!" > "\${TERM_PID_FILE}"
+    echo "✅ 已后台启动免密反向终端服务 (PID $(cat "\${TERM_PID_FILE}"))"
+  fi
 else
   echo "⚠️ 未检测到 systemd 或 crontab，已安装脚本至 \${SCRIPT_PATH}，请手动加入计划任务"
 fi
 
-echo "==> 正在执行首次公网 IPv4 及国内三网延迟检测..."
-"\${SCRIPT_PATH}" || true
+if [ "\${CDT_DDNS_SKIP_FIRST_RUN:-0}" != "1" ]; then
+  echo "==> 正在执行首次公网 IPv4 及国内三网延迟检测..."
+  "\${SCRIPT_PATH}" || true
+fi
 echo "✅ 安装完成！卸载命令: curl -fsSL \"\${PANEL_ORIGIN}/api/v1/ddns-ip/install.sh?token=\${DDNS_TOKEN}&action=uninstall\" | sudo sh"
 `;
 }

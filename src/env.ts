@@ -5,6 +5,7 @@
 export interface Env {
   DB: D1Database;
   ASSETS?: Fetcher;
+  DDNS_TERMINAL?: DurableObjectNamespace;
   ADMIN_PASSWORD?: string;
   SESSION_SECRET?: string;
   ENCRYPTION_KEY?: string;          // base64, 32 bytes; encrypts AccessKey secrets in D1

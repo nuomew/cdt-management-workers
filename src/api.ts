@@ -6117,10 +6117,44 @@ function extractDdnsIpToken(c: Ctx, body?: AnyRow): string {
   return body ? strOf(body["token"]).trim() : "";
 }
 
+interface DdnsTerminalStatus {
+  agent_online: boolean;
+  agent_version: string;
+}
+
+function getDdnsTerminalStub(env: Env, monitorId: number): DurableObjectStub | null {
+  if (!env.DDNS_TERMINAL) return null;
+  const id = env.DDNS_TERMINAL.idFromName(`monitor:${monitorId}`);
+  return env.DDNS_TERMINAL.get(id);
+}
+
+async function queryDdnsTerminalStatus(env: Env, monitorId: number): Promise<DdnsTerminalStatus> {
+  const stub = getDdnsTerminalStub(env, monitorId);
+  if (!stub) return { agent_online: false, agent_version: "" };
+  try {
+    const res = await stub.fetch("https://ddns-terminal/status");
+    if (!res.ok) return { agent_online: false, agent_version: "" };
+    const data = (await res.json()) as { agent_online?: unknown; agent_version?: unknown };
+    return {
+      agent_online: Boolean(data?.agent_online),
+      agent_version: typeof data?.agent_version === "string" ? data.agent_version : "",
+    };
+  } catch {
+    return { agent_online: false, agent_version: "" };
+  }
+}
+
+async function kickDdnsTerminalAgent(env: Env, monitorId: number): Promise<void> {
+  const stub = getDdnsTerminalStub(env, monitorId);
+  if (!stub) return;
+  await stub.fetch("https://ddns-terminal/kick-agent").catch(() => {});
+}
+
 function serializeDdnsIpMonitor(
   m: repo.DdnsIpMonitorRecord,
   origin: string,
   accountMap: Map<number, repo.DnsAccountRecord>,
+  terminalStatus?: DdnsTerminalStatus,
 ) {
   const acct = accountMap.get(m.dns_account_id);
   const nowSec = Math.floor(Date.now() / 1000);
@@ -6163,6 +6197,9 @@ function serializeDdnsIpMonitor(
     ssh_auth_type: m.ssh_auth_type,
     has_ssh_secret: m.has_ssh_secret,
     has_ssh_passphrase: m.has_ssh_passphrase,
+    terminal_agent_online: Boolean(terminalStatus?.agent_online),
+    terminal_agent_version: terminalStatus?.agent_version ?? "",
+    agent_version: ddnsIp.DDNS_AGENT_VERSION,
     remark: m.remark,
     online,
     install_cmd: `curl -fsSL "${installUrl}" | sudo sh`,
@@ -6209,6 +6246,29 @@ app.get("/api/v1/ddns-ip/install.sh", async (c) => {
   });
 });
 
+// Public token-authenticated reverse WebSocket endpoint for the DDNS IP terminal agent.
+app.get("/api/v1/ddns-ip/agent/ws", async (c) => {
+  const upgrade = (c.req.header("upgrade") ?? "").toLowerCase();
+  if (upgrade !== "websocket") {
+    return c.json({ error: "upgrade_required", message: "Expected WebSocket upgrade" }, 426);
+  }
+  const token = extractDdnsIpToken(c);
+  if (!token) {
+    return c.json({ error: "unauthorized", message: "缺少 DDNS IP 上报密钥 token" }, 401);
+  }
+  const monitor = await repo.getDdnsIpMonitorByToken(c.env, token);
+  if (!monitor) {
+    return c.json({ error: "unauthorized", message: "DDNS IP 上报密钥无效或已重置" }, 401);
+  }
+  const stub = getDdnsTerminalStub(c.env, monitor.id);
+  if (!stub) {
+    return c.json({ error: "service_unavailable", message: "反向终端中继服务未配置" }, 503);
+  }
+  const ver = (c.req.query("v") ?? "").trim().slice(0, 16);
+  const targetUrl = `https://ddns-terminal/agent?v=${encodeURIComponent(ver)}`;
+  return stub.fetch(new Request(targetUrl, c.req.raw));
+});
+
 async function handleDdnsIpReport(c: Ctx) {
   let body: AnyRow = {};
   if (c.req.method === "POST") {
@@ -6246,7 +6306,10 @@ async function handleDdnsIpReport(c: Ctx) {
       source: "agent",
       latency,
     });
-    return c.json(result);
+    return c.json({
+      ...result,
+      agent_version: ddnsIp.DDNS_AGENT_VERSION,
+    });
   } catch (err) {
     throw httpErr(400, "ddns_ip_error", err instanceof Error ? err.message : String(err));
   }
@@ -6262,10 +6325,15 @@ app.get("/api/v1/ddns-ip/monitors", async (c) => {
     repo.listDdnsIpMonitors(c.env, { decryptToken: true }),
     repo.listDnsAccounts(c.env, { decryptSecret: false }),
   ]);
+  const terminalStatuses = await Promise.all(
+    monitors.map((m) => queryDdnsTerminalStatus(c.env, m.id)),
+  );
   const accountMap = new Map(accounts.map((a) => [a.id, a]));
   const origin = new URL(c.req.url).origin;
   return c.json({
-    items: monitors.map((m) => serializeDdnsIpMonitor(m, origin, accountMap)),
+    items: monitors.map((m, idx) =>
+      serializeDdnsIpMonitor(m, origin, accountMap, terminalStatuses[idx]),
+    ),
     dns_accounts: accounts.map(sanitizeDnsAccount),
     origin,
   });
@@ -6448,11 +6516,12 @@ app.patch("/api/v1/ddns-ip/monitors/:monitorId", async (c) => {
   }
 
   const updated = (await repo.getDdnsIpMonitor(c.env, monitorId, true))!;
+  const terminalStatus = await queryDdnsTerminalStatus(c.env, monitorId);
   const origin = new URL(c.req.url).origin;
   const accountMap = new Map([[account.id, account]]);
   return c.json({
     ok: true,
-    item: serializeDdnsIpMonitor(updated, origin, accountMap),
+    item: serializeDdnsIpMonitor(updated, origin, accountMap, terminalStatus),
   });
 });
 
@@ -6488,18 +6557,68 @@ app.post("/api/v1/ddns-ip/monitors/:monitorId/probe", async (c) => {
 
   try {
     const probe = await ddnsIp.probeChinaThreeNetLatency(c.env, monitor);
-    const updated = (await repo.getDdnsIpMonitor(c.env, monitorId, true))!;
-    const account = await repo.getDnsAccount(c.env, updated.dns_account_id, false);
+    const [updated, terminalStatus] = await Promise.all([
+      repo.getDdnsIpMonitor(c.env, monitorId, true),
+      queryDdnsTerminalStatus(c.env, monitorId),
+    ]);
+    const account = await repo.getDnsAccount(c.env, updated!.dns_account_id, false);
     const accountMap = new Map(account ? [[account.id, account]] : []);
     const origin = new URL(c.req.url).origin;
     return c.json({
       ok: true,
       probe,
-      item: serializeDdnsIpMonitor(updated, origin, accountMap),
+      item: serializeDdnsIpMonitor(updated!, origin, accountMap, terminalStatus),
     });
   } catch (err) {
     throw httpErr(400, "ddns_ip_probe_error", err instanceof Error ? err.message : String(err));
   }
+});
+
+// Admin browser endpoint: connect passwordlessly to the node's reverse PTY agent via Durable Object.
+app.get("/api/v1/ddns-ip/monitors/:monitorId/terminal", async (c) => {
+  await requireAdmin(c);
+  const upgrade = (c.req.header("upgrade") ?? "").toLowerCase();
+  if (upgrade !== "websocket") {
+    return c.json({ error: "upgrade_required", message: "Expected WebSocket upgrade" }, 426);
+  }
+  // Same-origin check against Cross-Site WebSocket Hijacking (CSWSH).
+  const originHeader = c.req.header("origin");
+  if (originHeader) {
+    try {
+      const reqOrigin = new URL(c.req.url).origin;
+      const clientOrigin = new URL(originHeader).origin;
+      if (reqOrigin !== clientOrigin) {
+        return c.json({ error: "forbidden", message: "禁止跨站 WebSocket 连接" }, 403);
+      }
+    } catch {
+      return c.json({ error: "forbidden", message: "非法的 Origin 请求头" }, 403);
+    }
+  }
+
+  const monitorId = paramInt(c, "monitorId");
+  const monitor = await repo.getDdnsIpMonitor(c.env, monitorId, false, false);
+  if (!monitor) throw httpErr(404, "not_found", "DDNS IP 监控记录不存在");
+
+  const stub = getDdnsTerminalStub(c.env, monitor.id);
+  if (!stub) {
+    return c.json({ error: "service_unavailable", message: "反向终端中继服务未配置" }, 503);
+  }
+
+  const auditPromise = repo
+    .addEvent(
+      c.env,
+      "dns",
+      messages.ev("DDNS IP 免密远程终端已接入", messages.objServer(monitor.fqdn)),
+      { detail: `通过监控反向隧道接入 ${monitor.fqdn}（${monitor.current_ip || "未上报 IP"}）` },
+    )
+    .catch(() => {});
+  try {
+    c.executionCtx.waitUntil(auditPromise);
+  } catch {
+    void auditPromise;
+  }
+
+  return stub.fetch(new Request("https://ddns-terminal/client", c.req.raw));
 });
 
 app.get("/api/v1/ddns-ip/monitors/:monitorId/ssh", async (c) => {
@@ -6549,13 +6668,16 @@ app.patch("/api/v1/ddns-ip/monitors/:monitorId/ssh-config", async (c) => {
   }
 
   await repo.updateDdnsIpSshConfig(c.env, monitorId, patch);
-  const updated = (await repo.getDdnsIpMonitor(c.env, monitorId, true, false))!;
-  const account = await repo.getDnsAccount(c.env, updated.dns_account_id, false);
+  const [updated, terminalStatus] = await Promise.all([
+    repo.getDdnsIpMonitor(c.env, monitorId, true, false),
+    queryDdnsTerminalStatus(c.env, monitorId),
+  ]);
+  const account = await repo.getDnsAccount(c.env, updated!.dns_account_id, false);
   const accountMap = new Map(account ? [[account.id, account]] : []);
   const origin = new URL(c.req.url).origin;
   return c.json({
     ok: true,
-    item: serializeDdnsIpMonitor(updated, origin, accountMap),
+    item: serializeDdnsIpMonitor(updated!, origin, accountMap, terminalStatus),
   });
 });
 
@@ -6567,6 +6689,7 @@ app.post("/api/v1/ddns-ip/monitors/:monitorId/rotate-token", async (c) => {
   if (!existing) throw httpErr(404, "not_found", "DDNS IP 监控记录不存在");
 
   await repo.rotateDdnsIpMonitorToken(c.env, monitorId);
+  await kickDdnsTerminalAgent(c.env, monitorId);
   const updated = (await repo.getDdnsIpMonitor(c.env, monitorId, true))!;
   const account = await repo.getDnsAccount(c.env, updated.dns_account_id, false);
   const accountMap = new Map(account ? [[account.id, account]] : []);
@@ -6576,12 +6699,15 @@ app.post("/api/v1/ddns-ip/monitors/:monitorId/rotate-token", async (c) => {
     c.env,
     "dns",
     messages.ev("DDNS IP 上报密钥已重置", messages.objServer(updated.fqdn)),
-    { level: "warn", detail: "旧安装脚本中的密钥已失效，请在目标服务器重新运行新的一键安装命令" },
+    { level: "warn", detail: "旧安装脚本与反向终端密钥已失效，请在目标服务器重新运行新的一键安装命令" },
   );
 
   return c.json({
     ok: true,
-    item: serializeDdnsIpMonitor(updated, origin, accountMap),
+    item: serializeDdnsIpMonitor(updated, origin, accountMap, {
+      agent_online: false,
+      agent_version: "",
+    }),
   });
 });
 
@@ -6606,6 +6732,7 @@ app.delete("/api/v1/ddns-ip/monitors/:monitorId", async (c) => {
     }
   }
 
+  await kickDdnsTerminalAgent(c.env, monitorId);
   await repo.deleteDdnsIpMonitor(c.env, monitorId);
   await repo.addEvent(
     c.env,

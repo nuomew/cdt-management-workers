@@ -24,6 +24,8 @@ import { app } from "./api";
 import { resolveRuntimeEnv } from "./db";
 import { runReconcile } from "./scheduler";
 
+export { DdnsTerminalHub } from "./ddns_terminal_do";
+
 export default {
   async fetch(
     request: Request,

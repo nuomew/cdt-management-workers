@@ -660,8 +660,13 @@ export default function DdnsIpView({
                           type="button"
                           className="btn primary sm"
                           onClick={() => setSshItem(it)}
-                          title="打开浏览器 SSH 远程终端连接到该服务器"
+                          title={
+                            it.terminal_agent_online
+                              ? '免密监控终端在线，点击直接进入 Shell（无需输入密码）'
+                              : '打开远程终端（支持免密监控反向隧道或直连 SSH）'
+                          }
                         >
+                          {it.terminal_agent_online && <span className="ddns-term-ready-dot" />}
                           <Terminal size={12} /> 远程终端
                         </button>
                         <button
@@ -1194,10 +1199,11 @@ function DdnsIpInstallModal({
     >
       <div className="nps-form">
         <div className="eo-cert-modal-note">
-          <strong>工作原理：</strong>在需要监控动态公网 IPv4 的服务器上执行下方一键命令后，脚本会自动创建后台定时任务（优先{' '}
+          <strong>工作原理：</strong>在目标服务器上执行下方一键命令后，脚本会自动创建后台定时任务（优先{' '}
           <code>systemd timer</code> 每 {item.interval_seconds} 秒检测，无 systemd 时自动写入 <code>crontab</code>
-          ），实时获取公网 IPv4 并上报到本面板。当公网 IP 未变动时零云解析 API 消耗；一旦变动即自动更新{' '}
-          <code>{item.fqdn}</code> 的 <code>A</code> 记录。
+          ），每次心跳自动上报公网 IPv4 及国内电信/联通/移动三网延迟；公网 IP 未变动时零云解析 API 消耗，变动即自动更新{' '}
+          <code>{item.fqdn}</code> 的 <code>A</code> 记录。若系统装有 <code>python3</code>，还会同时启用轻量级免密反向终端守护服务（无需开放入站
+          SSH 端口，点「远程终端」直接免密进入 Shell），且后续面板升级监控脚本时会自动拉取更新。
         </div>
 
         <div className="ddns-ip-cmd-card">

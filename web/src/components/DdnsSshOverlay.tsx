@@ -3,12 +3,16 @@ import { Terminal as XTerm } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import {
+  Check,
+  Copy,
   Eraser,
   KeyRound,
   LoaderCircle,
   Lock,
   Plug,
+  Radio,
   RefreshCw,
+  ShieldCheck,
   SlidersHorizontal,
   Terminal as TerminalIcon,
   Trash2,
@@ -25,11 +29,14 @@ interface DdnsSshOverlayProps {
   onMonitorUpdated: (next: DdnsIpMonitorItem) => void
 }
 
+type TerminalMode = 'agent' | 'ssh'
 type ConnPhase = 'form' | 'connecting' | 'connected' | 'closed' | 'error'
 
 /**
- * Full-screen interactive Web SSH terminal backed by xterm.js and the Worker's
- * authenticated WebSocket-to-SSH2 bridge (`/api/v1/ddns-ip/monitors/:id/ssh`).
+ * Full-screen interactive remote terminal backed by xterm.js with two transports:
+ * 1. Passwordless reverse WebSocket PTY agent embedded in the DDNS IP monitor
+ *    (`/api/v1/ddns-ip/monitors/:id/terminal` -> SQLite Durable Object relay).
+ * 2. Direct SSH2 over Cloudflare outbound TCP sockets (`/api/v1/ddns-ip/monitors/:id/ssh`).
  */
 export default function DdnsSshOverlay({
   monitor,
@@ -38,6 +45,10 @@ export default function DdnsSshOverlay({
   onMonitorUpdated,
 }: DdnsSshOverlayProps) {
   const targetHost = (monitor.current_ip || monitor.resolved_ip || monitor.fqdn).trim()
+  const initialMode: TerminalMode =
+    monitor.terminal_agent_online || !monitor.has_ssh_secret ? 'agent' : 'ssh'
+
+  const [mode, setMode] = useState<TerminalMode>(initialMode)
   const [port, setPort] = useState(String(monitor.ssh_port || 22))
   const [username, setUsername] = useState(monitor.ssh_username || 'root')
   const [authType, setAuthType] = useState<DdnsIpSshAuthType>(monitor.ssh_auth_type || 'password')
@@ -46,20 +57,27 @@ export default function DdnsSshOverlay({
   const [saveProfile, setSaveProfile] = useState(true)
   const [hasSaved, setHasSaved] = useState(monitor.has_ssh_secret)
   const [clearingSaved, setClearingSaved] = useState(false)
+  const [copiedCmd, setCopiedCmd] = useState(false)
 
-  const [phase, setPhase] = useState<ConnPhase>(monitor.has_ssh_secret ? 'connecting' : 'form')
+  const [phase, setPhase] = useState<ConnPhase>('connecting')
   const [statusText, setStatusText] = useState(
-    monitor.has_ssh_secret ? `正在使用已存凭据连接 ${targetHost}…` : '请输入 SSH 登录信息',
+    initialMode === 'agent'
+      ? `正在接入 ${monitor.fqdn} 免密反向终端…`
+      : `正在使用已存凭据连接 ${targetHost}…`,
   )
   const [errorText, setErrorText] = useState('')
-  const [showForm, setShowForm] = useState(!monitor.has_ssh_secret)
+  const [showForm, setShowForm] = useState(false)
+  const [agentOffline, setAgentOffline] = useState(false)
 
   const termContainerRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<XTerm | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const pingTimerRef = useRef<number | null>(null)
+  const connSeqRef = useRef(0)
   const autoConnectedRef = useRef(false)
+  const monitorRef = useRef(monitor)
+  monitorRef.current = monitor
 
   // Lock body scroll while overlay is active (do NOT close on Escape so vim/nano work).
   useEffect(() => {
@@ -71,6 +89,7 @@ export default function DdnsSshOverlay({
   }, [])
 
   const disconnect = useCallback(() => {
+    connSeqRef.current += 1
     if (pingTimerRef.current !== null) {
       window.clearInterval(pingTimerRef.current)
       pingTimerRef.current = null
@@ -163,6 +182,121 @@ export default function DdnsSshOverlay({
     }
   }, [disconnect])
 
+  const connectAgent = useCallback(() => {
+    disconnect()
+    const seq = connSeqRef.current
+    const curMonitor = monitorRef.current
+    setMode('agent')
+    setShowForm(false)
+    setAgentOffline(false)
+    setErrorText('')
+    setPhase('connecting')
+    setStatusText(`正在通过免密监控隧道接入 ${curMonitor.fqdn}…`)
+
+    const term = termRef.current
+    const fit = fitRef.current
+    if (term) {
+      term.reset()
+      term.writeln(`\x1b[38;5;212m[CDT-TERM]\x1b[0m 正在连接免密监控反向终端 ${curMonitor.fqdn} …`)
+    }
+    try {
+      fit?.fit()
+    } catch {}
+
+    const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const wsUrl = `${wsProto}//${window.location.host}/api/v1/ddns-ip/monitors/${curMonitor.id}/terminal`
+    const ws = new WebSocket(wsUrl)
+    wsRef.current = ws
+
+    ws.onopen = () => {
+      if (connSeqRef.current !== seq) return
+      // Use plain "ping" so the Durable Object handles keepalive via WebSocket Hibernation AutoResponse.
+      pingTimerRef.current = window.setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send('ping')
+        }
+      }, 25_000)
+    }
+
+    ws.onmessage = (ev) => {
+      if (connSeqRef.current !== seq) return
+      if (typeof ev.data !== 'string' || ev.data === 'pong') return
+      let msg: { type?: string; state?: string; code?: string; data?: string; message?: string }
+      try {
+        msg = JSON.parse(ev.data)
+      } catch {
+        return
+      }
+      if (msg.type === 'output' && typeof msg.data === 'string') {
+        termRef.current?.write(msg.data)
+        return
+      }
+      if (msg.type === 'status') {
+        if (msg.state === 'agent_ready') {
+          setStatusText(msg.message || '反向隧道已就绪，正在分配 Shell…')
+          const cols = termRef.current?.cols || 100
+          const rows = termRef.current?.rows || 30
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'open', cols, rows }))
+          }
+          return
+        }
+        if (msg.state === 'connected') {
+          setAgentOffline(false)
+          setPhase('connected')
+          setStatusText(msg.message || `已免密接入 ${curMonitor.fqdn}`)
+          if (!curMonitor.terminal_agent_online) {
+            onMonitorUpdated({ ...curMonitor, terminal_agent_online: true })
+          }
+          window.setTimeout(() => {
+            try {
+              fitRef.current?.fit()
+            } catch {}
+            termRef.current?.focus()
+          }, 60)
+          return
+        }
+        if (msg.state === 'closed') {
+          setPhase((prev) => (prev === 'error' ? 'error' : 'closed'))
+          setStatusText(msg.message || '免密终端会话已结束')
+          termRef.current?.writeln(`\r\n\x1b[33m[CDT-TERM]\x1b[0m ${msg.message || '会话已结束'}`)
+          return
+        }
+      }
+      if (msg.type === 'error') {
+        const errMsg = msg.message || '反向终端连接失败'
+        setPhase('error')
+        setErrorText(errMsg)
+        if (msg.code === 'agent_offline') {
+          setAgentOffline(true)
+          setStatusText('反向终端未在线')
+          if (curMonitor.terminal_agent_online) {
+            onMonitorUpdated({ ...curMonitor, terminal_agent_online: false })
+          }
+        } else {
+          setStatusText('连接失败')
+        }
+        termRef.current?.writeln(`\r\n\x1b[31m[提示]\x1b[0m ${errMsg}`)
+      }
+    }
+
+    ws.onerror = () => {
+      if (connSeqRef.current !== seq) return
+      setPhase('error')
+      setErrorText('WebSocket 通道异常，请检查网络或重新登录后重试')
+      setStatusText('连接异常')
+    }
+
+    ws.onclose = () => {
+      if (connSeqRef.current !== seq) return
+      if (pingTimerRef.current !== null) {
+        window.clearInterval(pingTimerRef.current)
+        pingTimerRef.current = null
+      }
+      setPhase((prev) => (prev === 'connecting' || prev === 'connected' ? 'closed' : prev))
+    }
+  }, [disconnect, onMonitorUpdated])
+
   const connectSsh = useCallback(
     (overrides?: { useSaved?: boolean }) => {
       const portNum = Math.trunc(Number(port) || 22)
@@ -185,6 +319,10 @@ export default function DdnsSshOverlay({
       }
 
       disconnect()
+      const seq = connSeqRef.current
+      const curMonitor = monitorRef.current
+      setMode('ssh')
+      setAgentOffline(false)
       setErrorText('')
       setShowForm(false)
       setPhase('connecting')
@@ -201,11 +339,12 @@ export default function DdnsSshOverlay({
       } catch {}
 
       const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const wsUrl = `${wsProto}//${window.location.host}/api/v1/ddns-ip/monitors/${monitor.id}/ssh`
+      const wsUrl = `${wsProto}//${window.location.host}/api/v1/ddns-ip/monitors/${curMonitor.id}/ssh`
       const ws = new WebSocket(wsUrl)
       wsRef.current = ws
 
       ws.onopen = () => {
+        if (connSeqRef.current !== seq) return
         const cols = termRef.current?.cols || 100
         const rows = termRef.current?.rows || 30
         ws.send(
@@ -230,6 +369,7 @@ export default function DdnsSshOverlay({
       }
 
       ws.onmessage = (ev) => {
+        if (connSeqRef.current !== seq) return
         if (typeof ev.data !== 'string') return
         let msg: { type?: string; state?: string; data?: string; message?: string }
         try {
@@ -248,12 +388,12 @@ export default function DdnsSshOverlay({
             if (saveProfile && secret) {
               setHasSaved(true)
               onMonitorUpdated({
-                ...monitor,
+                ...curMonitor,
                 ssh_port: portNum,
                 ssh_username: user,
                 ssh_auth_type: authType,
                 has_ssh_secret: true,
-                has_ssh_passphrase: Boolean(passphrase) || monitor.has_ssh_passphrase,
+                has_ssh_passphrase: Boolean(passphrase) || curMonitor.has_ssh_passphrase,
               })
             }
             window.setTimeout(() => {
@@ -282,12 +422,14 @@ export default function DdnsSshOverlay({
       }
 
       ws.onerror = () => {
+        if (connSeqRef.current !== seq) return
         setPhase('error')
         setErrorText('WebSocket 通道异常，请检查网络或登录后重试')
         setStatusText('连接异常')
       }
 
       ws.onclose = () => {
+        if (connSeqRef.current !== seq) return
         if (pingTimerRef.current !== null) {
           window.clearInterval(pingTimerRef.current)
           pingTimerRef.current = null
@@ -299,7 +441,6 @@ export default function DdnsSshOverlay({
       authType,
       disconnect,
       hasSaved,
-      monitor,
       onMonitorUpdated,
       passphrase,
       port,
@@ -310,14 +451,49 @@ export default function DdnsSshOverlay({
     ],
   )
 
-  // Auto-connect immediately on open if encrypted credentials are already saved.
+  // Auto-connect immediately on open: prefer passwordless reverse terminal, or saved SSH if agent offline.
   useEffect(() => {
-    if (monitor.has_ssh_secret && !autoConnectedRef.current) {
-      autoConnectedRef.current = true
-      const timer = window.setTimeout(() => connectSsh({ useSaved: true }), 80)
-      return () => window.clearTimeout(timer)
+    if (autoConnectedRef.current) return
+    autoConnectedRef.current = true
+    const timer = window.setTimeout(() => {
+      if (initialMode === 'agent') {
+        connectAgent()
+      } else {
+        connectSsh({ useSaved: true })
+      }
+    }, 60)
+    return () => window.clearTimeout(timer)
+  }, [connectAgent, connectSsh, initialMode])
+
+  const switchMode = (nextMode: TerminalMode) => {
+    if (nextMode === mode && !(nextMode === 'agent' && agentOffline)) return
+    setErrorText('')
+    if (nextMode === 'agent') {
+      connectAgent()
+    } else {
+      disconnect()
+      setMode('ssh')
+      setAgentOffline(false)
+      if (hasSaved) {
+        connectSsh({ useSaved: true })
+      } else {
+        setPhase('form')
+        setStatusText('请输入 SSH 登录信息')
+        setShowForm(true)
+      }
     }
-  }, [connectSsh, monitor.has_ssh_secret])
+  }
+
+  const copyInstallCmd = async () => {
+    try {
+      await navigator.clipboard.writeText(monitor.install_cmd)
+      setCopiedCmd(true)
+      onToast('已复制新版 Linux 一键安装命令（含免密终端与自动三网延迟）', 'success')
+      window.setTimeout(() => setCopiedCmd(false), 1800)
+    } catch {
+      onToast('复制失败，请手动选中复制', 'error')
+    }
+  }
 
   const clearSavedCredentials = async () => {
     setClearingSaved(true)
@@ -348,23 +524,29 @@ export default function DdnsSshOverlay({
           : 'is-idle'
 
   return (
-    <div className="vnc-overlay ssh-overlay" role="dialog" aria-modal="true" aria-label="SSH 远程终端">
+    <div className="vnc-overlay ssh-overlay" role="dialog" aria-modal="true" aria-label="远程终端">
       <div className="vnc-bar">
         <div className="vnc-bar-info">
           <TerminalIcon size={15} style={{ color: '#f472b6' }} />
           <strong>{monitor.fqdn}</strong>
           {monitor.label && <span className="ssh-bar-label">{monitor.label}</span>}
           <code className="mono">
-            {username.trim() || 'root'}@{targetHost || '--'}:{port || '22'}
+            {mode === 'agent'
+              ? `免密监控隧道 · ${monitor.hostname || targetHost || monitor.fqdn}`
+              : `${username.trim() || 'root'}@${targetHost || '--'}:${port || '22'}`}
           </code>
           <span className={`ssh-status-pill ${phaseDotClass}`}>
             <i />
             {phase === 'connected'
-              ? '已连接'
+              ? mode === 'agent'
+                ? '免密已连接'
+                : 'SSH 已连接'
               : phase === 'connecting'
                 ? '连接中…'
                 : phase === 'error'
-                  ? '连接失败'
+                  ? agentOffline
+                    ? 'Agent 未在线'
+                    : '连接失败'
                   : phase === 'closed'
                     ? '已断开'
                     : '未连接'}
@@ -372,18 +554,43 @@ export default function DdnsSshOverlay({
         </div>
 
         <div className="vnc-bar-actions">
-          <button
-            type="button"
-            className="btn ghost sm"
-            onClick={() => setShowForm((v) => !v)}
-          >
-            <SlidersHorizontal size={12} /> {showForm ? '返回终端' : '连接配置'}
-          </button>
+          <div className="ssh-mode-switch" role="tablist" aria-label="终端连接方式">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === 'agent'}
+              className={mode === 'agent' ? 'on' : ''}
+              onClick={() => switchMode('agent')}
+              title="通过 DDNS 监控内置反向隧道免密直连，无需密码和开放端口"
+            >
+              <ShieldCheck size={12} /> 免密终端
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === 'ssh'}
+              className={mode === 'ssh' ? 'on' : ''}
+              onClick={() => switchMode('ssh')}
+              title="通过公网 IP 和端口使用密码或私钥直连 sshd"
+            >
+              <KeyRound size={12} /> 直连 SSH
+            </button>
+          </div>
+
+          {mode === 'ssh' && (
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={() => setShowForm((v) => !v)}
+            >
+              <SlidersHorizontal size={12} /> {showForm ? '返回终端' : '连接配置'}
+            </button>
+          )}
           <button
             type="button"
             className="btn ghost sm"
             disabled={phase === 'connecting'}
-            onClick={() => connectSsh()}
+            onClick={() => (mode === 'agent' ? connectAgent() : connectSsh())}
           >
             {phase === 'connecting' ? (
               <LoaderCircle size={12} className="spin" />
@@ -415,7 +622,63 @@ export default function DdnsSshOverlay({
       <div className="vnc-stage ssh-stage">
         <div ref={termContainerRef} className="ssh-xterm-host" />
 
-        {showForm && (
+        {/* Offline Reverse Agent Guidance Card */}
+        {mode === 'agent' && agentOffline && (
+          <div className="ssh-form-backdrop">
+            <div className="ssh-connect-card ssh-agent-guide">
+              <div className="ssh-connect-head">
+                <div>
+                  <h3>
+                    <Radio size={16} style={{ color: '#f472b6' }} /> 免密反向终端尚未在线
+                  </h3>
+                  <p>
+                    节点「{monitor.fqdn}」暂未接入新版免密监控隧道。在目标服务器执行一次下方命令即可开启免密终端、每分钟自动三网延迟上报，且后续面板升级脚本将自动更新。
+                  </p>
+                </div>
+              </div>
+
+              <div className="ssh-agent-cmd-box">
+                <div className="ssh-agent-cmd-head">
+                  <span>新版 Linux 一键安装 / 升级命令（需 python3，无需开放入站端口）</span>
+                  <button
+                    type="button"
+                    className="btn primary sm"
+                    onClick={() => void copyInstallCmd()}
+                  >
+                    {copiedCmd ? <Check size={12} /> : <Copy size={12} />}
+                    {copiedCmd ? '已复制' : '复制命令'}
+                  </button>
+                </div>
+                <pre className="ssh-agent-cmd-pre">{monitor.install_cmd}</pre>
+              </div>
+
+              <div className="ssh-form-foot">
+                <span className="ssh-form-tip">
+                  家宽 / NAT 内网无公网端口也能直接免密连入；若暂不升级，可切换直连 SSH
+                </span>
+                <div className="ssh-form-btns">
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    onClick={() => switchMode('ssh')}
+                  >
+                    <KeyRound size={12} /> 改用直连 SSH
+                  </button>
+                  <button
+                    type="button"
+                    className="btn primary sm"
+                    onClick={() => connectAgent()}
+                  >
+                    <RefreshCw size={12} /> 重新检测免密终端
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Direct SSH Login Form (Fallback Mode) */}
+        {mode === 'ssh' && showForm && (
           <div className="ssh-form-backdrop">
             <form
               className="ssh-connect-card"
@@ -427,9 +690,9 @@ export default function DdnsSshOverlay({
               <div className="ssh-connect-head">
                 <div>
                   <h3>
-                    <TerminalIcon size={16} /> SSH 远程终端登录
+                    <TerminalIcon size={16} /> 直连 SSH 终端登录
                   </h3>
-                  <p>通过安全加密通道直连当前监控节点的动态公网 IPv4</p>
+                  <p>通过安全加密通道直连当前监控节点的动态公网 IPv4（也支持顶部切换免密反向终端）</p>
                 </div>
               </div>
 
@@ -558,7 +821,7 @@ export default function DdnsSshOverlay({
 
               <div className="ssh-form-foot">
                 <span className="ssh-form-tip">
-                  提示：目标服务器需开放外网 SSH 端口（家宽请在路由器转发端口并填写外部端口）
+                  提示：目标服务器需开放外网 SSH 端口（家宽无端口推荐使用顶部「免密终端」）
                 </span>
                 <div className="ssh-form-btns">
                   {phase === 'connected' && (
@@ -583,32 +846,52 @@ export default function DdnsSshOverlay({
           </div>
         )}
 
-        {!showForm && phase === 'error' && errorText && (
+        {!showForm && !agentOffline && phase === 'error' && errorText && (
           <div className="ssh-error-banner">
             <span>{errorText}</span>
             <div className="ssh-error-banner-ops">
+              {mode === 'ssh' ? (
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  onClick={() => setShowForm(true)}
+                >
+                  修改端口 / 凭据
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  onClick={() => switchMode('ssh')}
+                >
+                  切换直连 SSH
+                </button>
+              )}
               <button
                 type="button"
-                className="btn ghost sm"
-                onClick={() => setShowForm(true)}
+                className="btn primary sm"
+                onClick={() => (mode === 'agent' ? connectAgent() : connectSsh())}
               >
-                修改端口 / 凭据
-              </button>
-              <button type="button" className="btn primary sm" onClick={() => connectSsh()}>
                 重试连接
               </button>
             </div>
           </div>
         )}
 
-        {!showForm && phase === 'closed' && (
+        {!showForm && !agentOffline && phase === 'closed' && (
           <div className="ssh-error-banner is-info">
             <span>{statusText}</span>
             <div className="ssh-error-banner-ops">
-              <button type="button" className="btn ghost sm" onClick={() => setShowForm(true)}>
-                连接配置
-              </button>
-              <button type="button" className="btn primary sm" onClick={() => connectSsh()}>
+              {mode === 'ssh' && (
+                <button type="button" className="btn ghost sm" onClick={() => setShowForm(true)}>
+                  连接配置
+                </button>
+              )}
+              <button
+                type="button"
+                className="btn primary sm"
+                onClick={() => (mode === 'agent' ? connectAgent() : connectSsh())}
+              >
                 重新连接
               </button>
             </div>

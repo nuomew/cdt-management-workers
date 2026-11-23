@@ -1273,6 +1273,9 @@ export type DdnsIpMonitorItem = {
   ssh_auth_type: DdnsIpSshAuthType
   has_ssh_secret: boolean
   has_ssh_passphrase: boolean
+  terminal_agent_online?: boolean
+  terminal_agent_version?: string
+  agent_version?: string
   remark: string
   online: boolean
   install_cmd: string
