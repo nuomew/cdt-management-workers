@@ -1072,7 +1072,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
               <div className="cloud-dns-error">{zonesError}</div>
             ) : filteredZones.length === 0 ? (
               <div className="cloud-dns-empty-sm">
-                当前{site === 'intl' ? '国际站' : '国内站'}下暂无 EdgeOne 站点，可尝试切换右上角「国内站 / 国际站」。
+                当前{site === 'intl' ? '国际站' : '国内站'}下暂无已绑定域名的 EdgeOne 站点，可尝试切换右上角「国内站 / 国际站」。
               </div>
             ) : (
               <div className="cloud-dns-domain-list">
@@ -1086,7 +1086,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                       className={`cloud-dns-domain-item${active ? ' is-active' : ''}`}
                       onClick={() => setSelectedZoneId(z.zoneId)}
                     >
-                      <div className="cloud-dns-domain-name">{z.zoneName || z.zoneId}</div>
+                      <div className="cloud-dns-domain-name">{z.zoneName}</div>
                       <div className="cloud-dns-domain-meta">
                         <span>{zoneTypeLabel(z.type)}</span>
                         <span>{ok ? areaLabel(z.area) : z.paused ? '已暂停' : z.activeStatus}</span>

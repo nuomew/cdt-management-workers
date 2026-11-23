@@ -320,6 +320,31 @@ function getDryBucket(creds: EdgeOneCreds): Map<string, DryZoneState> {
     ],
     prefetchTasks: [],
   });
+
+  // Seed an unbound/no-domain plan zone in dry-run to verify filtering excludes it.
+  const unboundZoneId = creds.site === "intl" ? "zone-dryintl-unbound" : "zone-drycn-unbound";
+  bucket.set(unboundZoneId, {
+    zone: {
+      zoneId: unboundZoneId,
+      zoneName: "",
+      area: creds.site === "intl" ? "overseas" : "global",
+      type: "noDomainAccess",
+      status: "active",
+      activeStatus: "active",
+      paused: false,
+      cnameStatus: "",
+      cnameSpeedUp: "",
+      planType: "free",
+      planStatus: "normal",
+      createdOn: nowIso,
+      modifiedOn: nowIso,
+      nameServers: [],
+    },
+    domains: new Map(),
+    purgeTasks: [],
+    prefetchTasks: [],
+  });
+
   dryStore.set(key, bucket);
   return bucket;
 }
@@ -328,23 +353,56 @@ function getDryBucket(creds: EdgeOneCreds): Map<string, DryZoneState> {
 // Zones & Acceleration Domains
 // ---------------------------------------------------------------------------
 
+const NON_DOMAIN_ZONE_TYPES = new Set([
+  "nodomainaccess",
+  "partialcomposite",
+  "pages",
+  "ai",
+]);
+
+/**
+ * Exclude EdgeOne plans/sites that have no bound domain (empty ZoneName,
+ * no-domain / Pages / AI access types, or deleted / uninitialized placeholders).
+ */
+export function hasBoundDomainZone(zone: EdgeOneZone): boolean {
+  const name = zone.zoneName.trim().toLowerCase();
+  const id = zone.zoneId.trim().toLowerCase();
+  if (!name || !name.includes(".") || (id && name === id)) {
+    return false;
+  }
+  const type = zone.type.trim().toLowerCase();
+  if (NON_DOMAIN_ZONE_TYPES.has(type)) {
+    return false;
+  }
+  const status = zone.status.trim().toLowerCase();
+  const activeStatus = zone.activeStatus.trim().toLowerCase();
+  if (status === "deleted" || status === "init" || activeStatus === "init") {
+    return false;
+  }
+  return true;
+}
+
 export async function listZones(env: Env, creds: EdgeOneCreds): Promise<EdgeOneZone[]> {
   if (isDryRun(env)) {
-    return [...getDryBucket(creds).values()].map((z) => z.zone);
+    return [...getDryBucket(creds).values()]
+      .map((z) => z.zone)
+      .filter(hasBoundDomainZone);
   }
 
   const all: EdgeOneZone[] = [];
   let offset = 0;
+  let fetched = 0;
   const limit = 100;
   for (let page = 0; page < 5; page += 1) {
     const resp = await teoRpc(creds, "DescribeZones", { Offset: offset, Limit: limit });
     const items = asArr<Record<string, unknown>>(resp["Zones"]);
+    fetched += items.length;
     for (const z of items) {
       const resources = asArr<Record<string, unknown>>(z["Resources"]);
       const planRes = resources.find((r) => asStr(r["Group"]) === "plan") ?? resources[0];
-      all.push({
+      const zone: EdgeOneZone = {
         zoneId: asStr(z["ZoneId"]),
-        zoneName: asStr(z["ZoneName"]),
+        zoneName: asStr(z["ZoneName"]).trim(),
         area: asStr(z["Area"], "global"),
         type: asStr(z["Type"], "partial"),
         status: asStr(z["Status"]),
@@ -357,10 +415,13 @@ export async function listZones(env: Env, creds: EdgeOneCreds): Promise<EdgeOneZ
         createdOn: asStr(z["CreatedOn"]),
         modifiedOn: asStr(z["ModifiedOn"]),
         nameServers: asArr<string>(z["NameServers"]).map((s) => asStr(s)),
-      });
+      };
+      if (hasBoundDomainZone(zone)) {
+        all.push(zone);
+      }
     }
-    const total = asNum(resp["TotalCount"], all.length);
-    if (items.length === 0 || all.length >= total) break;
+    const total = asNum(resp["TotalCount"], fetched);
+    if (items.length === 0 || fetched >= total) break;
     offset += limit;
   }
   return all;
