@@ -195,6 +195,7 @@ export type Overview = {
   dns: DnsState
   dns_accounts_count?: number
   ssl_certs_count?: number
+  nps_servers_count?: number
   notifications: {
     channels: string[]
     telegram: boolean
@@ -1068,6 +1069,170 @@ export type EdgeOneAnalyticsResponse = {
   }
   series: EdgeOneAnalyticsPoint[]
 }
+
+/* -------------------------------------------------------------- NPS (yisier/nps) */
+
+export type NpsAuthMode = 'auth_key' | 'web_login'
+
+export type NpsTunnelMode =
+  | 'tcp'
+  | 'udp'
+  | 'socks5'
+  | 'httpProxy'
+  | 'secret'
+  | 'p2p'
+  | 'file'
+
+export type NpsHostScheme = 'all' | 'http' | 'https'
+
+export type NpsServerItem = {
+  id: number
+  label: string
+  base_url: string
+  auth_mode: NpsAuthMode
+  username: string
+  has_auth_key: boolean
+  has_password: boolean
+  auth_key_preview: string
+  remark: string
+  created_at: number
+  updated_at: number
+}
+
+export type NpsBridgeInfo = {
+  ip: string
+  bridgeType: string
+  bridgePort: number
+}
+
+export type NpsClientItem = {
+  id: number
+  verifyKey: string
+  remark: string
+  status: boolean
+  isConnect: boolean
+  addr: string
+  localAddr: string
+  version: string
+  nowConn: number
+  maxConn: number
+  rateLimit: number
+  maxTunnelNum: number
+  inletFlow: number
+  exportFlow: number
+  flowLimit: number
+  compress: boolean
+  crypt: boolean
+  basicUser: string
+  basicPass: string
+  webUserName: string
+  configConnAllow: boolean
+  expireTime: string
+  createTime: string
+  lastOnlineTime: string
+}
+
+export type NpsTunnelItem = {
+  id: number
+  clientId: number
+  clientRemark: string
+  clientOnline: boolean
+  mode: NpsTunnelMode
+  port: number
+  serverIp: string
+  target: string
+  localProxy: boolean
+  status: boolean
+  runStatus: boolean
+  remark: string
+  password: string
+  localPath: string
+  stripPre: string
+  inletFlow: number
+  exportFlow: number
+}
+
+export type NpsHostCertBinding = {
+  id: number
+  nps_server_id: number
+  nps_host_id: number
+  nps_client_id: number
+  domain: string
+  ssl_cert_id: number
+  sync_cdn: boolean
+  last_deployed_cert_id: string
+  last_deployed_at: number
+  last_error: string
+  created_at: number
+  updated_at: number
+  ssl_domain?: string
+  ssl_cert_current_id?: string
+  ssl_pending_cert_id?: string
+  ssl_status?: SslCertStatus | ''
+  ssl_status_name?: string
+  ssl_cert_end_time?: string
+  ssl_cert_end_ts?: number
+  ssl_auto_renew?: boolean
+  ssl_renew_before_days?: number
+}
+
+export type NpsHostCdnBinding = {
+  id: number
+  zone_id: string
+  zone_name: string
+  site: EdgeOneSite
+  last_deployed_cert_id: string
+  last_deployed_at: number
+  last_error: string
+}
+
+export type NpsHostItem = {
+  id: number
+  clientId: number
+  clientRemark: string
+  clientOnline: boolean
+  host: string
+  target: string
+  localProxy: boolean
+  scheme: NpsHostScheme
+  location: string
+  headerChange: string
+  hostChange: string
+  remark: string
+  isClose: boolean
+  autoHttps: boolean
+  inletFlow: number
+  exportFlow: number
+  hasCert: boolean
+  certMode: 'none' | 'pem' | 'file'
+  certPreview: string
+  certBinding?: NpsHostCertBinding | null
+  cdnBindings?: NpsHostCdnBinding[]
+}
+
+export type NpsManagedCertOption = {
+  id: number
+  domain: string
+  tencent_account_id: number
+  cert_id: string
+  pending_cert_id: string
+  status: SslCertStatus
+  status_name: string
+  cert_end_time: string
+  cert_end_ts: number
+  auto_renew: boolean
+  renew_before_days: number
+}
+
+export type NpsBootstrapResponse = {
+  servers: NpsServerItem[]
+  tencent_accounts: DnsAccount[]
+  dns_accounts: DnsAccount[]
+  managed_certs: NpsManagedCertOption[]
+  bindings: NpsHostCertBinding[]
+  edgeone_bindings: EdgeOneCertBinding[]
+}
+
 
 
 

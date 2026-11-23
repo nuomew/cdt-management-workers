@@ -9,8 +9,10 @@ import {
   ExternalLink,
   Globe2,
   HeartPulse,
+  Link2,
   LoaderCircle,
   LogOut,
+  Network,
   RefreshCw,
   Repeat,
   Server as ServerIcon,
@@ -60,6 +62,7 @@ import ConfirmDialog from './components/ConfirmDialog'
 import DNSView from './components/DNSView'
 import CertsView from './components/CertsView'
 import EdgeOneView from './components/EdgeOneView'
+import NpsView from './components/NpsView'
 import { Badge, Modal } from './components/ui'
 import { ownerLabel } from './owners'
 import { syncClock } from './time'
@@ -74,6 +77,8 @@ type View =
   | 'dns'
   | 'certs'
   | 'cdn'
+  | 'nps_tunnels'
+  | 'nps_hosts'
   | 'settings'
 type Toast = { id: number; tone: 'success' | 'error' | 'info'; message: string }
 
@@ -96,8 +101,8 @@ const REFRESH_MS = 10_000
 type NavLeaf = { key: View; label: string; icon: typeof BarChart3 }
 
 /**
- * 侧栏三个总菜单：仪表盘 / 保活 / DNS。
- * 带 key 的总菜单本身就是页面（仪表盘可点），不带的只作分组标签（保活、DNS）。
+ * 侧栏总菜单：仪表盘 / 保活 / DNS / NPS。
+ * 带 key 的总菜单本身就是页面（仪表盘可点），不带的只作分组标签。
  * 子项统一缩进挂在总菜单下面。
  */
 type NavSection = {
@@ -134,6 +139,14 @@ const NAV_SECTIONS: NavSection[] = [
       { key: 'cdn', label: 'CDN服务', icon: CloudLightning },
     ],
   },
+  {
+    title: 'NPS',
+    icon: Network,
+    children: [
+      { key: 'nps_tunnels', label: '端口映射', icon: Network },
+      { key: 'nps_hosts', label: '域名解析', icon: Link2 },
+    ],
+  },
 ]
 
 function navCount(key: View, overview: Overview): number {
@@ -143,6 +156,7 @@ function navCount(key: View, overview: Overview): number {
   if (key === 'shift') return overview.groups.length
   if (key === 'dns') return (overview.dns_accounts_count ?? 0) || (overview.dns?.records.length ?? 0)
   if (key === 'certs') return overview.ssl_certs_count ?? 0
+  if (key === 'nps_tunnels') return overview.nps_servers_count ?? 0
   return 0
 }
 
@@ -1105,6 +1119,18 @@ export default function App() {
             onToast={toast}
             onGoDnsAccounts={() => setView('dns')}
             onGoCerts={() => setView('certs')}
+          />
+        )}
+
+        {(view === 'nps_tunnels' || view === 'nps_hosts') && (
+          <NpsView
+            section={view === 'nps_hosts' ? 'hosts' : 'tunnels'}
+            onSwitchSection={(next) => setView(next === 'hosts' ? 'nps_hosts' : 'nps_tunnels')}
+            onToast={toast}
+            onConfirm={setConfirmBox}
+            onGoCerts={() => setView('certs')}
+            onGoDnsAccounts={() => setView('dns')}
+            onChanged={() => void loadAll()}
           />
         )}
 

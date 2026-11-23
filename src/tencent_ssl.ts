@@ -11,10 +11,12 @@ import type { Env } from "./env";
 import * as dnsProviders from "./dns_providers";
 import * as messages from "./messages";
 import * as notify from "./notify";
+import * as nps from "./nps";
 import * as repo from "./repo";
 import type {
   DnsAccountRecord,
   EdgeOneSite,
+  NpsCertBindingRecord,
   SslCertStatus,
   SslCertificateRecord,
   SslVerifyMode,
@@ -42,9 +44,11 @@ const HTTP_TIMEOUT_MS = 18_000;
 const VERIFY_POLL_FLAG = "ssl_verify_last_run";
 const RENEW_SCAN_FLAG = "ssl_renew_last_run";
 const EO_CERT_SCAN_FLAG = "eo_cert_reconcile_last_run";
+const NPS_CERT_SYNC_FLAG = "nps_cert_sync_last_run";
 const VERIFY_POLL_INTERVAL_SECONDS = 120; // 2 min
 const RENEW_SCAN_INTERVAL_SECONDS = 900; // 15 min
 const EO_CERT_SCAN_INTERVAL_SECONDS = 1800; // 30 min
+const NPS_CERT_SYNC_INTERVAL_SECONDS = 300; // 5 min
 const RENEW_RETRY_COOLDOWN_SECONDS = 6 * 3600; // 6 h between automatic retry attempts
 
 export interface TencentCreds {
@@ -1272,10 +1276,23 @@ export async function refreshManagedCertificate(
 
     // Automatically push the newly issued / renewed certificate to any bound EdgeOne hosts.
     let edgeOneSyncNote = "";
+    let npsSyncNote = "";
     if (!wasAlreadyIssuedSameCert || isRenewalFlow) {
       const eoSync = await syncRenewedCertificateToEdgeOne(env, id, activeCertId);
       if (eoSync.notes.length > 0) {
         edgeOneSyncNote = `；${eoSync.notes.join("，")}`;
+      }
+      const npsSync = await syncRenewedCertificateToNps(env, id, activeCertId, {
+        pemOverride:
+          detail.certificatePublicKey && detail.certificatePrivateKey
+            ? {
+                certPem: detail.certificatePublicKey,
+                keyPem: detail.certificatePrivateKey,
+              }
+            : undefined,
+      });
+      if (npsSync.notes.length > 0) {
+        npsSyncNote = `；${npsSync.notes.join("，")}`;
       }
     }
 
@@ -1283,7 +1300,7 @@ export async function refreshManagedCertificate(
       justIssued = true;
       const actionTitle = isRenewalFlow ? "SSL 证书自动续签已签发" : "SSL 证书已签发";
       await repo.addEvent(env, "ssl", messages.ev(actionTitle, messages.objServer(cert.domain)), {
-        detail: `域名 ${cert.domain} 证书（ID: ${activeCertId}）已签发，有效期至 ${detail.certEndTime || "未知"}${dnsCleanupNote}${oldCleanupNote}${edgeOneSyncNote}`,
+        detail: `域名 ${cert.domain} 证书（ID: ${activeCertId}）已签发，有效期至 ${detail.certEndTime || "未知"}${dnsCleanupNote}${oldCleanupNote}${edgeOneSyncNote}${npsSyncNote}`,
       });
       await notifyCertEvent(env, "ssl_issued", `✅ ${actionTitle}：${cert.domain}`, [
         `域名：${cert.domain}`,
@@ -1294,6 +1311,7 @@ export async function refreshManagedCertificate(
         ...(dnsCleanupNote ? [`验证解析：${dnsCleanupNote.replace(/^；/, "")}`] : []),
         ...(oldCleanupNote ? [`旧证清理：${oldCleanupNote.replace(/^；/, "")}`] : []),
         ...(edgeOneSyncNote ? [`EdgeOne 联动：${edgeOneSyncNote.replace(/^；/, "")}`] : []),
+        ...(npsSyncNote ? [`NPS 联动：${npsSyncNote.replace(/^；/, "")}`] : []),
       ]);
     }
   } else if (detail.status === 2 || detail.status === 7 || detail.status === 10) {
@@ -2701,4 +2719,1003 @@ export async function reconcileEdgeOneCertificates(
 
   return summary;
 }
+
+// ---------------------------------------------------------------------------
+// NPS Host Certificate Automation & EdgeOne CDN Cross-Sync
+// ---------------------------------------------------------------------------
+
+export interface NpsCertSyncResult {
+  synced: number;
+  failed: number;
+  cdnSynced: number;
+  cdnFailed: number;
+  notes: string[];
+}
+
+export interface EnsureNpsHostCertParams {
+  npsServerId: number;
+  npsHostId: number;
+  sslCertId?: number;
+  tencentAccountId?: number;
+  dnsVerifyMode?: SslVerifyMode;
+  dnsAccountId?: number;
+  syncCdn?: boolean;
+  autoHttps?: boolean;
+  renewBeforeDays?: number;
+}
+
+export interface EnsureNpsHostCertResult {
+  domain: string;
+  action: "bound_and_deployed" | "applied" | "renewed" | "pending";
+  deployedToNps: boolean;
+  certId: string;
+  sslCertRowId: number;
+  binding: NpsCertBindingRecord;
+  cdnSynced: number;
+  cdnNotes: string[];
+  detail: string;
+}
+
+export interface ReconcileNpsCertsSummary {
+  checked: number;
+  synced: number;
+  failed: number;
+  cdnSynced: number;
+  errors: string[];
+}
+
+/**
+ * Push a freshly issued or bound Tencent SSL certificate (`certId`) to every
+ * matching EdgeOne CDN acceleration domain for `domain`:
+ * 1) Any existing `edgeone_cert_bindings` row for the same domain (re-linking
+ *    `ssl_cert_id` if needed, skipping bindings already deployed with `certId`
+ *    unless `force` is set);
+ * 2) Any active EdgeOne acceleration domain on the certificate's Tencent Cloud
+ *    account (cn/intl) whose `domainName` matches `domain`, automatically
+ *    creating an `edgeone_cert_bindings` record so future 7-day renewals stay
+ *    synchronized automatically.
+ */
+async function syncDomainCertToMatchingEdgeOne(
+  env: Env,
+  sslCertId: number,
+  certId: string,
+  domainRaw: string,
+  opts?: {
+    preferredTencentAccountId?: number;
+    force?: boolean;
+  },
+): Promise<{ synced: number; failed: number; matched: number; notes: string[] }> {
+  const domain = domainRaw.trim().toLowerCase().replace(/\.+$/, "");
+  const cleanCertId = certId.trim();
+  if (!domain || !cleanCertId) {
+    return { synced: 0, failed: 0, matched: 0, notes: [] };
+  }
+
+  const now = nowSeconds();
+  let synced = 0;
+  let failed = 0;
+  let matched = 0;
+  const notes: string[] = [];
+  const handledZoneDomains = new Set<string>();
+
+  const existingBindings = (await repo.listEdgeOneCertBindings(env)).filter(
+    (b) => b.domain.trim().toLowerCase() === domain,
+  );
+
+  for (const b of existingBindings) {
+    const key = `${b.tencent_account_id}:${b.site}:${b.zone_id}:${domain}`;
+    handledZoneDomains.add(key);
+    matched += 1;
+
+    // Ensure binding points to this managed SSL certificate so future renewals auto-sync.
+    let activeBinding = b;
+    if (b.ssl_cert_id !== sslCertId) {
+      activeBinding = await repo.upsertEdgeOneCertBinding(env, {
+        ssl_cert_id: sslCertId,
+        tencent_account_id: b.tencent_account_id,
+        site: b.site,
+        zone_id: b.zone_id,
+        zone_name: b.zone_name,
+        domain,
+        last_deployed_cert_id: b.last_deployed_cert_id,
+        last_deployed_at: b.last_deployed_at,
+        last_error: b.last_error,
+      });
+    }
+
+    if (!opts?.force && activeBinding.last_deployed_cert_id === cleanCertId) {
+      continue;
+    }
+
+    try {
+      await deployBindingNow(env, activeBinding, cleanCertId);
+      synced += 1;
+      notes.push(`EdgeOne CDN ${domain} 已同步证书 ${cleanCertId}`);
+    } catch (err) {
+      failed += 1;
+      const msg = err instanceof Error ? err.message : String(err);
+      notes.push(`EdgeOne CDN ${domain} 同步失败（${msg}）`);
+    }
+  }
+
+  // Probe EdgeOne zones on the certificate's Tencent account to auto-discover
+  // any CDN domain that hasn't been explicitly bound yet.
+  const scopeList: Array<{ accountId: number; site: EdgeOneSite }> = [];
+  const scopeSeen = new Set<string>();
+  const addScope = (accountId: number, site: EdgeOneSite) => {
+    if (!Number.isFinite(accountId) || accountId <= 0) return;
+    const cleanSite = normalizeEdgeOneSite(site);
+    const k = `${accountId}:${cleanSite}`;
+    if (scopeSeen.has(k)) return;
+    scopeSeen.add(k);
+    scopeList.push({ accountId, site: cleanSite });
+  };
+
+  const preferredAcct = opts?.preferredTencentAccountId ?? 0;
+  const watched = await listWatchedEdgeOneScopes(env);
+  if (preferredAcct > 0) {
+    for (const s of watched) {
+      if (s.accountId === preferredAcct) addScope(s.accountId, s.site);
+    }
+    addScope(preferredAcct, "cn");
+    addScope(preferredAcct, "intl");
+  } else {
+    for (const s of watched) {
+      addScope(s.accountId, s.site);
+    }
+    if (scopeList.length === 0) {
+      const accts = await repo.listDnsAccounts(env, { provider: "tencent", decryptSecret: false });
+      for (const a of accts) {
+        addScope(a.id, "cn");
+        addScope(a.id, "intl");
+      }
+    }
+  }
+
+  for (const scope of scopeList) {
+    let creds;
+    try {
+      creds = await resolveEdgeOneCreds(env, scope.accountId, scope.site);
+    } catch {
+      continue;
+    }
+
+    let zones;
+    try {
+      zones = await listZones(env, creds);
+    } catch {
+      continue;
+    }
+    if (zones.length === 0) continue;
+    await recordWatchedEdgeOneScope(env, scope.accountId, scope.site);
+
+    for (const zone of zones) {
+      if (zone.paused) continue;
+      // Quick suffix check: acceleration domain must match or be a subdomain of zoneName.
+      const zoneName = zone.zoneName.trim().toLowerCase().replace(/\.+$/, "");
+      if (zoneName && domain !== zoneName && !domain.endsWith(`.${zoneName}`)) {
+        continue;
+      }
+
+      let domains: EdgeOneDomain[];
+      try {
+        domains = await listAccelerationDomains(env, creds, zone.zoneId);
+      } catch {
+        continue;
+      }
+
+      const hit = domains.find(
+        (d) => d.domainName.trim().toLowerCase() === domain && d.domainStatus !== "offline",
+      );
+      if (!hit) continue;
+
+      const key = `${scope.accountId}:${scope.site}:${zone.zoneId}:${domain}`;
+      if (handledZoneDomains.has(key)) continue;
+      handledZoneDomains.add(key);
+      matched += 1;
+
+      try {
+        await modifyHostsCertificate(env, creds, zone.zoneId, [domain], "sslcert", cleanCertId);
+        await repo.upsertEdgeOneCertBinding(env, {
+          ssl_cert_id: sslCertId,
+          tencent_account_id: scope.accountId,
+          site: scope.site,
+          zone_id: zone.zoneId,
+          zone_name: zone.zoneName,
+          domain,
+          last_deployed_cert_id: cleanCertId,
+          last_deployed_at: now,
+          last_error: "",
+        });
+        synced += 1;
+        notes.push(`EdgeOne CDN ${domain}（${zone.zoneName || zone.zoneId}）已联动同步证书 ${cleanCertId}`);
+        await repo.addEvent(
+          env,
+          "ssl",
+          messages.ev("NPS 联动 EdgeOne CDN 证书同步成功", messages.objServer(domain)),
+          {
+            detail: `已将腾讯云证书 ${cleanCertId} 同步部署至 EdgeOne 站点 ${zone.zoneName || zone.zoneId}，并建立后续自动续签联动`,
+          },
+        );
+      } catch (err) {
+        failed += 1;
+        const msg = err instanceof Error ? err.message : String(err);
+        notes.push(`EdgeOne CDN ${domain} 联动同步失败（${msg}）`);
+        await repo.addEvent(
+          env,
+          "ssl",
+          messages.ev("NPS 联动 EdgeOne CDN 证书同步失败", messages.objServer(domain)),
+          { level: "error", detail: `证书 ${cleanCertId}：${msg}` },
+        );
+      }
+    }
+  }
+
+  return { synced, failed, matched, notes };
+}
+
+async function fetchCertPemForDeployment(
+  env: Env,
+  cert: SslCertificateRecord,
+  certId: string,
+  pemOverride?: { certPem: string; keyPem: string },
+): Promise<{ certPem: string; keyPem: string }> {
+  if (
+    pemOverride?.certPem.includes("-----BEGIN") &&
+    pemOverride?.keyPem.includes("-----BEGIN")
+  ) {
+    return pemOverride;
+  }
+  const creds = await resolveTencentCredsForCert(env, cert);
+  const detail = await describeTencentCertificateDetail(env, creds, certId);
+  if (
+    !detail.certificatePublicKey.includes("-----BEGIN") ||
+    !detail.certificatePrivateKey.includes("-----BEGIN")
+  ) {
+    throw new Error(`腾讯云证书 ${certId} 尚未包含完整 PEM 公钥/私钥内容`);
+  }
+  return {
+    certPem: detail.certificatePublicKey,
+    keyPem: detail.certificatePrivateKey,
+  };
+}
+
+/**
+ * Push a newly issued or renewed managed Tencent SSL certificate to every bound
+ * NPS Host (inline PEM hot-reload without restarting NPS) and, when `sync_cdn`
+ * is enabled on the binding, synchronize any matching EdgeOne CDN acceleration
+ * domain with the exact same certificate.
+ */
+export async function syncRenewedCertificateToNps(
+  env: Env,
+  sslCertId: number,
+  newCertId: string,
+  opts?: {
+    pemOverride?: { certPem: string; keyPem: string };
+    forceCdn?: boolean;
+  },
+): Promise<NpsCertSyncResult> {
+  const bindings = await repo.listNpsBindingsBySslCert(env, sslCertId);
+  if (bindings.length === 0) {
+    return { synced: 0, failed: 0, cdnSynced: 0, cdnFailed: 0, notes: [] };
+  }
+
+  const cert = await repo.getSslCertificate(env, sslCertId, true);
+  if (!cert) {
+    return { synced: 0, failed: 0, cdnSynced: 0, cdnFailed: 0, notes: [] };
+  }
+
+  let synced = 0;
+  let failed = 0;
+  let cdnSynced = 0;
+  let cdnFailed = 0;
+  const notes: string[] = [];
+  const now = nowSeconds();
+
+  let pem: { certPem: string; keyPem: string };
+  try {
+    pem = await fetchCertPemForDeployment(env, cert, newCertId, opts?.pemOverride);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    for (const b of bindings) {
+      failed += 1;
+      await repo.updateNpsCertBindingStatus(env, b.id, { last_error: msg });
+    }
+    notes.push(`NPS 证书同步失败（${msg}）`);
+    return { synced, failed, cdnSynced, cdnFailed, notes };
+  }
+
+  const cdnDomainsToSync = new Set<string>();
+
+  for (const binding of bindings) {
+    try {
+      const server = await nps.resolveNpsServer(env, binding.nps_server_id);
+      await nps.deployPemCertificateToNpsHost(
+        env,
+        server,
+        binding.nps_host_id,
+        pem.certPem,
+        pem.keyPem,
+      );
+      await repo.updateNpsCertBindingStatus(env, binding.id, {
+        last_deployed_cert_id: newCertId,
+        last_deployed_at: now,
+        last_error: "",
+      });
+      synced += 1;
+      notes.push(`NPS「${server.label}」${binding.domain} 已热替换证书 ${newCertId}`);
+      await repo.addEvent(
+        env,
+        "ssl",
+        messages.ev("NPS 证书自动同步成功", messages.objServer(binding.domain)),
+        {
+          detail: `已将腾讯云证书 ${newCertId}（PEM）热更新至 NPS 服务器「${server.label}」域名解析 #${binding.nps_host_id}`,
+        },
+      );
+      if (binding.sync_cdn) {
+        cdnDomainsToSync.add(binding.domain.trim().toLowerCase());
+      }
+    } catch (err) {
+      failed += 1;
+      const msg = err instanceof Error ? err.message : String(err);
+      await repo.updateNpsCertBindingStatus(env, binding.id, { last_error: msg });
+      notes.push(`NPS 域名 ${binding.domain} 同步失败（${msg}）`);
+      await repo.addEvent(
+        env,
+        "ssl",
+        messages.ev("NPS 证书自动同步失败", messages.objServer(binding.domain)),
+        { level: "error", detail: `证书 ${newCertId}：${msg}` },
+      );
+    }
+  }
+
+  for (const dom of cdnDomainsToSync) {
+    const cdnRes = await syncDomainCertToMatchingEdgeOne(env, sslCertId, newCertId, dom, {
+      preferredTencentAccountId: cert.tencent_account_id,
+      force: opts?.forceCdn,
+    });
+    cdnSynced += cdnRes.synced;
+    cdnFailed += cdnRes.failed;
+    notes.push(...cdnRes.notes);
+  }
+
+  return { synced, failed, cdnSynced, cdnFailed, notes };
+}
+
+/**
+ * Bind an NPS domain host to a Tencent Cloud SSL certificate — either an
+ * explicitly chosen managed certificate (`sslCertId`) or automatic 5-step
+ * provisioning (reuse healthy local cert -> advance in-flight cert -> import
+ * healthy remote cert -> renew expiring local cert -> apply brand-new free 443
+ * DV cert with auto DNS verification & 7-day auto-renewal).
+ *
+ * Whenever the certificate is already issued (or issues immediately), deploys
+ * its PEM directly onto the NPS Host and optionally synchronizes matching
+ * EdgeOne CDN domains.
+ */
+export async function ensureNpsHostTencentCert(
+  env: Env,
+  params: EnsureNpsHostCertParams,
+): Promise<EnsureNpsHostCertResult> {
+  const server = await nps.resolveNpsServer(env, params.npsServerId);
+  const hostRaw = await nps.getHostRaw(env, server, params.npsHostId);
+  const domain = hostRaw.host.trim().toLowerCase().replace(/\.+$/, "");
+  if (!domain) {
+    throw new Error("该 NPS 域名解析未配置有效域名");
+  }
+  const syncCdn = params.syncCdn !== false;
+  const thresholdDays = Math.max(1, Math.min(30, Math.trunc(params.renewBeforeDays ?? 7)));
+  const thresholdSec = thresholdDays * 86400;
+  const now = nowSeconds();
+
+  // Helper: persist binding + push PEM to NPS + sync matching EdgeOne CDN if enabled.
+  const deployIssuedCert = async (
+    cert: SslCertificateRecord,
+    actionLabel: EnsureNpsHostCertResult["action"],
+    summaryPrefix: string,
+  ): Promise<EnsureNpsHostCertResult> => {
+    const certWithSecrets = (await repo.getSslCertificate(env, cert.id, true)) ?? cert;
+    const pem = await fetchCertPemForDeployment(env, certWithSecrets, cert.cert_id);
+    await nps.deployPemCertificateToNpsHost(
+      env,
+      server,
+      hostRaw.id,
+      pem.certPem,
+      pem.keyPem,
+      params.autoHttps !== undefined ? { autoHttps: params.autoHttps } : undefined,
+    );
+    const binding = await repo.upsertNpsCertBinding(env, {
+      nps_server_id: server.id,
+      nps_host_id: hostRaw.id,
+      nps_client_id: hostRaw.clientId,
+      domain,
+      ssl_cert_id: cert.id,
+      sync_cdn: syncCdn,
+      last_deployed_cert_id: cert.cert_id,
+      last_deployed_at: now,
+      last_error: "",
+    });
+    if (!cert.auto_renew || cert.renew_before_days < thresholdDays) {
+      await repo.updateSslCertificate(env, cert.id, {
+        auto_renew: true,
+        renew_before_days: Math.max(cert.renew_before_days || 7, thresholdDays),
+      });
+    }
+
+    let cdnSynced = 0;
+    let cdnNotes: string[] = [];
+    if (syncCdn) {
+      const cdnRes = await syncDomainCertToMatchingEdgeOne(env, cert.id, cert.cert_id, domain, {
+        preferredTencentAccountId: cert.tencent_account_id,
+        force: true,
+      });
+      cdnSynced = cdnRes.synced;
+      cdnNotes = cdnRes.notes;
+    }
+
+    const cdnSuffix = cdnNotes.length > 0 ? `；${cdnNotes.join("，")}` : "";
+    await repo.addEvent(
+      env,
+      "ssl",
+      messages.ev("NPS 域名已绑定并部署腾讯证书", messages.objServer(domain)),
+      {
+        detail: `${summaryPrefix}（证书 ${cert.cert_id}，NPS「${server.label}」#${hostRaw.id}，到期前 ${thresholdDays} 天自动续期）${cdnSuffix}`,
+      },
+    );
+
+    return {
+      domain,
+      action: actionLabel,
+      deployedToNps: true,
+      certId: cert.cert_id,
+      sslCertRowId: cert.id,
+      binding,
+      cdnSynced,
+      cdnNotes,
+      detail: `${summaryPrefix}${cdnSuffix}`,
+    };
+  };
+
+  // Path A: Bind an explicitly selected managed SSL certificate.
+  if (params.sslCertId && params.sslCertId > 0) {
+    const chosen = await repo.getSslCertificate(env, params.sslCertId, false);
+    if (!chosen) {
+      throw new Error(`所选托管证书 #${params.sslCertId} 不存在`);
+    }
+    if (chosen.status === "issued" && chosen.cert_id) {
+      return deployIssuedCert(
+        chosen,
+        "bound_and_deployed",
+        `已绑定并热部署托管证书 ${chosen.cert_id} 到 NPS`,
+      );
+    }
+
+    // Pending / verifying certificate: bind first, advance once, deploy if issued immediately.
+    let binding = await repo.upsertNpsCertBinding(env, {
+      nps_server_id: server.id,
+      nps_host_id: hostRaw.id,
+      nps_client_id: hostRaw.clientId,
+      domain,
+      ssl_cert_id: chosen.id,
+      sync_cdn: syncCdn,
+      last_deployed_cert_id: "",
+      last_deployed_at: 0,
+      last_error: "",
+    });
+    const refreshed = await refreshManagedCertificate(env, chosen.id, {
+      forceWriteDns: false,
+      triggerVerify: true,
+    });
+    if (refreshed.certificate.status === "issued" && refreshed.certificate.cert_id) {
+      const latestBinding = await repo.getNpsCertBinding(env, binding.id);
+      if (!latestBinding || latestBinding.last_deployed_cert_id !== refreshed.certificate.cert_id) {
+        return deployIssuedCert(
+          refreshed.certificate,
+          "bound_and_deployed",
+          `所选证书 ${refreshed.certificate.cert_id} 已签发并热部署到 NPS`,
+        );
+      }
+      binding = latestBinding;
+      return {
+        domain,
+        action: "bound_and_deployed",
+        deployedToNps: true,
+        certId: refreshed.certificate.cert_id,
+        sslCertRowId: refreshed.certificate.id,
+        binding,
+        cdnSynced: 0,
+        cdnNotes: [],
+        detail: `所选证书 ${refreshed.certificate.cert_id} 已签发并自动部署到 NPS`,
+      };
+    }
+    return {
+      domain,
+      action: "pending",
+      deployedToNps: false,
+      certId: refreshed.certificate.pending_cert_id || refreshed.certificate.cert_id,
+      sslCertRowId: refreshed.certificate.id,
+      binding,
+      cdnSynced: 0,
+      cdnNotes: [],
+      detail: `已绑定证书 ${refreshed.certificate.pending_cert_id || refreshed.certificate.cert_id}，等待验证签发后将自动写入 NPS${syncCdn ? " 并同步 CDN" : ""}`,
+    };
+  }
+
+  // Path B: Automatic Tencent Cloud free 443 DV certificate provisioning / reuse.
+  if (domain.startsWith("*.")) {
+    throw new Error("腾讯云免费 443 DV 证书不支持泛域名，请改选已有泛域名证书或手动填写 PEM");
+  }
+
+  const allManaged = await repo.listSslCertificates(env, false);
+  const sameDomainAll = allManaged.filter((c) => c.domain.toLowerCase() === domain);
+
+  let accountId = Math.trunc(params.tencentAccountId ?? 0);
+  if (accountId <= 0) {
+    const existingAcct = sameDomainAll.find((c) => c.tencent_account_id > 0)?.tencent_account_id;
+    if (existingAcct) {
+      accountId = existingAcct;
+    } else {
+      const tencentAccounts = await repo.listDnsAccounts(env, {
+        provider: "tencent",
+        decryptSecret: false,
+      });
+      accountId = tencentAccounts[0]?.id ?? 0;
+    }
+  }
+  if (accountId <= 0) {
+    throw new Error("请先在「云解析 / DNS 账号」中添加至少一个腾讯云账号后再申请证书");
+  }
+
+  const acct = await repo.getDnsAccount(env, accountId, true);
+  if (!acct || acct.provider !== "tencent") {
+    throw new Error("所选腾讯云账号无效，请检查账号配置");
+  }
+  const sslCreds: TencentCreds = {
+    secretId: acct.cred_id,
+    secretKey: acct.cred_secret ?? "",
+    sourceLabel: acct.label,
+  };
+
+  const sameDomainCerts = sameDomainAll.filter((c) => c.tencent_account_id === accountId);
+  const caches = createScanCaches();
+
+  // 1. Reuse already-issued healthy local managed cert (> thresholdDays remaining).
+  const healthyManaged = sameDomainCerts
+    .filter(
+      (c) =>
+        c.status === "issued" &&
+        Boolean(c.cert_id) &&
+        c.cert_end_ts > now + thresholdSec,
+    )
+    .sort((a, b) => b.cert_end_ts - a.cert_end_ts)[0];
+
+  if (healthyManaged) {
+    return deployIssuedCert(
+      healthyManaged,
+      "bound_and_deployed",
+      `已复用面板有效证书 ${healthyManaged.cert_id} 并热部署到 NPS`,
+    );
+  }
+
+  // 2. Bind & advance an existing in-flight managed cert for this domain.
+  const inFlightManaged = sameDomainCerts.find(
+    (c) =>
+      Boolean(c.pending_cert_id) ||
+      c.status === "pending_dns" ||
+      c.status === "verifying",
+  );
+  if (inFlightManaged) {
+    const binding = await repo.upsertNpsCertBinding(env, {
+      nps_server_id: server.id,
+      nps_host_id: hostRaw.id,
+      nps_client_id: hostRaw.clientId,
+      domain,
+      ssl_cert_id: inFlightManaged.id,
+      sync_cdn: syncCdn,
+      last_deployed_cert_id: "",
+      last_deployed_at: 0,
+      last_error: "",
+    });
+    const refreshed = await refreshManagedCertificate(env, inFlightManaged.id, {
+      forceWriteDns: false,
+      triggerVerify: true,
+    });
+    const finalCert = refreshed.certificate;
+    if (finalCert.status === "issued" && finalCert.cert_id) {
+      const latestBinding = await repo.getNpsCertBinding(env, binding.id);
+      if (!latestBinding || latestBinding.last_deployed_cert_id !== finalCert.cert_id) {
+        return deployIssuedCert(
+          finalCert,
+          "bound_and_deployed",
+          `在途证书 ${finalCert.cert_id} 已签发并热部署到 NPS`,
+        );
+      }
+      return {
+        domain,
+        action: "bound_and_deployed",
+        deployedToNps: true,
+        certId: finalCert.cert_id,
+        sslCertRowId: finalCert.id,
+        binding: latestBinding,
+        cdnSynced: 0,
+        cdnNotes: [],
+        detail: `在途证书 ${finalCert.cert_id} 已签发并自动部署到 NPS`,
+      };
+    }
+    return {
+      domain,
+      action: "pending",
+      deployedToNps: false,
+      certId: finalCert.pending_cert_id || finalCert.cert_id,
+      sslCertRowId: finalCert.id,
+      binding,
+      cdnSynced: 0,
+      cdnNotes: [],
+      detail: `已有证书 ${finalCert.pending_cert_id || finalCert.cert_id} 正在验证签发，签发后将自动部署到 NPS${syncCdn ? " 并同步 CDN" : ""}`,
+    };
+  }
+
+  // 3. Check Tencent Cloud remote SSL list for an already-issued healthy certificate to import & deploy.
+  const remoteCerts = await getCachedRemoteTencentCerts(env, accountId, sslCreds, caches);
+  const healthyRemote = remoteCerts
+    .filter(
+      (r) =>
+        r.domain.toLowerCase() === domain &&
+        r.status === 1 &&
+        Boolean(r.certificateId) &&
+        r.certEndTs > now + thresholdSec,
+    )
+    .sort((a, b) => b.certEndTs - a.certEndTs)[0];
+
+  if (healthyRemote) {
+    const verify = await autoDetectDnsVerifyForDomain(env, accountId, domain, caches, {
+      dnsVerifyMode: params.dnsVerifyMode,
+      dnsAccountId: params.dnsAccountId,
+    });
+    let row = await repo.getSslCertificateByCertId(env, healthyRemote.certificateId, false);
+    if (!row) {
+      const rowId = await repo.createSslCertificate(env, {
+        domain,
+        tencent_account_id: accountId,
+        dns_verify_mode: verify.mode,
+        dns_account_id: verify.dnsAccountId,
+        cert_id: healthyRemote.certificateId,
+        encrypt_algo: healthyRemote.encryptAlgorithm.toUpperCase() === "ECC" ? "ECC" : "RSA",
+        status: "issued",
+        tencent_status: healthyRemote.status,
+        status_name: healthyRemote.statusName || "已颁发",
+        cert_begin_time: healthyRemote.certBeginTime,
+        cert_end_time: healthyRemote.certEndTime,
+        cert_end_ts: healthyRemote.certEndTs,
+        auto_renew: true,
+        renew_before_days: thresholdDays,
+        clean_dns_after_issue: true,
+        remark: `NPS 自动导入复用 (${server.label})`,
+        last_checked_at: now,
+      });
+      row = (await repo.getSslCertificate(env, rowId, false))!;
+    }
+    return deployIssuedCert(
+      row,
+      "bound_and_deployed",
+      `已导入腾讯云有效证书 ${healthyRemote.certificateId} 并热部署到 NPS`,
+    );
+  }
+
+  // 4. Renew an existing expiring/expired/failed local managed certificate.
+  const renewableManaged = sameDomainCerts
+    .slice()
+    .sort((a, b) => b.cert_end_ts - a.cert_end_ts || b.id - a.id)[0];
+
+  if (renewableManaged) {
+    const patch: Partial<repo.SslCertificateCreateInput> = {
+      auto_renew: true,
+      renew_before_days: Math.max(renewableManaged.renew_before_days || 7, thresholdDays),
+    };
+    if (renewableManaged.dns_verify_mode === "manual" || params.dnsVerifyMode || params.dnsAccountId) {
+      const verify = await autoDetectDnsVerifyForDomain(env, accountId, domain, caches, {
+        dnsVerifyMode: params.dnsVerifyMode,
+        dnsAccountId: params.dnsAccountId,
+      });
+      patch.dns_verify_mode = verify.mode;
+      patch.dns_account_id = verify.dnsAccountId;
+    }
+    await repo.updateSslCertificate(env, renewableManaged.id, patch);
+
+    // Bind BEFORE calling renewManagedCertificate so immediate issuance auto-pushes to NPS + CDN.
+    const binding = await repo.upsertNpsCertBinding(env, {
+      nps_server_id: server.id,
+      nps_host_id: hostRaw.id,
+      nps_client_id: hostRaw.clientId,
+      domain,
+      ssl_cert_id: renewableManaged.id,
+      sync_cdn: syncCdn,
+      last_deployed_cert_id: "",
+      last_deployed_at: 0,
+      last_error: "",
+    });
+
+    const renewed = await renewManagedCertificate(env, renewableManaged.id, "manual");
+    const issuedNow =
+      renewed.certificate.status === "issued" &&
+      renewed.certificate.cert_id === renewed.newCertId;
+
+    if (issuedNow) {
+      const latestBinding = await repo.getNpsCertBinding(env, binding.id);
+      if (!latestBinding || latestBinding.last_deployed_cert_id !== renewed.newCertId) {
+        return deployIssuedCert(
+          renewed.certificate,
+          "renewed",
+          `已续签新证书 ${renewed.newCertId} 并热部署到 NPS`,
+        );
+      }
+      let cdnSynced = 0;
+      let cdnNotes: string[] = [];
+      if (syncCdn) {
+        const cdnRes = await syncDomainCertToMatchingEdgeOne(
+          env,
+          renewed.certificate.id,
+          renewed.newCertId,
+          domain,
+          { preferredTencentAccountId: accountId },
+        );
+        cdnSynced = cdnRes.synced;
+        cdnNotes = cdnRes.notes;
+      }
+      return {
+        domain,
+        action: "renewed",
+        deployedToNps: true,
+        certId: renewed.newCertId,
+        sslCertRowId: renewed.certificate.id,
+        binding: latestBinding,
+        cdnSynced,
+        cdnNotes,
+        detail: `已续签新证书 ${renewed.newCertId} 并自动热替换至 NPS${
+          cdnNotes.length > 0 ? `；${cdnNotes.join("，")}` : ""
+        }`,
+      };
+    }
+
+    return {
+      domain,
+      action: "renewed",
+      deployedToNps: false,
+      certId: renewed.newCertId,
+      sslCertRowId: renewableManaged.id,
+      binding,
+      cdnSynced: 0,
+      cdnNotes: [],
+      detail: `已发起证书续签（新证书 ${renewed.newCertId}），验证签发后将自动热替换到 NPS${syncCdn ? " 并同步 CDN" : ""}`,
+    };
+  }
+
+  // 5. Apply a brand-new Tencent Cloud free 443 DV certificate.
+  const verify = await autoDetectDnsVerifyForDomain(env, accountId, domain, caches, {
+    dnsVerifyMode: params.dnsVerifyMode,
+    dnsAccountId: params.dnsAccountId,
+  });
+
+  const applied = await applyManagedCertificate(env, {
+    domain,
+    tencent_account_id: accountId,
+    dns_verify_mode: verify.mode,
+    dns_account_id: verify.dnsAccountId,
+    encrypt_algo: "RSA",
+    auto_renew: true,
+    renew_before_days: thresholdDays,
+    clean_dns_after_issue: true,
+    remark: `NPS 自动申请 (${server.label})`,
+  });
+
+  const issuedNow =
+    applied.certificate.status === "issued" && Boolean(applied.certificate.cert_id);
+
+  if (issuedNow) {
+    return deployIssuedCert(
+      applied.certificate,
+      "applied",
+      `已自动申请免费证书 ${applied.certificate.cert_id} 并热部署到 NPS`,
+    );
+  }
+
+  const binding = await repo.upsertNpsCertBinding(env, {
+    nps_server_id: server.id,
+    nps_host_id: hostRaw.id,
+    nps_client_id: hostRaw.clientId,
+    domain,
+    ssl_cert_id: applied.certificate.id,
+    sync_cdn: syncCdn,
+    last_deployed_cert_id: "",
+    last_deployed_at: 0,
+    last_error: "",
+  });
+
+  return {
+    domain,
+    action: "applied",
+    deployedToNps: false,
+    certId: applied.certificate.cert_id,
+    sslCertRowId: applied.certificate.id,
+    binding,
+    cdnSynced: 0,
+    cdnNotes: [],
+    detail: `已向腾讯云提交免费证书申请（${applied.certificate.cert_id}），自动验证签发后将自动写入 NPS${syncCdn ? " 并同步 CDN" : ""}`,
+  };
+}
+
+/**
+ * Manually trigger an immediate certificate sync for a single NPS Host binding
+ * (advances verification if still pending, pushes PEM to NPS Host, and syncs
+ * matching EdgeOne CDN if `sync_cdn` is enabled).
+ */
+export async function syncNpsHostCertBindingNow(
+  env: Env,
+  npsServerId: number,
+  npsHostId: number,
+): Promise<{
+  synced: boolean;
+  certId: string;
+  cdnSynced: number;
+  detail: string;
+}> {
+  const binding = await repo.getNpsCertBindingByHost(env, npsServerId, npsHostId);
+  if (!binding) {
+    throw new Error("该 NPS 域名尚未绑定腾讯云托管证书");
+  }
+  let cert = await repo.getSslCertificate(env, binding.ssl_cert_id, true);
+  if (!cert) {
+    throw new Error(`绑定的托管证书 #${binding.ssl_cert_id} 不存在`);
+  }
+
+  if (cert.status !== "issued" || cert.pending_cert_id) {
+    const refreshed = await refreshManagedCertificate(env, cert.id, {
+      forceWriteDns: false,
+      triggerVerify: true,
+    });
+    cert = (await repo.getSslCertificate(env, refreshed.certificate.id, true)) ?? cert;
+  }
+
+  if (cert.status !== "issued" || !cert.cert_id) {
+    return {
+      synced: false,
+      certId: cert.pending_cert_id || cert.cert_id,
+      cdnSynced: 0,
+      detail: `证书当前状态为「${cert.status_name || cert.status}」，尚未签发完成，签发后将自动同步`,
+    };
+  }
+
+  const server = await nps.resolveNpsServer(env, binding.nps_server_id);
+  const pem = await fetchCertPemForDeployment(env, cert, cert.cert_id);
+  await nps.deployPemCertificateToNpsHost(env, server, binding.nps_host_id, pem.certPem, pem.keyPem);
+  await repo.updateNpsCertBindingStatus(env, binding.id, {
+    last_deployed_cert_id: cert.cert_id,
+    last_deployed_at: nowSeconds(),
+    last_error: "",
+  });
+
+  let cdnSynced = 0;
+  let cdnNote = "";
+  if (binding.sync_cdn) {
+    const cdnRes = await syncDomainCertToMatchingEdgeOne(env, cert.id, cert.cert_id, binding.domain, {
+      preferredTencentAccountId: cert.tencent_account_id,
+      force: true,
+    });
+    cdnSynced = cdnRes.synced;
+    if (cdnRes.notes.length > 0) {
+      cdnNote = `；${cdnRes.notes.join("，")}`;
+    }
+  }
+
+  await repo.addEvent(
+    env,
+    "ssl",
+    messages.ev("NPS 证书手动同步成功", messages.objServer(binding.domain)),
+    {
+      detail: `已将证书 ${cert.cert_id} 重新部署至 NPS「${server.label}」#${binding.nps_host_id}${cdnNote}`,
+    },
+  );
+
+  return {
+    synced: true,
+    certId: cert.cert_id,
+    cdnSynced,
+    detail: `已将证书 ${cert.cert_id} 热部署至 NPS${cdnNote}`,
+  };
+}
+
+/**
+ * Periodic Cron self-healing reconciler (~every 5 min): checks all NPS
+ * certificate bindings and retries pushing PEM to any NPS Host whose bound
+ * SSL certificate has a newer issued `cert_id` (or previously failed to push),
+ * plus ensures CDN sync when `sync_cdn` is enabled. Steady state costs zero
+ * external network requests.
+ */
+export async function reconcileNpsCertificates(
+  env: Env,
+  opts?: { force?: boolean },
+): Promise<ReconcileNpsCertsSummary> {
+  const force = Boolean(opts?.force);
+  const summary: ReconcileNpsCertsSummary = {
+    checked: 0,
+    synced: 0,
+    failed: 0,
+    cdnSynced: 0,
+    errors: [],
+  };
+
+  if (!force) {
+    const age = await repo.flagAge(env, NPS_CERT_SYNC_FLAG);
+    if (age >= 0 && age < NPS_CERT_SYNC_INTERVAL_SECONDS) {
+      return summary;
+    }
+  }
+
+  const bindings = await repo.listNpsCertBindings(env);
+  if (bindings.length === 0) {
+    await repo.clearFlag(env, NPS_CERT_SYNC_FLAG);
+    await repo.setFlag(env, NPS_CERT_SYNC_FLAG);
+    return summary;
+  }
+
+  const allCerts = await repo.listSslCertificates(env, true);
+  const certById = new Map(allCerts.map((c) => [c.id, c]));
+  const pemCache = new Map<string, { certPem: string; keyPem: string }>();
+  const now = nowSeconds();
+
+  for (const binding of bindings) {
+    summary.checked += 1;
+    const cert = certById.get(binding.ssl_cert_id);
+    if (!cert || cert.status !== "issued" || !cert.cert_id) continue;
+
+    const needsPush =
+      force ||
+      binding.last_deployed_cert_id !== cert.cert_id ||
+      Boolean(binding.last_error);
+    if (!needsPush) continue;
+
+    try {
+      let pem = pemCache.get(cert.cert_id);
+      if (!pem) {
+        pem = await fetchCertPemForDeployment(env, cert, cert.cert_id);
+        pemCache.set(cert.cert_id, pem);
+      }
+      const server = await nps.resolveNpsServer(env, binding.nps_server_id);
+      await nps.deployPemCertificateToNpsHost(
+        env,
+        server,
+        binding.nps_host_id,
+        pem.certPem,
+        pem.keyPem,
+      );
+      await repo.updateNpsCertBindingStatus(env, binding.id, {
+        last_deployed_cert_id: cert.cert_id,
+        last_deployed_at: now,
+        last_error: "",
+      });
+      summary.synced += 1;
+
+      if (binding.sync_cdn) {
+        const cdnRes = await syncDomainCertToMatchingEdgeOne(
+          env,
+          cert.id,
+          cert.cert_id,
+          binding.domain,
+          { preferredTencentAccountId: cert.tencent_account_id },
+        );
+        summary.cdnSynced += cdnRes.synced;
+      }
+    } catch (err) {
+      summary.failed += 1;
+      const msg = err instanceof Error ? err.message : String(err);
+      summary.errors.push(`${binding.domain}: ${msg}`);
+      await repo.updateNpsCertBindingStatus(env, binding.id, { last_error: msg });
+    }
+  }
+
+  await repo.clearFlag(env, NPS_CERT_SYNC_FLAG);
+  await repo.setFlag(env, NPS_CERT_SYNC_FLAG);
+  return summary;
+}
+
 

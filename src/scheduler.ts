@@ -127,6 +127,14 @@ export async function runReconcile(env: Env): Promise<void> {
     console.error("EdgeOne certificate reconcile failed", e);
   }
 
+  // NPS Host certificates: retry any pending/failed inline PEM pushes (~5 min)
+  // and keep linked EdgeOne CDN domains synchronized.
+  try {
+    await tencentSsl.reconcileNpsCertificates(runtimeEnv);
+  } catch (e) {
+    console.error("NPS certificate reconcile failed", e);
+  }
+
   // Lightweight application servers: read-only status + traffic package refresh.
   try {
     await swas.refreshAllSwasServers(runtimeEnv);

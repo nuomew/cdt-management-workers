@@ -60,6 +60,7 @@ import * as analytics from "./analytics";
 import * as dnsProviders from "./dns_providers";
 import * as tencentSsl from "./tencent_ssl";
 import * as tencentEdgeOne from "./tencent_edgeone";
+import * as nps from "./nps";
 import {
   BRAND,
   CSRF_COOKIE,
@@ -1046,6 +1047,7 @@ app.get("/api/v1/overview", async (c) => {
   const swasServers = await repo.listSwasServers(env);
   const dnsAccounts = await repo.listDnsAccounts(env);
   const sslCerts = await repo.listSslCertificates(env);
+  const npsServers = await repo.listNpsServers(env);
   const managed = managedMap(groups, keepalives);
   const books = await dns.recordBooks(env);
   const cards = await dns.booksForCards(env, now.epoch, books);
@@ -1074,6 +1076,7 @@ app.get("/api/v1/overview", async (c) => {
     dns: await dns.snapshot(env, config, now.epoch),
     dns_accounts_count: dnsAccounts.length,
     ssl_certs_count: sslCerts.length,
+    nps_servers_count: npsServers.length,
     notifications: {
       channels,
       telegram: channels.includes("telegram"),
@@ -1093,6 +1096,7 @@ app.post("/api/v1/reconcile", async (c) => {
   await reconcileAll(c.env);
   await swas.refreshAllSwasServers(c.env).catch(() => 0);
   const ssl = await tencentSsl.reconcileCertificates(c.env).catch(() => null);
+  await tencentSsl.reconcileNpsCertificates(c.env).catch(() => null);
   // Manual reconcile also sweeps DNS, same as Python.
   return c.json({
     results: [],
@@ -5226,6 +5230,872 @@ app.get("/api/v1/events", async (c) => {
       c.req.query("level") ?? "",
     ),
   });
+});
+
+// -- NPS (yisier/nps) -----------------------------------------------------------
+
+function sanitizeNpsServer(s: repo.NpsServerRecord) {
+  return {
+    id: s.id,
+    label: s.label,
+    base_url: s.base_url,
+    auth_mode: s.auth_mode,
+    username: s.username,
+    has_auth_key: Boolean(s.auth_key),
+    has_password: Boolean(s.password),
+    auth_key_preview: s.auth_key ? "已加密保存" : "",
+    remark: s.remark,
+    created_at: s.created_at,
+    updated_at: s.updated_at,
+  };
+}
+
+function parseNpsAuthMode(raw: unknown): repo.NpsAuthMode {
+  const mode = strOf(raw).trim().toLowerCase();
+  if (mode === "web_login") return "web_login";
+  return "auth_key";
+}
+
+function parseNpsTunnelMode(raw: unknown): nps.NpsTunnelMode {
+  const mode = strOf(raw).trim();
+  const allowed: nps.NpsTunnelMode[] = [
+    "tcp",
+    "udp",
+    "socks5",
+    "httpProxy",
+    "secret",
+    "p2p",
+    "file",
+  ];
+  const hit = allowed.find((m) => m.toLowerCase() === mode.toLowerCase());
+  if (!hit) {
+    throw invalid("不支持的映射协议，可选：tcp / udp / socks5 / httpProxy / secret / p2p / file");
+  }
+  return hit;
+}
+
+function parseNpsHostScheme(raw: unknown): nps.NpsHostScheme {
+  const s = strOf(raw).trim().toLowerCase();
+  if (s === "http" || s === "https" || s === "all") return s;
+  return "all";
+}
+
+function parseOptionalSslVerifyMode(raw: unknown): repo.SslVerifyMode | undefined {
+  const s = strOf(raw).trim();
+  if (!s) return undefined;
+  if (s === "dns_account" || s === "tencent_auto" || s === "manual") return s;
+  throw invalid("不支持的 DNS 验证方式");
+}
+
+app.get("/api/v1/nps/servers", async (c) => {
+  await requireAdmin(c);
+  const [servers, dnsAccounts, managedCerts, bindings, edgeoneBindings] = await Promise.all([
+    repo.listNpsServers(c.env, { decryptSecrets: false }),
+    repo.listDnsAccounts(c.env, { decryptSecret: false }),
+    repo.listSslCertificates(c.env, false),
+    repo.listNpsCertBindings(c.env),
+    repo.listEdgeOneCertBindings(c.env),
+  ]);
+  const sanitizedDns = dnsAccounts.map(sanitizeDnsAccount);
+  const tencentAccounts = sanitizedDns.filter((a) => a.provider === "tencent");
+
+  return c.json({
+    servers: servers.map(sanitizeNpsServer),
+    tencent_accounts: tencentAccounts,
+    dns_accounts: sanitizedDns,
+    managed_certs: managedCerts.map((cert) => ({
+      id: cert.id,
+      domain: cert.domain,
+      tencent_account_id: cert.tencent_account_id,
+      cert_id: cert.cert_id,
+      pending_cert_id: cert.pending_cert_id,
+      status: cert.status,
+      status_name: cert.status_name,
+      cert_end_time: cert.cert_end_time,
+      cert_end_ts: cert.cert_end_ts,
+      auto_renew: cert.auto_renew,
+      renew_before_days: cert.renew_before_days,
+    })),
+    bindings,
+    edgeone_bindings: edgeoneBindings,
+  });
+});
+
+app.post("/api/v1/nps/servers", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const payload = await jsonBody(c);
+  const label = strOf(payload["label"]).trim();
+  const baseUrlRaw = strOf(payload["base_url"]).trim();
+  const authMode = parseNpsAuthMode(payload["auth_mode"]);
+  const authKey = strOf(payload["auth_key"]).trim();
+  const username = strOf(payload["username"]).trim();
+  const password = strOf(payload["password"]);
+  const remark = strOf(payload["remark"]).trim();
+
+  if (!label) throw invalid("请输入 NPS 服务器名称");
+  let baseUrl: string;
+  try {
+    baseUrl = nps.normalizeNpsBaseUrl(baseUrlRaw);
+  } catch (err) {
+    throw invalid(err instanceof Error ? err.message : String(err));
+  }
+  if (authMode === "auth_key" && !authKey) {
+    throw invalid("使用 auth_key 认证时请填写 nps.conf 中的 auth_key");
+  }
+  if (authMode === "web_login" && (!username || !password)) {
+    throw invalid("使用 Web 账号登录认证时请填写管理员用户名和密码");
+  }
+
+  const id = await repo.createNpsServer(c.env, {
+    label,
+    base_url: baseUrl,
+    auth_mode: authMode,
+    auth_key: authMode === "auth_key" ? authKey : "",
+    username: authMode === "web_login" ? username : "",
+    password: authMode === "web_login" ? password : "",
+    remark,
+  });
+
+  const saved = (await repo.getNpsServer(c.env, id, true))!;
+  let testResult: { ok: true; clientCount: number; bridge: nps.NpsBridgeInfo } | null = null;
+  let testError = "";
+  if (payload["test_after_save"] !== false) {
+    try {
+      testResult = await nps.testNpsServer(c.env, saved);
+    } catch (err) {
+      testError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  await repo.addEvent(c.env, "system", messages.ev("NPS 服务器已添加", messages.objServer(label)), {
+    detail: `${baseUrl}（认证方式：${authMode === "auth_key" ? "API auth_key" : "Web 登录"}）`,
+  });
+
+  return c.json({
+    ok: true,
+    id,
+    server: sanitizeNpsServer(saved),
+    test: testResult ? { ok: true, client_count: testResult.clientCount, bridge: testResult.bridge } : null,
+    test_error: testError,
+  });
+});
+
+app.patch("/api/v1/nps/servers/:serverId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const existing = await repo.getNpsServer(c.env, serverId, false);
+  if (!existing) throw httpErr(404, "not_found", "NPS 服务器不存在");
+
+  const payload = await jsonBody(c);
+  const patch: Partial<repo.NpsServerInput> = {};
+  if (payload["label"] !== undefined) {
+    const label = strOf(payload["label"]).trim();
+    if (!label) throw invalid("服务器名称不能为空");
+    patch.label = label;
+  }
+  if (payload["base_url"] !== undefined) {
+    try {
+      patch.base_url = nps.normalizeNpsBaseUrl(strOf(payload["base_url"]));
+    } catch (err) {
+      throw invalid(err instanceof Error ? err.message : String(err));
+    }
+  }
+  if (payload["auth_mode"] !== undefined) {
+    patch.auth_mode = parseNpsAuthMode(payload["auth_mode"]);
+  }
+  if (payload["auth_key"] !== undefined && strOf(payload["auth_key"]).trim() !== "") {
+    patch.auth_key = strOf(payload["auth_key"]).trim();
+  }
+  if (payload["username"] !== undefined) {
+    patch.username = strOf(payload["username"]).trim();
+  }
+  if (payload["password"] !== undefined && strOf(payload["password"]) !== "") {
+    patch.password = strOf(payload["password"]);
+  }
+  if (payload["remark"] !== undefined) {
+    patch.remark = strOf(payload["remark"]).trim();
+  }
+
+  await repo.updateNpsServer(c.env, serverId, patch);
+  const updated = (await repo.getNpsServer(c.env, serverId, false))!;
+  await repo.addEvent(
+    c.env,
+    "system",
+    messages.ev("NPS 服务器配置已更新", messages.objServer(updated.label)),
+    { detail: updated.base_url },
+  );
+  return c.json({ ok: true, server: sanitizeNpsServer(updated) });
+});
+
+app.delete("/api/v1/nps/servers/:serverId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const existing = await repo.getNpsServer(c.env, serverId, false);
+  if (!existing) throw httpErr(404, "not_found", "NPS 服务器不存在");
+  await repo.deleteNpsServer(c.env, serverId);
+  await repo.addEvent(
+    c.env,
+    "system",
+    messages.ev("NPS 服务器已移除", messages.objServer(existing.label)),
+    { detail: `仅从面板移除连接（${existing.base_url}），NPS 服务端数据不受影响` },
+  );
+  return c.json({ ok: true });
+});
+
+app.post("/api/v1/nps/servers/:serverId/test", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    const res = await nps.testNpsServer(c.env, server);
+    return c.json({ ok: true, client_count: res.clientCount, bridge: res.bridge });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+// -- NPS Clients ----------------------------------------------------------------
+
+app.get("/api/v1/nps/servers/:serverId/clients", async (c) => {
+  await requireAdmin(c);
+  const serverId = paramInt(c, "serverId");
+  const search = c.req.query("search") ?? "";
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    const res = await nps.listClients(c.env, server, search);
+    return c.json(res);
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/nps/servers/:serverId/clients", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const payload = await jsonBody(c);
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    const res = await nps.addClient(c.env, server, {
+      remark: strOf(payload["remark"]).trim(),
+      vkey: strOf(payload["vkey"]).trim(),
+      u: strOf(payload["basic_user"]).trim(),
+      p: strOf(payload["basic_pass"]),
+      webUserName: strOf(payload["web_username"]).trim(),
+      webPassword: strOf(payload["web_password"]),
+      configConnAllow:
+        payload["config_conn_allow"] === undefined ? true : boolOf(payload["config_conn_allow"]),
+      compress: payload["compress"] === undefined ? true : boolOf(payload["compress"]),
+      crypt: payload["crypt"] === undefined ? true : boolOf(payload["crypt"]),
+      rateLimit: Math.max(0, Math.trunc(numOf(payload["rate_limit"], 0))),
+      flowLimit: Math.max(0, Math.trunc(numOf(payload["flow_limit"], 0))),
+      maxConn: Math.max(0, Math.trunc(numOf(payload["max_conn"], 0))),
+      maxTunnelNum: Math.max(0, Math.trunc(numOf(payload["max_tunnel_num"], 0))),
+      expireTime: strOf(payload["expire_time"]).trim(),
+    });
+    await repo.addEvent(
+      c.env,
+      "manual",
+      messages.ev("NPS 客户端已创建", messages.objServer(server.label)),
+      { detail: `备注：${strOf(payload["remark"]).trim() || `客户端 #${res.id}`}` },
+    );
+    return c.json({ ok: true, id: res.id });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.patch("/api/v1/nps/servers/:serverId/clients/:clientId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const clientId = paramInt(c, "clientId");
+  const payload = await jsonBody(c);
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    const patch: Partial<nps.NpsClientWriteInput> = {};
+    if (payload["remark"] !== undefined) patch.remark = strOf(payload["remark"]).trim();
+    if (payload["vkey"] !== undefined && strOf(payload["vkey"]).trim() !== "") {
+      patch.vkey = strOf(payload["vkey"]).trim();
+    }
+    if (payload["basic_user"] !== undefined) patch.u = strOf(payload["basic_user"]).trim();
+    if (payload["basic_pass"] !== undefined) patch.p = strOf(payload["basic_pass"]);
+    if (payload["web_username"] !== undefined) patch.webUserName = strOf(payload["web_username"]).trim();
+    if (payload["web_password"] !== undefined && strOf(payload["web_password"]) !== "") {
+      patch.webPassword = strOf(payload["web_password"]);
+    }
+    if (payload["config_conn_allow"] !== undefined) {
+      patch.configConnAllow = boolOf(payload["config_conn_allow"]);
+    }
+    if (payload["compress"] !== undefined) patch.compress = boolOf(payload["compress"]);
+    if (payload["crypt"] !== undefined) patch.crypt = boolOf(payload["crypt"]);
+    if (payload["rate_limit"] !== undefined) {
+      patch.rateLimit = Math.max(0, Math.trunc(numOf(payload["rate_limit"], 0)));
+    }
+    if (payload["flow_limit"] !== undefined) {
+      patch.flowLimit = Math.max(0, Math.trunc(numOf(payload["flow_limit"], 0)));
+    }
+    if (payload["max_conn"] !== undefined) {
+      patch.maxConn = Math.max(0, Math.trunc(numOf(payload["max_conn"], 0)));
+    }
+    if (payload["max_tunnel_num"] !== undefined) {
+      patch.maxTunnelNum = Math.max(0, Math.trunc(numOf(payload["max_tunnel_num"], 0)));
+    }
+    if (payload["expire_time"] !== undefined) {
+      patch.expireTime = strOf(payload["expire_time"]).trim();
+    }
+    await nps.editClient(c.env, server, clientId, patch);
+    await repo.addEvent(
+      c.env,
+      "manual",
+      messages.ev("NPS 客户端已更新", messages.objServer(server.label)),
+      { detail: `客户端 #${clientId}${patch.remark ? `（${patch.remark}）` : ""}` },
+    );
+    return c.json({ ok: true });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/nps/servers/:serverId/clients/:clientId/status", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const clientId = paramInt(c, "clientId");
+  const payload = await jsonBody(c);
+  const enabled = boolOf(payload["enabled"]);
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    await nps.setClientStatus(c.env, server, clientId, enabled);
+    await repo.addEvent(
+      c.env,
+      "manual",
+      messages.ev(enabled ? "NPS 客户端已启用" : "NPS 客户端已禁用", messages.objServer(server.label)),
+      { detail: `客户端 #${clientId}` },
+    );
+    return c.json({ ok: true });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.delete("/api/v1/nps/servers/:serverId/clients/:clientId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const clientId = paramInt(c, "clientId");
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    await nps.deleteClient(c.env, server, clientId);
+    await repo.addEvent(
+      c.env,
+      "manual",
+      messages.ev("NPS 客户端已删除", messages.objServer(server.label)),
+      { level: "warn", detail: `客户端 #${clientId} 及其下映射已从 NPS 删除` },
+    );
+    return c.json({ ok: true });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+// -- NPS Port Tunnels (TCP / UDP / etc.) ----------------------------------------
+
+app.get("/api/v1/nps/servers/:serverId/tunnels", async (c) => {
+  await requireAdmin(c);
+  const serverId = paramInt(c, "serverId");
+  const type = c.req.query("type") ?? "";
+  const clientIdRaw = c.req.query("client_id");
+  const clientId = clientIdRaw ? Math.trunc(numOf(clientIdRaw, 0)) : undefined;
+  const search = c.req.query("search") ?? "";
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    const res = await nps.listTunnels(c.env, server, {
+      type: type || undefined,
+      clientId: clientId && clientId > 0 ? clientId : undefined,
+      search,
+    });
+    return c.json(res);
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/nps/servers/:serverId/tunnels", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const payload = await jsonBody(c);
+  const clientId = asInt(payload["client_id"], "所属客户端");
+  const mode = parseNpsTunnelMode(payload["mode"] ?? payload["type"] ?? "tcp");
+  const port = Math.trunc(numOf(payload["port"], 0));
+  if (port < 0 || port > 65535) throw invalid("服务端端口须在 0–65535 之间");
+  const target = strOf(payload["target"]).trim();
+  if ((mode === "tcp" || mode === "udp" || mode === "secret" || mode === "p2p") && !target) {
+    throw invalid("请填写目标内网地址（例如 127.0.0.1:22）");
+  }
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    const res = await nps.addTunnel(c.env, server, {
+      clientId,
+      mode,
+      port,
+      serverIp: strOf(payload["server_ip"]).trim(),
+      target,
+      localProxy: boolOf(payload["local_proxy"]),
+      remark: strOf(payload["remark"]).trim(),
+      password: strOf(payload["password"]).trim(),
+      localPath: strOf(payload["local_path"]).trim(),
+      stripPre: strOf(payload["strip_pre"]).trim(),
+    });
+    await repo.addEvent(
+      c.env,
+      "manual",
+      messages.ev("NPS 端口映射已创建", messages.objServer(server.label)),
+      {
+        detail: `${mode.toUpperCase()} :${port || "随机"} → ${target || strOf(payload["local_path"]).trim() || "-"}（客户端 #${clientId}）`,
+      },
+    );
+    return c.json({ ok: true, id: res.id });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.patch("/api/v1/nps/servers/:serverId/tunnels/:tunnelId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const tunnelId = paramInt(c, "tunnelId");
+  const payload = await jsonBody(c);
+  const patch: Partial<nps.NpsTunnelWriteInput> = {};
+  if (payload["client_id"] !== undefined) patch.clientId = asInt(payload["client_id"], "所属客户端");
+  if (payload["mode"] !== undefined || payload["type"] !== undefined) {
+    patch.mode = parseNpsTunnelMode(payload["mode"] ?? payload["type"]);
+  }
+  if (payload["port"] !== undefined) {
+    const port = Math.trunc(numOf(payload["port"], 0));
+    if (port < 0 || port > 65535) throw invalid("服务端端口须在 0–65535 之间");
+    patch.port = port;
+  }
+  if (payload["server_ip"] !== undefined) patch.serverIp = strOf(payload["server_ip"]).trim();
+  if (payload["target"] !== undefined) patch.target = strOf(payload["target"]).trim();
+  if (payload["local_proxy"] !== undefined) patch.localProxy = boolOf(payload["local_proxy"]);
+  if (payload["remark"] !== undefined) patch.remark = strOf(payload["remark"]).trim();
+  if (payload["password"] !== undefined) patch.password = strOf(payload["password"]).trim();
+  if (payload["local_path"] !== undefined) patch.localPath = strOf(payload["local_path"]).trim();
+  if (payload["strip_pre"] !== undefined) patch.stripPre = strOf(payload["strip_pre"]).trim();
+
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    await nps.editTunnel(c.env, server, tunnelId, patch);
+    await repo.addEvent(
+      c.env,
+      "manual",
+      messages.ev("NPS 端口映射已更新", messages.objServer(server.label)),
+      { detail: `映射 #${tunnelId}` },
+    );
+    return c.json({ ok: true });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/nps/servers/:serverId/tunnels/:tunnelId/start", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const tunnelId = paramInt(c, "tunnelId");
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    await nps.setTunnelRunning(c.env, server, tunnelId, true);
+    return c.json({ ok: true });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/nps/servers/:serverId/tunnels/:tunnelId/stop", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const tunnelId = paramInt(c, "tunnelId");
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    await nps.setTunnelRunning(c.env, server, tunnelId, false);
+    return c.json({ ok: true });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.delete("/api/v1/nps/servers/:serverId/tunnels/:tunnelId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const tunnelId = paramInt(c, "tunnelId");
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    await nps.deleteTunnel(c.env, server, tunnelId);
+    await repo.addEvent(
+      c.env,
+      "manual",
+      messages.ev("NPS 端口映射已删除", messages.objServer(server.label)),
+      { level: "warn", detail: `映射 #${tunnelId}` },
+    );
+    return c.json({ ok: true });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+// -- NPS Domain Hosts & Tencent SSL / CDN Certificate Sync ----------------------
+
+app.get("/api/v1/nps/servers/:serverId/hosts", async (c) => {
+  await requireAdmin(c);
+  const serverId = paramInt(c, "serverId");
+  const clientIdRaw = c.req.query("client_id");
+  const clientId = clientIdRaw ? Math.trunc(numOf(clientIdRaw, 0)) : undefined;
+  const search = c.req.query("search") ?? "";
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    const [res, bindings, managedCerts, eoBindings] = await Promise.all([
+      nps.listHosts(c.env, server, {
+        clientId: clientId && clientId > 0 ? clientId : undefined,
+        search,
+      }),
+      repo.listNpsCertBindings(c.env, { npsServerId: serverId }),
+      repo.listSslCertificates(c.env, false),
+      repo.listEdgeOneCertBindings(c.env),
+    ]);
+
+    const bindingByHostId = new Map(bindings.map((b) => [b.nps_host_id, b]));
+    const certById = new Map(managedCerts.map((cert) => [cert.id, cert]));
+    const eoByDomain = new Map<string, repo.EdgeOneCertBindingRecord[]>();
+    for (const eb of eoBindings) {
+      const k = eb.domain.trim().toLowerCase();
+      const arr = eoByDomain.get(k) ?? [];
+      arr.push(eb);
+      eoByDomain.set(k, arr);
+    }
+
+    const items = res.items.map((h) => {
+      const binding = bindingByHostId.get(h.id) ?? null;
+      const sslCert = binding ? certById.get(binding.ssl_cert_id) ?? null : null;
+      const cdnList = eoByDomain.get(h.host.trim().toLowerCase()) ?? [];
+      return {
+        ...h,
+        certBinding: binding
+          ? {
+              ...binding,
+              ssl_domain: sslCert?.domain ?? binding.domain,
+              ssl_cert_current_id: sslCert?.cert_id ?? "",
+              ssl_pending_cert_id: sslCert?.pending_cert_id ?? "",
+              ssl_status: sslCert?.status ?? "",
+              ssl_status_name: sslCert?.status_name ?? "",
+              ssl_cert_end_time: sslCert?.cert_end_time ?? "",
+              ssl_cert_end_ts: sslCert?.cert_end_ts ?? 0,
+              ssl_auto_renew: sslCert?.auto_renew ?? false,
+              ssl_renew_before_days: sslCert?.renew_before_days ?? 7,
+            }
+          : null,
+        cdnBindings: cdnList.map((eb) => ({
+          id: eb.id,
+          zone_id: eb.zone_id,
+          zone_name: eb.zone_name,
+          site: eb.site,
+          last_deployed_cert_id: eb.last_deployed_cert_id,
+          last_deployed_at: eb.last_deployed_at,
+          last_error: eb.last_error,
+        })),
+      };
+    });
+
+    return c.json({ total: res.total, items });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/nps/servers/:serverId/hosts", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const payload = await jsonBody(c);
+  const clientId = asInt(payload["client_id"], "所属客户端");
+  const host = strOf(payload["host"]).trim().toLowerCase().replace(/\.+$/, "");
+  const target = strOf(payload["target"]).trim();
+  if (!host || !host.includes(".")) throw invalid("请输入有效的绑定域名");
+  if (!target) throw invalid("请输入目标内网地址（例如 127.0.0.1:8080）");
+
+  const scheme = parseNpsHostScheme(payload["scheme"]);
+  const autoHttps = payload["auto_https"] === undefined ? scheme !== "http" : boolOf(payload["auto_https"]);
+  const certAction = strOf(payload["cert_action"]).trim().toLowerCase(); // "", "tencent_auto", "existing_ssl", "manual"
+  const dnsVerifyMode = parseOptionalSslVerifyMode(payload["dns_verify_mode"]);
+
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    const created = await nps.addHost(c.env, server, {
+      clientId,
+      host,
+      target,
+      scheme: certAction === "tencent_auto" || certAction === "existing_ssl"
+        ? (scheme === "http" ? "all" : scheme)
+        : scheme,
+      location: strOf(payload["location"]).trim(),
+      headerChange: strOf(payload["header_change"]).trim(),
+      hostChange: strOf(payload["host_change"]).trim(),
+      remark: strOf(payload["remark"]).trim(),
+      localProxy: boolOf(payload["local_proxy"]),
+      autoHttps,
+      certFilePath: certAction === "manual" ? strOf(payload["cert_file_path"]) : "",
+      keyFilePath: certAction === "manual" ? strOf(payload["key_file_path"]) : "",
+    });
+
+    let hostId = created.id;
+    // Some yisier/nps builds return only { status: 1, msg } without `id` on /index/addhost;
+    // resolve the newly created host by matching (clientId, host) if needed.
+    if (hostId <= 0 && (certAction === "tencent_auto" || certAction === "existing_ssl")) {
+      const listed = await nps.listHosts(c.env, server, { clientId, search: host });
+      const matched = listed.items
+        .filter((h) => h.host.toLowerCase() === host && h.clientId === clientId)
+        .sort((a, b) => b.id - a.id)[0];
+      if (matched) hostId = matched.id;
+    }
+
+    await repo.addEvent(
+      c.env,
+      "manual",
+      messages.ev("NPS 域名解析已创建", messages.objServer(host)),
+      { detail: `NPS「${server.label}」客户端 #${clientId} → ${target}（协议 ${scheme}）` },
+    );
+
+    let certResult: tencentSsl.EnsureNpsHostCertResult | null = null;
+    let certError = "";
+    if (hostId > 0 && (certAction === "tencent_auto" || certAction === "existing_ssl")) {
+      try {
+        certResult = await tencentSsl.ensureNpsHostTencentCert(c.env, {
+          npsServerId: serverId,
+          npsHostId: hostId,
+          sslCertId:
+            certAction === "existing_ssl" ? Math.trunc(numOf(payload["ssl_cert_id"], 0)) : undefined,
+          tencentAccountId: Math.trunc(numOf(payload["tencent_account_id"], 0)) || undefined,
+          dnsVerifyMode,
+          dnsAccountId: Math.trunc(numOf(payload["dns_account_id"], 0)) || undefined,
+          syncCdn: payload["sync_cdn"] !== false,
+          autoHttps,
+          renewBeforeDays: Math.trunc(numOf(payload["renew_before_days"], 7)),
+        });
+      } catch (err) {
+        certError = err instanceof Error ? err.message : String(err);
+      }
+    }
+
+    return c.json({ ok: true, id: hostId, cert_result: certResult, cert_error: certError });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.patch("/api/v1/nps/servers/:serverId/hosts/:hostId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const hostId = paramInt(c, "hostId");
+  const payload = await jsonBody(c);
+  const patch: Partial<nps.NpsHostWriteInput> = {};
+  if (payload["client_id"] !== undefined) patch.clientId = asInt(payload["client_id"], "所属客户端");
+  if (payload["host"] !== undefined) {
+    const h = strOf(payload["host"]).trim().toLowerCase().replace(/\.+$/, "");
+    if (!h) throw invalid("绑定域名不能为空");
+    patch.host = h;
+  }
+  if (payload["target"] !== undefined) {
+    const t = strOf(payload["target"]).trim();
+    if (!t) throw invalid("目标地址不能为空");
+    patch.target = t;
+  }
+  if (payload["scheme"] !== undefined) patch.scheme = parseNpsHostScheme(payload["scheme"]);
+  if (payload["location"] !== undefined) patch.location = strOf(payload["location"]).trim();
+  if (payload["header_change"] !== undefined) patch.headerChange = strOf(payload["header_change"]).trim();
+  if (payload["host_change"] !== undefined) patch.hostChange = strOf(payload["host_change"]).trim();
+  if (payload["remark"] !== undefined) patch.remark = strOf(payload["remark"]).trim();
+  if (payload["local_proxy"] !== undefined) patch.localProxy = boolOf(payload["local_proxy"]);
+  if (payload["auto_https"] !== undefined) patch.autoHttps = boolOf(payload["auto_https"]);
+
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    const updated = await nps.editHost(c.env, server, hostId, patch);
+    await repo.addEvent(
+      c.env,
+      "manual",
+      messages.ev("NPS 域名解析已更新", messages.objServer(updated.host)),
+      { detail: `NPS「${server.label}」#${hostId} → ${updated.target}` },
+    );
+    return c.json({ ok: true, host: updated });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/nps/servers/:serverId/hosts/:hostId/start", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const hostId = paramInt(c, "hostId");
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    await nps.setHostEnabled(c.env, server, hostId, true);
+    return c.json({ ok: true });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/nps/servers/:serverId/hosts/:hostId/stop", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const hostId = paramInt(c, "hostId");
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    await nps.setHostEnabled(c.env, server, hostId, false);
+    return c.json({ ok: true });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.delete("/api/v1/nps/servers/:serverId/hosts/:hostId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const hostId = paramInt(c, "hostId");
+  try {
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    await nps.deleteHost(c.env, server, hostId);
+    await repo.addEvent(
+      c.env,
+      "manual",
+      messages.ev("NPS 域名解析已删除", messages.objServer(server.label)),
+      { level: "warn", detail: `域名解析 #${hostId} 及其证书同步绑定已删除` },
+    );
+    return c.json({ ok: true });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/nps/servers/:serverId/hosts/:hostId/cert", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const hostId = paramInt(c, "hostId");
+  const payload = await jsonBody(c);
+  const mode = strOf(payload["mode"]).trim().toLowerCase();
+
+  if (mode !== "tencent_auto" && mode !== "existing_ssl" && mode !== "manual" && mode !== "clear") {
+    throw invalid("证书配置模式仅支持 tencent_auto / existing_ssl / manual / clear");
+  }
+
+  try {
+    if (mode === "tencent_auto" || mode === "existing_ssl") {
+      const sslCertId =
+        mode === "existing_ssl" ? asInt(payload["ssl_cert_id"], "托管证书") : undefined;
+      const dnsVerifyMode = parseOptionalSslVerifyMode(payload["dns_verify_mode"]);
+      const result = await tencentSsl.ensureNpsHostTencentCert(c.env, {
+        npsServerId: serverId,
+        npsHostId: hostId,
+        sslCertId,
+        tencentAccountId: Math.trunc(numOf(payload["tencent_account_id"], 0)) || undefined,
+        dnsVerifyMode,
+        dnsAccountId: Math.trunc(numOf(payload["dns_account_id"], 0)) || undefined,
+        syncCdn: payload["sync_cdn"] !== false,
+        autoHttps: payload["auto_https"] !== undefined ? boolOf(payload["auto_https"]) : undefined,
+        renewBeforeDays: Math.trunc(numOf(payload["renew_before_days"], 7)),
+      });
+      return c.json({ ok: true, result });
+    }
+
+    const server = await nps.resolveNpsServer(c.env, serverId);
+    if (mode === "manual") {
+      const certFilePath = strOf(payload["cert_file_path"]).trim();
+      const keyFilePath = strOf(payload["key_file_path"]).trim();
+      if (!certFilePath || !keyFilePath) {
+        throw invalid("手动配置证书时请同时填写证书公钥（PEM 或路径）和私钥（PEM 或路径）");
+      }
+      const cur = await nps.getHostRaw(c.env, server, hostId);
+      const updated = await nps.editHost(c.env, server, hostId, {
+        scheme: cur.scheme === "http" ? "all" : cur.scheme,
+        autoHttps: payload["auto_https"] !== undefined ? boolOf(payload["auto_https"]) : cur.autoHttps,
+        certFilePath,
+        keyFilePath,
+      });
+      // Detach any managed auto-sync binding so Cron won't overwrite manual PEM later.
+      await repo.deleteNpsCertBindingByHost(c.env, serverId, hostId);
+      await repo.addEvent(
+        c.env,
+        "ssl",
+        messages.ev("NPS 手动证书已更新", messages.objServer(updated.host)),
+        { detail: `NPS「${server.label}」#${hostId} 已更新${updated.certMode === "pem" ? "内联 PEM" : "路径"}证书` },
+      );
+      return c.json({ ok: true, host: updated });
+    }
+
+    // mode === "clear"
+    const updated = await nps.editHost(c.env, server, hostId, {
+      certFilePath: "",
+      keyFilePath: "",
+    });
+    await repo.deleteNpsCertBindingByHost(c.env, serverId, hostId);
+    await repo.addEvent(
+      c.env,
+      "ssl",
+      messages.ev("NPS 域名证书已清空", messages.objServer(updated.host)),
+      { detail: `NPS「${server.label}」#${hostId} 已清除证书配置并解除自动同步绑定` },
+    );
+    return c.json({ ok: true, host: updated });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/nps/servers/:serverId/hosts/:hostId/cert/sync", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const serverId = paramInt(c, "serverId");
+  const hostId = paramInt(c, "hostId");
+  try {
+    const result = await tencentSsl.syncNpsHostCertBindingNow(c.env, serverId, hostId);
+    return c.json({ ok: true, result });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.delete("/api/v1/nps/bindings/:bindingId", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const bindingId = paramInt(c, "bindingId");
+  const existing = await repo.getNpsCertBinding(c.env, bindingId);
+  if (!existing) throw httpErr(404, "not_found", "NPS 证书自动同步绑定不存在");
+  await repo.deleteNpsCertBinding(c.env, bindingId);
+  return c.json({ ok: true });
+});
+
+app.post("/api/v1/nps/certs/reconcile", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  try {
+    const summary = await tencentSsl.reconcileNpsCertificates(c.env, { force: true });
+    return c.json({ ok: true, summary });
+  } catch (err) {
+    throw httpErr(400, "nps_error", err instanceof Error ? err.message : String(err));
+  }
 });
 
 export default app;

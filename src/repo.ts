@@ -3184,6 +3184,7 @@ export async function updateSslCertificate(
 
 export async function deleteSslCertificate(env: Env, id: number): Promise<void> {
   await execute(env.DB, "DELETE FROM edgeone_cert_bindings WHERE ssl_cert_id=?", [id]);
+  await execute(env.DB, "DELETE FROM nps_cert_bindings WHERE ssl_cert_id=?", [id]);
   await execute(env.DB, "DELETE FROM ssl_certificates WHERE id=?", [id]);
 }
 
@@ -3377,3 +3378,366 @@ export async function deleteEdgeOneCertBindingByHost(
     [tencentAccountId, site, zoneId.trim(), domain.trim().toLowerCase()],
   );
 }
+
+// ---------------------------------------------------------------------------
+// NPS (https://github.com/yisier/nps) Servers & SSL Auto-Sync Bindings
+// ---------------------------------------------------------------------------
+
+export type NpsAuthMode = "auth_key" | "web_login";
+
+export interface NpsServerRecord {
+  id: number;
+  label: string;
+  base_url: string;
+  auth_mode: NpsAuthMode;
+  auth_key: string;
+  username: string;
+  password: string;
+  remark: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface NpsServerInput {
+  label: string;
+  base_url: string;
+  auth_mode?: NpsAuthMode;
+  auth_key?: string;
+  username?: string;
+  password?: string;
+  remark?: string;
+}
+
+async function normalizeNpsServerRow(
+  env: Env,
+  row: Row,
+  decryptSecrets: boolean,
+): Promise<NpsServerRecord> {
+  const modeRaw = asStr(row["auth_mode"]).toLowerCase();
+  const authMode: NpsAuthMode = modeRaw === "web_login" ? "web_login" : "auth_key";
+  const rawAuthKey = asStr(row["auth_key"]);
+  const rawPassword = asStr(row["password"]);
+  let authKey = rawAuthKey;
+  let password = rawPassword;
+  if (decryptSecrets) {
+    if (rawAuthKey) authKey = await decrypt(rawAuthKey, env.ENCRYPTION_KEY);
+    if (rawPassword) password = await decrypt(rawPassword, env.ENCRYPTION_KEY);
+  }
+  return {
+    id: asInt(row["id"]),
+    label: asStr(row["label"]),
+    base_url: asStr(row["base_url"]),
+    auth_mode: authMode,
+    auth_key: authKey,
+    username: asStr(row["username"]),
+    password,
+    remark: asStr(row["remark"]),
+    created_at: asInt(row["created_at"]),
+    updated_at: asInt(row["updated_at"]),
+  };
+}
+
+export async function listNpsServers(
+  env: Env,
+  opts?: { decryptSecrets?: boolean },
+): Promise<NpsServerRecord[]> {
+  const rows = await query<Row>(env.DB, "SELECT * FROM nps_servers ORDER BY id ASC");
+  const out: NpsServerRecord[] = [];
+  for (const row of rows) {
+    out.push(await normalizeNpsServerRow(env, row, Boolean(opts?.decryptSecrets)));
+  }
+  return out;
+}
+
+export async function getNpsServer(
+  env: Env,
+  id: number,
+  decryptSecrets = false,
+): Promise<NpsServerRecord | null> {
+  const row = await queryOne<Row>(env.DB, "SELECT * FROM nps_servers WHERE id=?", [id]);
+  if (!row) return null;
+  return normalizeNpsServerRow(env, row, decryptSecrets);
+}
+
+export async function createNpsServer(env: Env, input: NpsServerInput): Promise<number> {
+  const now = nowSeconds();
+  const authMode: NpsAuthMode = input.auth_mode === "web_login" ? "web_login" : "auth_key";
+  const cleanKey = (input.auth_key ?? "").trim();
+  const cleanPass = (input.password ?? "").trim();
+  const encKey = cleanKey ? await encrypt(cleanKey, env.ENCRYPTION_KEY) : "";
+  const encPass = cleanPass ? await encrypt(cleanPass, env.ENCRYPTION_KEY) : "";
+  const res = await execute(
+    env.DB,
+    `INSERT INTO nps_servers
+       (label, base_url, auth_mode, auth_key, username, password, remark, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      input.label.trim(),
+      input.base_url.trim().replace(/\/+$/, ""),
+      authMode,
+      encKey,
+      (input.username ?? "").trim(),
+      encPass,
+      (input.remark ?? "").trim(),
+      now,
+      now,
+    ],
+  );
+  return res.lastInsertRowId;
+}
+
+export async function updateNpsServer(
+  env: Env,
+  id: number,
+  input: Partial<NpsServerInput>,
+): Promise<void> {
+  const existing = await queryOne<Row>(env.DB, "SELECT * FROM nps_servers WHERE id=?", [id]);
+  if (!existing) throw new Error("NPS 服务器不存在");
+  const sets: string[] = [];
+  const params: (string | number)[] = [];
+  if (input.label !== undefined) {
+    sets.push("label=?");
+    params.push(input.label.trim());
+  }
+  if (input.base_url !== undefined) {
+    sets.push("base_url=?");
+    params.push(input.base_url.trim().replace(/\/+$/, ""));
+  }
+  if (input.auth_mode !== undefined) {
+    sets.push("auth_mode=?");
+    params.push(input.auth_mode === "web_login" ? "web_login" : "auth_key");
+  }
+  if (input.auth_key !== undefined && input.auth_key.trim() !== "") {
+    sets.push("auth_key=?");
+    params.push(await encrypt(input.auth_key.trim(), env.ENCRYPTION_KEY));
+  }
+  if (input.username !== undefined) {
+    sets.push("username=?");
+    params.push(input.username.trim());
+  }
+  if (input.password !== undefined && input.password.trim() !== "") {
+    sets.push("password=?");
+    params.push(await encrypt(input.password.trim(), env.ENCRYPTION_KEY));
+  }
+  if (input.remark !== undefined) {
+    sets.push("remark=?");
+    params.push(input.remark.trim());
+  }
+  if (sets.length === 0) return;
+  sets.push("updated_at=?");
+  params.push(nowSeconds(), id);
+  await execute(env.DB, `UPDATE nps_servers SET ${sets.join(", ")} WHERE id=?`, params);
+}
+
+export async function deleteNpsServer(env: Env, id: number): Promise<void> {
+  await execute(env.DB, "DELETE FROM nps_cert_bindings WHERE nps_server_id=?", [id]);
+  await execute(env.DB, "DELETE FROM nps_servers WHERE id=?", [id]);
+}
+
+export interface NpsCertBindingRecord {
+  id: number;
+  ssl_cert_id: number;
+  nps_server_id: number;
+  nps_host_id: number;
+  nps_client_id: number;
+  domain: string;
+  sync_cdn: boolean;
+  last_deployed_cert_id: string;
+  last_deployed_at: number;
+  last_error: string;
+  created_at: number;
+  updated_at: number;
+}
+
+function normalizeNpsBindingRow(row: Row): NpsCertBindingRecord {
+  return {
+    id: asInt(row["id"]),
+    ssl_cert_id: asInt(row["ssl_cert_id"]),
+    nps_server_id: asInt(row["nps_server_id"]),
+    nps_host_id: asInt(row["nps_host_id"]),
+    nps_client_id: asInt(row["nps_client_id"]),
+    domain: asStr(row["domain"]),
+    sync_cdn: asBool(row["sync_cdn"]),
+    last_deployed_cert_id: asStr(row["last_deployed_cert_id"]),
+    last_deployed_at: asInt(row["last_deployed_at"]),
+    last_error: asStr(row["last_error"]),
+    created_at: asInt(row["created_at"]),
+    updated_at: asInt(row["updated_at"]),
+  };
+}
+
+export async function listNpsCertBindings(
+  env: Env,
+  filter?: { npsServerId?: number; domain?: string },
+): Promise<NpsCertBindingRecord[]> {
+  const clauses: string[] = [];
+  const params: (string | number)[] = [];
+  if (filter?.npsServerId) {
+    clauses.push("nps_server_id=?");
+    params.push(filter.npsServerId);
+  }
+  if (filter?.domain) {
+    clauses.push("domain=?");
+    params.push(filter.domain.trim().toLowerCase());
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const rows = await query<Row>(
+    env.DB,
+    `SELECT * FROM nps_cert_bindings ${where} ORDER BY id DESC`,
+    params,
+  );
+  return rows.map(normalizeNpsBindingRow);
+}
+
+export async function listNpsBindingsBySslCert(
+  env: Env,
+  sslCertId: number,
+): Promise<NpsCertBindingRecord[]> {
+  const rows = await query<Row>(
+    env.DB,
+    "SELECT * FROM nps_cert_bindings WHERE ssl_cert_id=? ORDER BY id ASC",
+    [sslCertId],
+  );
+  return rows.map(normalizeNpsBindingRow);
+}
+
+export async function getNpsCertBinding(
+  env: Env,
+  id: number,
+): Promise<NpsCertBindingRecord | null> {
+  const row = await queryOne<Row>(env.DB, "SELECT * FROM nps_cert_bindings WHERE id=?", [id]);
+  return row ? normalizeNpsBindingRow(row) : null;
+}
+
+export async function getNpsCertBindingByHost(
+  env: Env,
+  npsServerId: number,
+  npsHostId: number,
+): Promise<NpsCertBindingRecord | null> {
+  const row = await queryOne<Row>(
+    env.DB,
+    "SELECT * FROM nps_cert_bindings WHERE nps_server_id=? AND nps_host_id=?",
+    [npsServerId, npsHostId],
+  );
+  return row ? normalizeNpsBindingRow(row) : null;
+}
+
+export async function upsertNpsCertBinding(
+  env: Env,
+  input: {
+    ssl_cert_id: number;
+    nps_server_id: number;
+    nps_host_id: number;
+    nps_client_id?: number;
+    domain: string;
+    sync_cdn?: boolean;
+    last_deployed_cert_id?: string;
+    last_deployed_at?: number;
+    last_error?: string;
+  },
+): Promise<NpsCertBindingRecord> {
+  const now = nowSeconds();
+  const domain = input.domain.trim().toLowerCase();
+  const clientId = Math.max(0, Math.trunc(input.nps_client_id ?? 0));
+  const syncCdn = input.sync_cdn === false ? 0 : 1;
+  const deployedCertId = (input.last_deployed_cert_id ?? "").trim();
+  const deployedAt = input.last_deployed_at ?? 0;
+  const lastError = input.last_error ?? "";
+
+  await execute(
+    env.DB,
+    `INSERT INTO nps_cert_bindings
+       (ssl_cert_id, nps_server_id, nps_host_id, nps_client_id, domain, sync_cdn,
+        last_deployed_cert_id, last_deployed_at, last_error, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(nps_server_id, nps_host_id) DO UPDATE SET
+       ssl_cert_id=excluded.ssl_cert_id,
+       nps_client_id=CASE WHEN excluded.nps_client_id > 0 THEN excluded.nps_client_id ELSE nps_cert_bindings.nps_client_id END,
+       domain=excluded.domain,
+       sync_cdn=excluded.sync_cdn,
+       last_deployed_cert_id=excluded.last_deployed_cert_id,
+       last_deployed_at=excluded.last_deployed_at,
+       last_error=excluded.last_error,
+       updated_at=excluded.updated_at`,
+    [
+      input.ssl_cert_id,
+      input.nps_server_id,
+      input.nps_host_id,
+      clientId,
+      domain,
+      syncCdn,
+      deployedCertId,
+      deployedAt,
+      lastError,
+      now,
+      now,
+    ],
+  );
+  const row = await queryOne<Row>(
+    env.DB,
+    "SELECT * FROM nps_cert_bindings WHERE nps_server_id=? AND nps_host_id=?",
+    [input.nps_server_id, input.nps_host_id],
+  );
+  return normalizeNpsBindingRow(row!);
+}
+
+export async function updateNpsCertBindingStatus(
+  env: Env,
+  id: number,
+  patch: {
+    domain?: string;
+    nps_client_id?: number;
+    sync_cdn?: boolean;
+    last_deployed_cert_id?: string;
+    last_deployed_at?: number;
+    last_error?: string;
+  },
+): Promise<void> {
+  const sets: string[] = [];
+  const params: (string | number)[] = [];
+  if (patch.domain !== undefined) {
+    sets.push("domain=?");
+    params.push(patch.domain.trim().toLowerCase());
+  }
+  if (patch.nps_client_id !== undefined) {
+    sets.push("nps_client_id=?");
+    params.push(Math.max(0, Math.trunc(patch.nps_client_id)));
+  }
+  if (patch.sync_cdn !== undefined) {
+    sets.push("sync_cdn=?");
+    params.push(patch.sync_cdn ? 1 : 0);
+  }
+  if (patch.last_deployed_cert_id !== undefined) {
+    sets.push("last_deployed_cert_id=?");
+    params.push(patch.last_deployed_cert_id.trim());
+  }
+  if (patch.last_deployed_at !== undefined) {
+    sets.push("last_deployed_at=?");
+    params.push(patch.last_deployed_at);
+  }
+  if (patch.last_error !== undefined) {
+    sets.push("last_error=?");
+    params.push(patch.last_error);
+  }
+  if (sets.length === 0) return;
+  sets.push("updated_at=?");
+  params.push(nowSeconds(), id);
+  await execute(env.DB, `UPDATE nps_cert_bindings SET ${sets.join(", ")} WHERE id=?`, params);
+}
+
+export async function deleteNpsCertBinding(env: Env, id: number): Promise<void> {
+  await execute(env.DB, "DELETE FROM nps_cert_bindings WHERE id=?", [id]);
+}
+
+export async function deleteNpsCertBindingByHost(
+  env: Env,
+  npsServerId: number,
+  npsHostId: number,
+): Promise<void> {
+  await execute(
+    env.DB,
+    "DELETE FROM nps_cert_bindings WHERE nps_server_id=? AND nps_host_id=?",
+    [npsServerId, npsHostId],
+  );
+}
+
