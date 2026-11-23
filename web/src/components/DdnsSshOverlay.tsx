@@ -18,12 +18,17 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
-import { patch } from '../api'
-import type { DdnsIpMonitorItem, DdnsIpSshAuthType } from '../types'
+import { APIError, api, patch } from '../api'
+import type {
+  DdnsIpMonitorItem,
+  DdnsIpMonitorsResponse,
+  DdnsIpSshAuthType,
+} from '../types'
 import { Segmented } from './ui'
 
 interface DdnsSshOverlayProps {
   monitor: DdnsIpMonitorItem
+  standalone?: boolean
   onClose: () => void
   onToast: (message: string, tone?: 'success' | 'error' | 'info') => void
   onMonitorUpdated: (next: DdnsIpMonitorItem) => void
@@ -40,6 +45,7 @@ type ConnPhase = 'form' | 'connecting' | 'connected' | 'closed' | 'error'
  */
 export default function DdnsSshOverlay({
   monitor,
+  standalone = false,
   onClose,
   onToast,
   onMonitorUpdated,
@@ -609,12 +615,13 @@ export default function DdnsSshOverlay({
           <button
             type="button"
             className="btn sm danger"
+            title={standalone ? '关闭当前终端标签页（若浏览器阻止则回到管理面板）' : '关闭远程终端'}
             onClick={() => {
               disconnect()
               onClose()
             }}
           >
-            <X size={13} /> 关闭
+            <X size={13} /> {standalone ? '关闭页面' : '关闭'}
           </button>
         </div>
       </div>
@@ -901,3 +908,114 @@ export default function DdnsSshOverlay({
     </div>
   )
 }
+
+interface DdnsTerminalStandalonePageProps {
+  monitorId: number
+  onToast: (message: string, tone?: 'success' | 'error' | 'info') => void
+  onUnauthorized: () => void
+  onBackToAdmin: () => void
+}
+
+/**
+ * Dedicated full-screen browser tab page (`/admin/ddns-terminal/:monitorId`)
+ * so multiple DDNS IP remote terminals can be opened side by side without
+ * covering the main admin console.
+ */
+export function DdnsTerminalStandalonePage({
+  monitorId,
+  onToast,
+  onUnauthorized,
+  onBackToAdmin,
+}: DdnsTerminalStandalonePageProps) {
+  const [monitor, setMonitor] = useState<DdnsIpMonitorItem | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  const loadMonitor = useCallback(async () => {
+    setLoading(true)
+    setError('')
+    try {
+      const res = await api<DdnsIpMonitorsResponse>('/api/v1/ddns-ip/monitors')
+      const hit = res.items.find((x) => x.id === monitorId) ?? null
+      if (!hit) {
+        setMonitor(null)
+        setError(`未找到编号为 #${monitorId} 的 DDNS IP 监控节点（可能已被删除）`)
+      } else {
+        setMonitor(hit)
+      }
+    } catch (err) {
+      if (err instanceof APIError && err.status === 401) {
+        onUnauthorized()
+        return
+      }
+      setError(err instanceof Error ? err.message : '加载节点信息失败')
+    } finally {
+      setLoading(false)
+    }
+  }, [monitorId, onUnauthorized])
+
+  useEffect(() => {
+    void loadMonitor()
+  }, [loadMonitor])
+
+  useEffect(() => {
+    const prevTitle = document.title
+    if (monitor) {
+      document.title = `${monitor.fqdn}${monitor.label ? ` (${monitor.label})` : ''} · 远程终端`
+    } else {
+      document.title = `远程终端 #${monitorId}`
+    }
+    return () => {
+      document.title = prevTitle
+    }
+  }, [monitor, monitorId])
+
+  const handleCloseTab = useCallback(() => {
+    window.close()
+    // Fallback when browser disallows window.close() (e.g. directly opened URL).
+    window.setTimeout(() => {
+      if (!window.closed) {
+        onBackToAdmin()
+      }
+    }, 120)
+  }, [onBackToAdmin])
+
+  if (loading) {
+    return (
+      <div className="ssh-standalone-boot">
+        <LoaderCircle size={24} className="spin" style={{ color: '#f472b6' }} />
+        <h3>正在打开远程终端…</h3>
+        <p>正在获取 DDNS 监控节点信息与免密隧道状态</p>
+      </div>
+    )
+  }
+
+  if (error || !monitor) {
+    return (
+      <div className="ssh-standalone-boot">
+        <TerminalIcon size={26} style={{ color: '#f87171' }} />
+        <h3>无法打开远程终端</h3>
+        <p>{error || '目标节点不存在'}</p>
+        <div className="ssh-standalone-boot-ops">
+          <button type="button" className="btn ghost sm" onClick={onBackToAdmin}>
+            返回管理面板
+          </button>
+          <button type="button" className="btn primary sm" onClick={() => void loadMonitor()}>
+            <RefreshCw size={12} /> 重试
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <DdnsSshOverlay
+      monitor={monitor}
+      standalone
+      onToast={onToast}
+      onMonitorUpdated={setMonitor}
+      onClose={handleCloseTab}
+    />
+  )
+}
+

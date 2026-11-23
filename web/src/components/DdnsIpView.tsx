@@ -28,7 +28,6 @@ import type {
   DnsAccount,
 } from '../types'
 import { Badge, Empty, Modal, Segmented, Switch } from './ui'
-import DdnsSshOverlay from './DdnsSshOverlay'
 
 type ConfirmRequest = {
   title: string
@@ -161,7 +160,6 @@ export default function DdnsIpView({
     editing: null,
   })
   const [installModalItem, setInstallModalItem] = useState<DdnsIpMonitorItem | null>(null)
-  const [sshItem, setSshItem] = useState<DdnsIpMonitorItem | null>(null)
 
   const copyText = useCallback(
     async (text: string, key: string, label: string) => {
@@ -185,9 +183,6 @@ export default function DdnsIpView({
       setDnsAccounts(res.dns_accounts)
       setInstallModalItem((prev) =>
         prev ? res.items.find((x) => x.id === prev.id) ?? null : null,
-      )
-      setSshItem((prev) =>
-        prev ? res.items.find((x) => x.id === prev.id) ?? prev : null,
       )
     } catch (err) {
       onToast(err instanceof Error ? err.message : '加载 DDNS IP 列表失败', 'error')
@@ -656,19 +651,20 @@ export default function DdnsIpView({
                         {it.remark ? ` · ${it.remark}` : ''}
                       </span>
                       <div className="nps-host-actions">
-                        <button
-                          type="button"
+                        <a
+                          href={`/admin/ddns-terminal/${it.id}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
                           className="btn primary sm"
-                          onClick={() => setSshItem(it)}
                           title={
                             it.terminal_agent_online
-                              ? '免密监控终端在线，点击直接进入 Shell（无需输入密码）'
-                              : '打开远程终端（支持免密监控反向隧道或直连 SSH）'
+                              ? '在新标签页免密打开监控远程终端（无需输入密码）'
+                              : '在新标签页打开远程终端（支持免密监控反向隧道或直连 SSH）'
                           }
                         >
                           {it.terminal_agent_online && <span className="ddns-term-ready-dot" />}
                           <Terminal size={12} /> 远程终端
-                        </button>
+                        </a>
                         <button
                           type="button"
                           className="btn ghost sm"
@@ -804,19 +800,6 @@ export default function DdnsIpView({
           onCopy={copyText}
           onRotateToken={() => rotateToken(installModalItem)}
           onClose={() => setInstallModalItem(null)}
-        />
-      )}
-
-      {/* Full-Screen Web SSH Remote Terminal Overlay */}
-      {sshItem && (
-        <DdnsSshOverlay
-          monitor={sshItem}
-          onToast={onToast}
-          onMonitorUpdated={(updated) => {
-            setItems((prev) => prev.map((x) => (x.id === updated.id ? updated : x)))
-            setSshItem(updated)
-          }}
-          onClose={() => setSshItem(null)}
         />
       )}
     </div>

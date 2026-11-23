@@ -7787,6 +7787,52 @@ input[type='number']::-webkit-inner-spin-button {
   user-select: all;
 }
 
+a.btn {
+  text-decoration: none;
+}
+
+.ssh-standalone-boot {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  background: #0b0f17;
+  color: #e2e8f0;
+  text-align: center;
+}
+
+.ssh-standalone-boot h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 640;
+  color: #f8fafc;
+}
+
+.ssh-standalone-boot p {
+  margin: 0;
+  max-width: 440px;
+  font-size: 13px;
+  color: #94a3b8;
+  line-height: 1.55;
+}
+
+.ssh-standalone-boot-ops {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.ssh-standalone-boot .btn.ghost {
+  color: #e2e8f0;
+  border-color: rgba(148, 163, 184, 0.28);
+  background: rgba(255, 255, 255, 0.05);
+}
+
 @media (max-width: 680px) {
   .ssh-connect-card {
     padding: 16px;

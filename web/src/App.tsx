@@ -62,6 +62,7 @@ import SettingsDrawer from './components/SettingsDrawer'
 import ConfirmDialog from './components/ConfirmDialog'
 import DNSView from './components/DNSView'
 import DdnsIpView from './components/DdnsIpView'
+import { DdnsTerminalStandalonePage } from './components/DdnsSshOverlay'
 import CertsView from './components/CertsView'
 import EdgeOneView from './components/EdgeOneView'
 import NpsView from './components/NpsView'
@@ -87,6 +88,13 @@ type Toast = { id: number; tone: 'success' | 'error' | 'info'; message: string }
 
 function isAdminPath(pathname: string = window.location.pathname): boolean {
   return pathname === '/admin' || pathname.startsWith('/admin/')
+}
+
+function parseDdnsTerminalId(pathname: string = window.location.pathname): number | null {
+  const m = pathname.match(/^\/admin\/ddns-terminal\/(\d+)\/?$/)
+  if (!m) return null
+  const id = Number(m[1])
+  return Number.isInteger(id) && id > 0 ? id : null
 }
 
 /** 删除这类不可撤销的操作，统一走应用内二次确认（window.confirm 在桌面壳里可能被吞掉） */
@@ -228,6 +236,7 @@ export default function App() {
   const [busyKeepalive, setBusyKeepalive] = useState<number | null>(null)
   // 轮询连续失败两轮以上才置 true：偶发一次抖动静默跳过，别每分钟弹一次提示
   const [stale, setStale] = useState(false)
+  const [terminalPageId, setTerminalPageId] = useState<number | null>(() => parseDdnsTerminalId())
   const polling = useRef<number | null>(null)
   const pollingBusy = useRef(false)
   const failedRounds = useRef(0)
@@ -277,9 +286,10 @@ export default function App() {
   }, [])
 
   const goAdmin = useCallback(() => {
-    if (!isAdminPath()) {
+    if (!isAdminPath() || parseDdnsTerminalId() !== null) {
       window.history.pushState({}, '', '/admin')
     }
+    setTerminalPageId(null)
     if (overview && settingsRef.current) {
       setPhase('ready')
       return
@@ -299,6 +309,7 @@ export default function App() {
     if (isAdminPath()) {
       window.history.pushState({}, '', '/')
     }
+    setTerminalPageId(null)
     setPhase('public')
   }, [])
 
@@ -327,6 +338,12 @@ export default function App() {
           setPhase('setup')
           return
         }
+        const termId = parseDdnsTerminalId()
+        if (termId !== null) {
+          setTerminalPageId(termId)
+          setPhase('ready')
+          return
+        }
         const wantAdmin = isAdminPath()
         const publicEnabled = init.public_home_enabled !== false
         if (!wantAdmin && publicEnabled) {
@@ -351,6 +368,12 @@ export default function App() {
   useEffect(() => {
     const onPopState = () => {
       if (!meta.initialized) return
+      const termId = parseDdnsTerminalId()
+      setTerminalPageId(termId)
+      if (termId !== null) {
+        setPhase('ready')
+        return
+      }
       if (isAdminPath()) {
         if (overview && settingsRef.current) {
           setPhase('ready')
@@ -369,7 +392,7 @@ export default function App() {
   }, [meta.initialized, meta.public_home_enabled, overview, loadAll])
 
   useEffect(() => {
-    if (phase !== 'ready') {
+    if (phase !== 'ready' || terminalPageId !== null) {
       if (polling.current) window.clearInterval(polling.current)
       return
     }
@@ -398,7 +421,7 @@ export default function App() {
     return () => {
       if (polling.current) window.clearInterval(polling.current)
     }
-  }, [phase])
+  }, [phase, terminalPageId])
 
   async function reconcile() {
     if (reconciling) return
@@ -870,11 +893,37 @@ export default function App() {
             if (!isAdminPath()) {
               window.history.replaceState({}, '', '/admin')
             }
+            const termId = parseDdnsTerminalId()
             setMeta((prev) => ({ ...prev, initialized: true, authenticated: true }))
+            if (termId !== null) {
+              setTerminalPageId(termId)
+              setPhase('ready')
+              return
+            }
             setPhase('loading')
             void loadAll().catch(() => setPhase('login'))
           }}
         />
+      </>
+    )
+  }
+
+  if (terminalPageId !== null) {
+    return (
+      <>
+        <DdnsTerminalStandalonePage
+          monitorId={terminalPageId}
+          onToast={toast}
+          onUnauthorized={() => setPhase('login')}
+          onBackToAdmin={goAdmin}
+        />
+        <div className="toasts">
+          {toasts.map((item) => (
+            <div className={`toast ${item.tone}`} key={item.id}>
+              {item.message}
+            </div>
+          ))}
+        </div>
       </>
     )
   }
