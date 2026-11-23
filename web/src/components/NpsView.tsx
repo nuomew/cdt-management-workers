@@ -1161,7 +1161,7 @@ export default function NpsView({
               <div className="section-head">
                 <div className="nps-section-title">
                   <Link2 size={15} />
-                  <h3>域名绑定与 HTTPS 证书联动</h3>
+                  <h3>域名管理</h3>
                   <span className="nps-count-pill">{filteredHosts.length}</span>
                 </div>
                 <div className="nps-head-actions">
