@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Check,
+  ChevronLeft,
+  ChevronRight,
   CloudLightning,
   Copy,
   Edit3,
@@ -61,6 +63,22 @@ interface NpsViewProps {
 }
 
 const SELECTED_SERVER_STORAGE_KEY = 'cdt_nps_selected_server_id'
+const CLIENTS_PAGE_SIZE = 6
+const TUNNELS_PAGE_SIZE = 10
+
+function buildPageTokens(current: number, total: number): Array<number | 'ellipsis'> {
+  if (total <= 7) {
+    return Array.from({ length: total }, (_, i) => i + 1)
+  }
+  const pages = new Set<number>([1, total, current - 1, current, current + 1])
+  const sorted = [...pages].filter((p) => p >= 1 && p <= total).sort((a, b) => a - b)
+  const out: Array<number | 'ellipsis'> = []
+  for (let i = 0; i < sorted.length; i += 1) {
+    if (i > 0 && sorted[i]! - sorted[i - 1]! > 1) out.push('ellipsis')
+    out.push(sorted[i]!)
+  }
+  return out
+}
 
 const TUNNEL_MODE_OPTIONS: { value: NpsTunnelMode; label: string }[] = [
   { value: 'tcp', label: 'TCP 隧道' },
@@ -159,10 +177,12 @@ export default function NpsView({
   const [tunnels, setTunnels] = useState<NpsTunnelItem[]>([])
   const [hosts, setHosts] = useState<NpsHostItem[]>([])
 
-  // Filters
+  // Filters & Pagination
   const [clientFilter, setClientFilter] = useState<number>(0)
   const [protoFilter, setProtoFilter] = useState<string>('all')
   const [searchText, setSearchText] = useState('')
+  const [clientsPage, setClientsPage] = useState(1)
+  const [tunnelsPage, setTunnelsPage] = useState(1)
   const [revealedVkeys, setRevealedVkeys] = useState<Record<number, boolean>>({})
   const [copiedKey, setCopiedKey] = useState('')
   const [busyKey, setBusyKey] = useState('')
@@ -267,6 +287,8 @@ export default function NpsView({
   }, [loadBootstrap])
 
   useEffect(() => {
+    setClientsPage(1)
+    setTunnelsPage(1)
     if (currentServer) {
       window.localStorage.setItem(SELECTED_SERVER_STORAGE_KEY, String(currentServer.id))
       void loadServerData(currentServer.id)
@@ -278,6 +300,10 @@ export default function NpsView({
       setLoadError('')
     }
   }, [currentServer?.id, loadServerData])
+
+  useEffect(() => {
+    setTunnelsPage(1)
+  }, [clientFilter, protoFilter, searchText])
 
   const refreshAll = useCallback(async () => {
     await loadBootstrap(currentServer?.id)
@@ -330,6 +356,28 @@ export default function NpsView({
       return true
     })
   }, [tunnels, clientFilter, protoFilter, searchText, clientNameMap])
+
+  const clientsTotalPages = Math.max(1, Math.ceil(clients.length / CLIENTS_PAGE_SIZE))
+  const safeClientsPage = Math.min(clientsPage, clientsTotalPages)
+  const pagedClients = useMemo(
+    () =>
+      clients.slice(
+        (safeClientsPage - 1) * CLIENTS_PAGE_SIZE,
+        safeClientsPage * CLIENTS_PAGE_SIZE,
+      ),
+    [clients, safeClientsPage],
+  )
+
+  const tunnelsTotalPages = Math.max(1, Math.ceil(filteredTunnels.length / TUNNELS_PAGE_SIZE))
+  const safeTunnelsPage = Math.min(tunnelsPage, tunnelsTotalPages)
+  const pagedTunnels = useMemo(
+    () =>
+      filteredTunnels.slice(
+        (safeTunnelsPage - 1) * TUNNELS_PAGE_SIZE,
+        safeTunnelsPage * TUNNELS_PAGE_SIZE,
+      ),
+    [filteredTunnels, safeTunnelsPage],
+  )
 
   const filteredHosts = useMemo(() => {
     const kw = searchText.trim().toLowerCase()
@@ -764,8 +812,9 @@ export default function NpsView({
                     />
                   </div>
                 ) : (
-                  <div className="nps-client-grid">
-                    {clients.map((cli) => {
+                  <>
+                    <div className="nps-client-grid">
+                      {pagedClients.map((cli) => {
                       const isSelected = clientFilter === cli.id
                       const vkeyShown = Boolean(revealedVkeys[cli.id])
                       const npcCmd = buildNpcCommand(bridge, currentServer.base_url, cli.verifyKey)
@@ -908,7 +957,16 @@ export default function NpsView({
                         </div>
                       )
                     })}
-                  </div>
+                    </div>
+                    <NpsPager
+                      label="NPS 客户端分页"
+                      total={clients.length}
+                      pageSize={CLIENTS_PAGE_SIZE}
+                      page={safeClientsPage}
+                      unit="个"
+                      onChange={setClientsPage}
+                    />
+                  </>
                 )}
               </section>
 
@@ -968,122 +1026,132 @@ export default function NpsView({
                     />
                   </div>
                 ) : (
-                  <div className="card nps-table-card">
-                    <div className="nps-table-scroll">
-                      <table className="nps-table">
-                        <thead>
-                          <tr>
-                            <th>协议</th>
-                            <th>服务端端口</th>
-                            <th>内网目标</th>
-                            <th>所属客户端</th>
-                            <th>备注</th>
-                            <th>流量</th>
-                            <th>状态</th>
-                            <th className="right">操作</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {filteredTunnels.map((t) => {
-                            const mb = tunnelModeBadge(t.mode)
-                            const cli = clientNameMap.get(t.clientId)
-                            const portLabel = t.port > 0 ? `${t.serverIp ? `${t.serverIp}:` : ':'}${t.port}` : '—'
-                            const busy = busyKey === `tun-toggle-${t.id}`
-                            return (
-                              <tr key={t.id}>
-                                <td>
-                                  <Badge tone={mb.tone} dot={false}>
-                                    {mb.label}
-                                  </Badge>
-                                </td>
-                                <td>
-                                  <div className="nps-mono-cell">
-                                    <code>{portLabel}</code>
-                                    {t.port > 0 && (
+                  <>
+                    <div className="card nps-table-card">
+                      <div className="nps-table-scroll">
+                        <table className="nps-table">
+                          <thead>
+                            <tr>
+                              <th>协议</th>
+                              <th>服务端端口</th>
+                              <th>内网目标</th>
+                              <th>所属客户端</th>
+                              <th>备注</th>
+                              <th>流量</th>
+                              <th>状态</th>
+                              <th className="right">操作</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {pagedTunnels.map((t) => {
+                              const mb = tunnelModeBadge(t.mode)
+                              const cli = clientNameMap.get(t.clientId)
+                              const portLabel = t.port > 0 ? `${t.serverIp ? `${t.serverIp}:` : ':'}${t.port}` : '—'
+                              const busy = busyKey === `tun-toggle-${t.id}`
+                              return (
+                                <tr key={t.id}>
+                                  <td>
+                                    <Badge tone={mb.tone} dot={false}>
+                                      {mb.label}
+                                    </Badge>
+                                  </td>
+                                  <td>
+                                    <div className="nps-mono-cell">
+                                      <code>{portLabel}</code>
+                                      {t.port > 0 && (
+                                        <button
+                                          type="button"
+                                          className="btn ghost icon sm"
+                                          onClick={() =>
+                                            void copyText(
+                                              `${t.serverIp || bridge?.ip || ''}:${t.port}`,
+                                              `port-${t.id}`,
+                                              '监听地址',
+                                            )
+                                          }
+                                          title="复制监听地址"
+                                        >
+                                          {copiedKey === `port-${t.id}` ? <Check size={11} /> : <Copy size={11} />}
+                                        </button>
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td>
+                                    <code className="nps-target-code">
+                                      {t.mode === 'file' ? t.localPath || '—' : t.target || '—'}
+                                    </code>
+                                    {t.localProxy && <span className="nps-mini-tag">本地代理</span>}
+                                  </td>
+                                  <td>
+                                    <div className="nps-client-chip">
+                                      <i className={`nps-dot ${cli?.isConnect ?? t.clientOnline ? 'on' : 'off'}`} />
+                                      <span>{cli?.remark || t.clientRemark || `客户端 #${t.clientId}`}</span>
+                                    </div>
+                                  </td>
+                                  <td className="nps-remark-cell">{t.remark || '—'}</td>
+                                  <td className="nps-flow-cell">
+                                    ↓{formatBytes(t.inletFlow)} / ↑{formatBytes(t.exportFlow)}
+                                  </td>
+                                  <td>
+                                    {t.status ? (
+                                      <Badge tone={t.runStatus ? 'green' : 'amber'}>
+                                        {t.runStatus ? '运行中' : '已开启'}
+                                      </Badge>
+                                    ) : (
+                                      <Badge tone="gray">已停止</Badge>
+                                    )}
+                                  </td>
+                                  <td className="right">
+                                    <div className="nps-row-actions">
                                       <button
                                         type="button"
-                                        className="btn ghost icon sm"
-                                        onClick={() =>
-                                          void copyText(
-                                            `${t.serverIp || bridge?.ip || ''}:${t.port}`,
-                                            `port-${t.id}`,
-                                            '监听地址',
-                                          )
-                                        }
-                                        title="复制监听地址"
+                                        className="btn ghost sm"
+                                        disabled={busy}
+                                        onClick={() => void toggleTunnel(t)}
+                                        title={t.status ? '停止' : '启动'}
                                       >
-                                        {copiedKey === `port-${t.id}` ? <Check size={11} /> : <Copy size={11} />}
+                                        {busy ? (
+                                          <LoaderCircle size={12} className="spin" />
+                                        ) : t.status ? (
+                                          <Square size={12} />
+                                        ) : (
+                                          <Play size={12} />
+                                        )}
                                       </button>
-                                    )}
-                                  </div>
-                                </td>
-                                <td>
-                                  <code className="nps-target-code">
-                                    {t.mode === 'file' ? t.localPath || '—' : t.target || '—'}
-                                  </code>
-                                  {t.localProxy && <span className="nps-mini-tag">本地代理</span>}
-                                </td>
-                                <td>
-                                  <div className="nps-client-chip">
-                                    <i className={`nps-dot ${cli?.isConnect ?? t.clientOnline ? 'on' : 'off'}`} />
-                                    <span>{cli?.remark || t.clientRemark || `客户端 #${t.clientId}`}</span>
-                                  </div>
-                                </td>
-                                <td className="nps-remark-cell">{t.remark || '—'}</td>
-                                <td className="nps-flow-cell">
-                                  ↓{formatBytes(t.inletFlow)} / ↑{formatBytes(t.exportFlow)}
-                                </td>
-                                <td>
-                                  {t.status ? (
-                                    <Badge tone={t.runStatus ? 'green' : 'amber'}>
-                                      {t.runStatus ? '运行中' : '已开启'}
-                                    </Badge>
-                                  ) : (
-                                    <Badge tone="gray">已停止</Badge>
-                                  )}
-                                </td>
-                                <td className="right">
-                                  <div className="nps-row-actions">
-                                    <button
-                                      type="button"
-                                      className="btn ghost sm"
-                                      disabled={busy}
-                                      onClick={() => void toggleTunnel(t)}
-                                      title={t.status ? '停止' : '启动'}
-                                    >
-                                      {busy ? (
-                                        <LoaderCircle size={12} className="spin" />
-                                      ) : t.status ? (
-                                        <Square size={12} />
-                                      ) : (
-                                        <Play size={12} />
-                                      )}
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="btn ghost sm"
-                                      onClick={() => setTunnelModal({ open: true, editing: t })}
-                                      title="编辑"
-                                    >
-                                      <Edit3 size={12} />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="btn ghost sm danger"
-                                      onClick={() => deleteTunnel(t)}
-                                      title="删除"
-                                    >
-                                      <Trash2 size={12} />
-                                    </button>
-                                  </div>
-                                </td>
-                              </tr>
-                            )
-                          })}
-                        </tbody>
-                      </table>
+                                      <button
+                                        type="button"
+                                        className="btn ghost sm"
+                                        onClick={() => setTunnelModal({ open: true, editing: t })}
+                                        title="编辑"
+                                      >
+                                        <Edit3 size={12} />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="btn ghost sm danger"
+                                        onClick={() => deleteTunnel(t)}
+                                        title="删除"
+                                      >
+                                        <Trash2 size={12} />
+                                      </button>
+                                    </div>
+                                  </td>
+                                </tr>
+                              )
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
                     </div>
-                  </div>
+                    <NpsPager
+                      label="端口映射分页"
+                      total={filteredTunnels.length}
+                      pageSize={TUNNELS_PAGE_SIZE}
+                      page={safeTunnelsPage}
+                      unit="条"
+                      onChange={setTunnelsPage}
+                    />
+                  </>
                 )}
               </section>
             </>
@@ -2752,3 +2820,71 @@ function NpsHostCertModal({
     </Modal>
   )
 }
+
+function NpsPager({
+  label,
+  total,
+  pageSize,
+  page,
+  unit,
+  onChange,
+}: {
+  label: string
+  total: number
+  pageSize: number
+  page: number
+  unit: string
+  onChange: (nextPage: number) => void
+}) {
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  if (totalPages <= 1) return null
+  const start = (page - 1) * pageSize + 1
+  const end = Math.min(page * pageSize, total)
+  const tokens = buildPageTokens(page, totalPages)
+
+  return (
+    <div className="card certs-pager" style={{ marginTop: 0 }}>
+      <div className="cloud-dns-pager" role="navigation" aria-label={label}>
+        <span className="cloud-dns-pager-info">
+          共 {total} {unit} · 第 {start}–{end} {unit}（{page} / {totalPages} 页）
+        </span>
+        <div className="cloud-dns-pager-controls">
+          <button
+            type="button"
+            className="cloud-dns-page-btn"
+            disabled={page <= 1}
+            onClick={() => onChange(Math.max(1, page - 1))}
+          >
+            <ChevronLeft size={13} /> 上一页
+          </button>
+          {tokens.map((tok, idx) =>
+            tok === 'ellipsis' ? (
+              <span key={`e-${idx}`} className="cloud-dns-page-ellipsis">
+                …
+              </span>
+            ) : (
+              <button
+                key={tok}
+                type="button"
+                className={`cloud-dns-page-btn${tok === page ? ' on' : ''}`}
+                aria-current={tok === page ? 'page' : undefined}
+                onClick={() => onChange(tok)}
+              >
+                {tok}
+              </button>
+            ),
+          )}
+          <button
+            type="button"
+            className="cloud-dns-page-btn"
+            disabled={page >= totalPages}
+            onClick={() => onChange(Math.min(totalPages, page + 1))}
+          >
+            下一页 <ChevronRight size={13} />
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
