@@ -691,6 +691,16 @@ if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl daemon-reload 2>/dev/null || true
 fi
 
+if [ -f "/etc/init.d/\${TERM_UNIT}" ]; then
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service "\${TERM_UNIT}" stop 2>/dev/null || true
+  fi
+  if command -v rc-update >/dev/null 2>&1; then
+    rc-update del "\${TERM_UNIT}" default 2>/dev/null || true
+  fi
+  rm -f "/etc/init.d/\${TERM_UNIT}"
+fi
+
 if [ -f "\${TERM_PID_FILE}" ]; then
   OLD_PID="$(cat "\${TERM_PID_FILE}" 2>/dev/null || true)"
   if [ -n "$OLD_PID" ]; then
@@ -710,6 +720,9 @@ echo "✅ 已完成卸载 \${UNIT} 与反向终端服务 (${safeFqdn})"
 
   return `#!/bin/sh
 set -eu
+
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\${PATH:-}"
+export PATH
 
 UNIT="${unitName}"
 TERM_UNIT="${termUnitName}"
@@ -736,14 +749,43 @@ fi
 
 echo "==> 正在安装 DDNS IP 监控 v\${AGENT_VERSION}（动态 IPv4 + 每次心跳三网延迟 + 免密反向终端）: \${DDNS_FQDN} (每 \${INTERVAL_SEC} 秒)"
 
+# Auto-install python3 (+ ca-certificates on Alpine/minimal images) so the
+# zero-dependency reverse WebSocket PTY terminal works out of the box.
+ensure_python3() {
+  if command -v apk >/dev/null 2>&1; then
+    if ! command -v python3 >/dev/null 2>&1 || [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
+      echo "==> 检测到 Alpine 环境，正在通过 apk 自动安装 python3 与 CA 证书..."
+      apk add --no-cache python3 ca-certificates </dev/null >/dev/null 2>&1 || apk add --no-cache python3 ca-certificates </dev/null || true
+    fi
+  elif ! command -v python3 >/dev/null 2>&1; then
+    echo "==> 未检测到 python3，正在尝试自动安装以启用免密反向终端..."
+    if command -v apt-get >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq </dev/null >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 ca-certificates </dev/null >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y -q python3 ca-certificates </dev/null >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y -q python3 ca-certificates </dev/null >/dev/null 2>&1 || true
+    elif command -v opkg >/dev/null 2>&1; then
+      opkg update </dev/null >/dev/null 2>&1 || true
+      opkg install python3-light ca-bundle </dev/null >/dev/null 2>&1 || true
+    fi
+  fi
+  command -v python3 >/dev/null 2>&1
+}
+
 mkdir -p /usr/local/bin /var/run
 cat > "\${SCRIPT_PATH}" <<'CDT_DDNS_AGENT_EOF'
 #!/bin/sh
 set -u
 
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\${PATH:-}"
+export PATH
+
 PANEL_ORIGIN="__PANEL_ORIGIN__"
 DDNS_TOKEN="__DDNS_TOKEN__"
 AGENT_VERSION="__AGENT_VERSION__"
+TERM_UNIT="__TERM_UNIT__"
 TERM_SCRIPT_PATH="__TERM_SCRIPT_PATH__"
 TERM_PID_FILE="__TERM_PID_FILE__"
 UPDATE_STAMP_FILE="__UPDATE_STAMP_FILE__"
@@ -757,7 +799,7 @@ fetch_v4() {
   if command -v curl >/dev/null 2>&1; then
     curl -4 -fsS --connect-timeout 8 --max-time 15 "$1" 2>/dev/null || true
   else
-    wget -4 -qO- -T 15 "$1" 2>/dev/null || true
+    wget -4 -qO- -T 15 "$1" 2>/dev/null || wget -qO- -T 15 "$1" 2>/dev/null || true
   fi
 }
 
@@ -775,7 +817,7 @@ probe_isp_ms() {
         fi
       fi
     elif command -v ping >/dev/null 2>&1; then
-      ms="$(ping -4 -c 2 -W 2 "$host" 2>/dev/null | awk -F'[=/ ]+' '/time=/{for(i=1;i<=NF;i++) if($i=="time"){sum+=$(i+1);n++}} END{if(n>0) printf "%.1f", sum/n}' 2>/dev/null || true)"
+      ms="$({ ping -4 -c 2 -W 2 "$host" 2>/dev/null || ping -c 2 -W 2 "$host" 2>/dev/null; } | awk -F'[=/ ]+' '/time=/{for(i=1;i<=NF;i++) if($i=="time"){sum+=$(i+1);n++}} END{if(n>0) printf "%.1f", sum/n}' 2>/dev/null || true)"
       if [ -n "$ms" ]; then
         printf '%s' "$ms"
         return 0
@@ -785,12 +827,16 @@ probe_isp_ms() {
   printf '%s' "-1"
 }
 
-# Keep non-systemd reverse terminal daemon alive on Alpine / OpenWrt / Docker
+# Keep non-systemd reverse terminal daemon alive on Alpine (OpenRC / container), OpenWrt, Docker
 ensure_term_daemon() {
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     return 0
   fi
   if ! command -v python3 >/dev/null 2>&1 || [ ! -x "$TERM_SCRIPT_PATH" ]; then
+    return 0
+  fi
+  if [ -x "/etc/init.d/\${TERM_UNIT}" ] && command -v rc-service >/dev/null 2>&1 && [ -d /run/openrc ]; then
+    rc-service "\${TERM_UNIT}" status >/dev/null 2>&1 || rc-service "\${TERM_UNIT}" start >/dev/null 2>&1 || true
     return 0
   fi
   if [ -f "$TERM_PID_FILE" ]; then
@@ -799,7 +845,7 @@ ensure_term_daemon() {
       return 0
     fi
   fi
-  nohup python3 "$TERM_SCRIPT_PATH" >/dev/null 2>&1 &
+  nohup python3 "$TERM_SCRIPT_PATH" </dev/null >/dev/null 2>&1 &
   printf '%s' "$!" > "$TERM_PID_FILE"
 }
 
@@ -824,7 +870,7 @@ maybe_self_update() {
   fi
   if /bin/sh -n "$TMP_UP" 2>/dev/null; then
     printf '[cdt-ddns-ip] 检测到新版本 v%s（本地 v%s），正在自动更新...\\n' "$REMOTE_VER" "$AGENT_VERSION"
-    CDT_DDNS_SKIP_FIRST_RUN=1 /bin/sh "$TMP_UP" >/dev/null 2>&1 || true
+    CDT_DDNS_SKIP_FIRST_RUN=1 /bin/sh "$TMP_UP" </dev/null >/dev/null 2>&1 || true
   fi
   rm -f "$TMP_UP"
 }
@@ -870,18 +916,60 @@ else
 fi
 CDT_DDNS_AGENT_EOF
 
-sed -i "s|__PANEL_ORIGIN__|\${PANEL_ORIGIN}|g; s|__DDNS_TOKEN__|\${DDNS_TOKEN}|g; s|__AGENT_VERSION__|\${AGENT_VERSION}|g; s|__TERM_SCRIPT_PATH__|\${TERM_SCRIPT_PATH}|g; s|__TERM_PID_FILE__|\${TERM_PID_FILE}|g; s|__UPDATE_STAMP_FILE__|\${UPDATE_STAMP_FILE}|g" "\${SCRIPT_PATH}"
+sed -i "s|__PANEL_ORIGIN__|\${PANEL_ORIGIN}|g; s|__DDNS_TOKEN__|\${DDNS_TOKEN}|g; s|__AGENT_VERSION__|\${AGENT_VERSION}|g; s|__TERM_UNIT__|\${TERM_UNIT}|g; s|__TERM_SCRIPT_PATH__|\${TERM_SCRIPT_PATH}|g; s|__TERM_PID_FILE__|\${TERM_PID_FILE}|g; s|__UPDATE_STAMP_FILE__|\${UPDATE_STAMP_FILE}|g" "\${SCRIPT_PATH}"
 chmod 700 "\${SCRIPT_PATH}"
 
 # Install zero-dependency Python 3 reverse WebSocket PTY terminal daemon
-if command -v python3 >/dev/null 2>&1; then
+if ensure_python3; then
   cat > "\${TERM_SCRIPT_PATH}" <<'CDT_DDNS_TERM_EOF'
 ${pyAgentTemplate}CDT_DDNS_TERM_EOF
   sed -i "s|__PANEL_ORIGIN__|\${PANEL_ORIGIN}|g; s|__DDNS_TOKEN__|\${DDNS_TOKEN}|g; s|__AGENT_VERSION__|\${AGENT_VERSION}|g" "\${TERM_SCRIPT_PATH}"
   chmod 700 "\${TERM_SCRIPT_PATH}"
 else
-  echo "⚠️ 未检测到 python3，将跳过免密反向终端守护服务（DDNS IP 与三网延迟监控不受影响）"
+  echo "⚠️ 自动安装 python3 失败，将跳过免密反向终端守护服务（Alpine 请手动运行 apk add python3 ca-certificates 后重跑安装命令）"
 fi
+
+start_term_non_systemd() {
+  if [ ! -x "\${TERM_SCRIPT_PATH}" ]; then
+    return 0
+  fi
+  PYTHON_BIN="$(command -v python3 2>/dev/null || echo /usr/bin/python3)"
+  if [ -x /sbin/openrc-run ] && command -v rc-service >/dev/null 2>&1 && [ -d /run/openrc ]; then
+    cat > "/etc/init.d/\${TERM_UNIT}" <<EOF
+#!/sbin/openrc-run
+name="cdt-ddns-terminal"
+description="CDT DDNS Reverse WebSocket Terminal Agent (\${DDNS_FQDN})"
+command="\${PYTHON_BIN}"
+command_args="\${TERM_SCRIPT_PATH}"
+command_background="yes"
+pidfile="\${TERM_PID_FILE}"
+directory="/root"
+
+depend() {
+  need net
+  after firewall
+}
+
+start_pre() {
+  export HOME=/root
+}
+EOF
+    chmod 755 "/etc/init.d/\${TERM_UNIT}"
+    if command -v rc-update >/dev/null 2>&1; then
+      rc-update add "\${TERM_UNIT}" default >/dev/null 2>&1 || true
+    fi
+    rc-service "\${TERM_UNIT}" restart >/dev/null 2>&1 || rc-service "\${TERM_UNIT}" start >/dev/null 2>&1 || true
+    echo "✅ 已启用 Alpine OpenRC 免密反向终端常驻服务: \${TERM_UNIT} (开机自启，无需开放 SSH 端口)"
+    return 0
+  fi
+  if [ -f "\${TERM_PID_FILE}" ]; then
+    OLD_PID="$(cat "\${TERM_PID_FILE}" 2>/dev/null || true)"
+    [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null || true
+  fi
+  nohup "\${PYTHON_BIN}" "\${TERM_SCRIPT_PATH}" </dev/null >/dev/null 2>&1 &
+  printf '%s' "$!" > "\${TERM_PID_FILE}"
+  echo "✅ 已后台启动免密反向终端服务 (PID $(cat "\${TERM_PID_FILE}"))"
+}
 
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   cat > "/etc/systemd/system/\${UNIT}.service" <<EOF
@@ -940,18 +1028,15 @@ EOF
   fi
 elif command -v crontab >/dev/null 2>&1; then
   (crontab -l 2>/dev/null | grep -v "# \${UNIT}" || true; echo "\${CRON_EXPR} \${SCRIPT_PATH} >/dev/null 2>&1 # \${UNIT}") | crontab -
-  echo "✅ 已写入 crontab 定时任务: \${CRON_EXPR} (注释标记 # \${UNIT})"
-  if [ -x "\${TERM_SCRIPT_PATH}" ]; then
-    if [ -f "\${TERM_PID_FILE}" ]; then
-      OLD_PID="$(cat "\${TERM_PID_FILE}" 2>/dev/null || true)"
-      [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null || true
-    fi
-    nohup python3 "\${TERM_SCRIPT_PATH}" >/dev/null 2>&1 &
-    printf '%s' "$!" > "\${TERM_PID_FILE}"
-    echo "✅ 已后台启动免密反向终端服务 (PID $(cat "\${TERM_PID_FILE}"))"
+  if command -v rc-service >/dev/null 2>&1 && [ -d /run/openrc ]; then
+    command -v rc-update >/dev/null 2>&1 && rc-update add crond default >/dev/null 2>&1 || true
+    rc-service crond status >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
   fi
+  echo "✅ 已写入 crontab 定时任务: \${CRON_EXPR} (注释标记 # \${UNIT})"
+  start_term_non_systemd
 else
   echo "⚠️ 未检测到 systemd 或 crontab，已安装脚本至 \${SCRIPT_PATH}，请手动加入计划任务"
+  start_term_non_systemd
 fi
 
 if [ "\${CDT_DDNS_SKIP_FIRST_RUN:-0}" != "1" ]; then

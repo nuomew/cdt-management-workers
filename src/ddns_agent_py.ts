@@ -7,7 +7,7 @@
  * and most Linux servers without `pip install`.
  */
 
-export const DDNS_AGENT_VERSION = "2";
+export const DDNS_AGENT_VERSION = "3";
 
 /**
  * Render the standalone Python 3 reverse WebSocket PTY daemon script.
