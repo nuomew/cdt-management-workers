@@ -110,6 +110,24 @@ export interface ValidationRecordResult {
   action: "created" | "updated" | "unchanged";
 }
 
+export interface ValidationRecordCleanupMatch {
+  /** Certificate domain used to resolve root domain / zone when not already stored. */
+  domain: string;
+  subDomain?: string;
+  fullHost?: string;
+  type?: string;
+  value?: string;
+}
+
+export interface ValidationRecordDeleteResult {
+  /** True when the temporary validation record is deleted or confirmed absent. */
+  cleared: boolean;
+  /** Number of remote DNS records actually deleted during this call. */
+  deletedCount: number;
+  /** True when this DNS account does not host the target domain. */
+  notHosted?: boolean;
+}
+
 function isDryRun(env: Env): boolean {
   return env.CDT_DRY_RUN === "1";
 }
@@ -982,6 +1000,34 @@ export async function resolveDomainZone(
   return { rootDomain: best.name, zoneId: best.id };
 }
 
+const VALIDATION_RECORD_REMARK = "SSL auto validation";
+
+function normalizeValidationValue(type: string, value: string): string {
+  const unquoted = value.trim().replace(/^"+|"+$/g, "").trim();
+  if (type.toUpperCase() === "CNAME") {
+    return unquoted.replace(/\.+$/, "").toLowerCase();
+  }
+  return unquoted;
+}
+
+function isDedicatedValidationHost(hostName: string): boolean {
+  const firstLabel = hostName.trim().toLowerCase().split(".")[0] ?? "";
+  return firstLabel.startsWith("_");
+}
+
+function isDnsRecordMissingError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("404") ||
+    lower.includes("recordidinvalid") ||
+    lower.includes("resourcenotfound") ||
+    lower.includes("does not exist") ||
+    lower.includes("not found") ||
+    msg.includes("不存在") ||
+    msg.includes("记录编号错误")
+  );
+}
+
 /**
  * Idempotently create or update the TXT/CNAME validation record required by
  * Tencent Cloud SSL CA verification.
@@ -1007,6 +1053,7 @@ export async function upsertValidationRecord(
   if (!value) {
     throw new Error("证书验证记录值为空，无法自动写入 DNS");
   }
+  const normTargetVal = normalizeValidationValue(spec.type, value);
 
   const existingRecords = await listRecords(env, account, rootDomain, zoneId, {
     type: spec.type,
@@ -1019,7 +1066,7 @@ export async function upsertValidationRecord(
 
   // Exact match already present -> reuse cleanly (idempotent).
   const exact = matching.find(
-    (r) => r.value.trim().replace(/^"|"$/g, "") === value.replace(/^"|"$/g, "") && r.enabled,
+    (r) => normalizeValidationValue(spec.type, r.value) === normTargetVal && r.enabled,
   );
   if (exact) {
     return {
@@ -1034,19 +1081,24 @@ export async function upsertValidationRecord(
     };
   }
 
-  // Existing record on same host & type with stale value -> update in place
-  // (avoids CNAME collisions and stale verification tokens on renewal).
-  if (matching.length > 0) {
-    const target = matching[0]!;
-    const updated = await updateRecord(env, account, rootDomain, zoneId, target.id, {
+  // Only update an existing record in place when it is a dedicated `_...` validation
+  // host, a CNAME (which cannot coexist with duplicates), or previously created by us.
+  // This avoids overwriting unrelated TXT records (e.g. SPF/DMARC) on apex/business hosts.
+  const reusable =
+    spec.type === "CNAME" || isDedicatedValidationHost(hostName)
+      ? matching[0]
+      : matching.find((r) => r.remark.trim() === VALIDATION_RECORD_REMARK);
+
+  if (reusable) {
+    const updated = await updateRecord(env, account, rootDomain, zoneId, reusable.id, {
       name: hostName,
       type: spec.type,
       value,
       ttl: account.provider === "tencent" ? 600 : 60,
-      line: account.provider === "tencent" ? target.line || "默认" : undefined,
+      line: account.provider === "tencent" ? reusable.line || "默认" : undefined,
       proxied: false,
       enabled: true,
-      remark: "SSL auto validation",
+      remark: VALIDATION_RECORD_REMARK,
     });
     return {
       rootDomain,
@@ -1068,7 +1120,7 @@ export async function upsertValidationRecord(
     line: account.provider === "tencent" ? "默认" : undefined,
     proxied: false,
     enabled: true,
-    remark: "SSL auto validation",
+    remark: VALIDATION_RECORD_REMARK,
   });
   return {
     rootDomain,
@@ -1083,8 +1135,10 @@ export async function upsertValidationRecord(
 }
 
 /**
- * Best-effort cleanup of a temporary validation DNS record once the certificate
- * has been issued. Missing/already-deleted records are ignored safely.
+ * Clean up temporary validation DNS record(s) once domain verification completes
+ * or terminates. Deletes by tracked `recordId` and, when `match` metadata is
+ * available, also removes any remaining TXT/CNAME records matching the exact
+ * validation host, type, and value (without ever touching unrelated business records).
  */
 export async function deleteValidationRecord(
   env: Env,
@@ -1092,22 +1146,114 @@ export async function deleteValidationRecord(
   rootDomain: string,
   zoneId: string,
   recordId: string,
-): Promise<boolean> {
-  if (!rootDomain || !recordId) return false;
-  try {
-    await deleteRecord(env, account, rootDomain, zoneId, recordId);
-    return true;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (
-      msg.includes("404") ||
-      msg.includes("RecordIdInvalid") ||
-      msg.includes("does not exist") ||
-      msg.includes("不存在")
-    ) {
-      return false;
+  match?: ValidationRecordCleanupMatch,
+): Promise<ValidationRecordDeleteResult> {
+  let root = cleanHost(rootDomain);
+  let zid = (zoneId ?? "").trim();
+  const cleanRecordId = (recordId ?? "").trim();
+
+  if ((!root || (account.provider === "cloudflare" && !zid)) && match?.domain) {
+    try {
+      const resolved = await resolveDomainZone(env, account, match.domain);
+      root = resolved.rootDomain;
+      zid = resolved.zoneId;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("未在所选")) {
+        return { cleared: false, deletedCount: 0, notHosted: true };
+      }
+      console.warn("failed to resolve DNS zone for validation cleanup", msg);
+      return { cleared: false, deletedCount: 0 };
     }
-    console.warn("failed to clean temporary SSL validation DNS record", msg);
-    return false;
   }
+  if (!root) {
+    return { cleared: false, deletedCount: 0 };
+  }
+
+  let deletedCount = 0;
+  let hadError = false;
+  let attempted = false;
+  const deletedIds = new Set<string>();
+
+  // 1. Delete the tracked record ID first if present.
+  if (cleanRecordId) {
+    attempted = true;
+    try {
+      await deleteRecord(env, account, root, zid, cleanRecordId);
+      deletedCount += 1;
+      deletedIds.add(cleanRecordId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isDnsRecordMissingError(msg)) {
+        deletedIds.add(cleanRecordId);
+      } else {
+        hadError = true;
+        console.warn("failed to clean temporary SSL validation DNS record by id", msg);
+      }
+    }
+  }
+
+  // 2. Fallback / duplicate sweep by exact (fullHost, type, value) for TXT/CNAME records.
+  const rawType = (match?.type ?? "").trim().toUpperCase();
+  const rawValue = (match?.value ?? "").trim();
+  const rawFullHost = (match?.fullHost ?? "").trim();
+  const rawSubDomain = (match?.subDomain ?? "").trim();
+  if ((rawType === "TXT" || rawType === "CNAME") && rawValue && (rawFullHost || rawSubDomain)) {
+    attempted = true;
+    const candidateHosts = new Set<string>();
+    if (rawFullHost) {
+      candidateHosts.add(cleanHost(toFqdn(toRelativeHost(rawFullHost, root), root)));
+    }
+    if (rawSubDomain) {
+      // CA DvAuthSubDomain is normally relative to the apex/root zone (e.g. `_dnsauth.api` under `example.com`),
+      // but may also be relative to the target subdomain (`_dnsauth` under `api.example.com`).
+      candidateHosts.add(cleanHost(toFqdn(toRelativeHost(rawSubDomain, root), root)));
+      const cleanCertDomain = cleanHost(match?.domain ?? "");
+      if (cleanCertDomain && cleanCertDomain !== root && cleanCertDomain.endsWith(`.${root}`)) {
+        const subPrefix = cleanCertDomain.slice(0, -(root.length + 1));
+        const cleanSub = cleanHost(rawSubDomain);
+        if (cleanSub && cleanSub !== subPrefix && !cleanSub.endsWith(`.${subPrefix}`)) {
+          candidateHosts.add(cleanHost(toFqdn(cleanSub, cleanCertDomain)));
+        }
+      }
+    }
+    const targetNormVal = normalizeValidationValue(rawType, rawValue);
+    try {
+      const records = await listRecords(env, account, root, zid, { type: rawType });
+      const matched = records.filter(
+        (r) =>
+          !deletedIds.has(r.id) &&
+          r.type.toUpperCase() === rawType &&
+          candidateHosts.has(cleanHost(r.full_name)) &&
+          normalizeValidationValue(rawType, r.value) === targetNormVal,
+      );
+      for (const rec of matched) {
+        try {
+          await deleteRecord(env, account, root, rec.zone_id || zid, rec.id);
+          deletedCount += 1;
+          deletedIds.add(rec.id);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (isDnsRecordMissingError(msg)) {
+            deletedIds.add(rec.id);
+          } else {
+            hadError = true;
+            console.warn("failed to clean matched SSL validation DNS record", msg);
+          }
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Only treat list error as blocking if we didn't already confirm the tracked ID gone.
+      if (!cleanRecordId || hadError) {
+        hadError = true;
+      }
+      console.warn("failed to list DNS records during validation cleanup", msg);
+    }
+  }
+
+  return {
+    cleared: attempted && !hadError,
+    deletedCount,
+  };
 }

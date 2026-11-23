@@ -4295,6 +4295,14 @@ app.get("/api/v1/certs/:id/detail", async (c) => {
       verification = await tencentSsl
         .checkTencentDomainVerification(c.env, creds, cert.pending_cert_id || targetCertId)
         .catch(() => null);
+    } else if (
+      detail.status === 1 &&
+      !cert.pending_cert_id &&
+      (cert.dns_record_id || cert.dns_record_written || cert.dv_auth_value || detail.dvAuth)
+    ) {
+      await tencentSsl
+        .cleanupManagedValidationDns(c.env, cert, detail.dvAuth)
+        .catch(() => undefined);
     }
     return c.json({
       ok: true,
@@ -4365,6 +4373,11 @@ app.delete("/api/v1/certs/:id", async (c) => {
     } catch (err) {
       remoteError = err instanceof Error ? err.message : String(err);
     }
+  }
+  if (cert.dns_record_id || cert.dns_record_written || cert.dv_auth_value) {
+    await tencentSsl
+      .cleanupManagedValidationDns(c.env, cert, null, { clearDbState: false })
+      .catch(() => undefined);
   }
   await repo.deleteSslCertificate(c.env, id);
   await repo.addEvent(c.env, "ssl", messages.ev("SSL 托管证书已移除", messages.objServer(cert.domain)), {

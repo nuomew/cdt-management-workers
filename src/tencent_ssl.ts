@@ -909,28 +909,116 @@ async function writeDnsValidationIfNeeded(
   };
 }
 
-async function cleanupValidationDnsIfConfigured(
+const CLEAR_VALIDATION_DNS_PATCH: Partial<repo.SslCertificateCreateInput> = {
+  dns_record_id: "",
+  dns_record_written: false,
+  dv_auth_domain: "",
+  dv_auth_sub_domain: "",
+  dv_auth_type: "",
+  dv_auth_value: "",
+};
+
+function hasPendingValidationDnsCleanup(cert: SslCertificateRecord): boolean {
+  return Boolean(cert.dns_record_id || cert.dns_record_written || cert.dv_auth_value);
+}
+
+/**
+ * Clean up temporary DNS validation records once domain verification has completed
+ * or terminated. Supports both explicit `dns_account` bindings (DNSPod/Cloudflare)
+ * and `tencent_auto` / imported certs by matching tracked `recordId` and exact
+ * `(fullHost, type, value)` against configured DNS accounts.
+ */
+export async function cleanupManagedValidationDns(
   env: Env,
   cert: SslCertificateRecord,
-): Promise<boolean> {
-  if (
-    !cert.clean_dns_after_issue ||
-    cert.dns_verify_mode !== "dns_account" ||
-    !cert.dns_account_id ||
-    !cert.dns_record_id ||
-    !cert.dns_root_domain
-  ) {
-    return false;
+  dvAuthOverride?: DvAuthInfo | null,
+  opts?: { force?: boolean; clearDbState?: boolean },
+): Promise<{ cleared: boolean; deletedCount: number }> {
+  const clearDbState = opts?.clearDbState !== false;
+  if (!opts?.force && !cert.clean_dns_after_issue) {
+    return { cleared: false, deletedCount: 0 };
   }
-  const dnsAccount = await repo.getDnsAccount(env, cert.dns_account_id, true);
-  if (!dnsAccount) return false;
-  return dnsProviders.deleteValidationRecord(
-    env,
-    dnsAccount,
-    cert.dns_root_domain,
-    cert.dns_zone_id,
-    cert.dns_record_id,
+
+  const dvDomain = (dvAuthOverride?.domain || cert.dv_auth_domain || cert.domain).trim();
+  const dvSub = (dvAuthOverride?.subDomain || cert.dv_auth_sub_domain).trim();
+  const dvFullHost = (dvAuthOverride?.fullHost ?? "").trim();
+  const dvType = (dvAuthOverride?.verifyType || cert.dv_auth_type).trim().toUpperCase();
+  const dvValue = (dvAuthOverride?.value || cert.dv_auth_value).trim();
+
+  const hasExactMatch = Boolean(
+    dvValue && (dvFullHost || dvSub) && (dvType === "TXT" || dvType === "CNAME"),
   );
+  const hasRecordId = Boolean(cert.dns_record_id);
+
+  if (!hasRecordId && !hasExactMatch) {
+    // Nothing trackable to delete remotely (e.g. tencent_auto without saved dv_auth);
+    // clear stale local written flag if set so Cron doesn't spin.
+    if (clearDbState && cert.id > 0 && hasPendingValidationDnsCleanup(cert)) {
+      await repo.updateSslCertificate(env, cert.id, CLEAR_VALIDATION_DNS_PATCH);
+    }
+    return { cleared: true, deletedCount: 0 };
+  }
+
+  const match: dnsProviders.ValidationRecordCleanupMatch = {
+    domain: dvDomain || cert.domain,
+    subDomain: dvSub || undefined,
+    fullHost: dvFullHost || undefined,
+    type: dvType || undefined,
+    value: dvValue || undefined,
+  };
+
+  // Build ordered candidate DNS accounts: bound dns_account first, then same tencent
+  // account (covers tencent_auto), then any other configured DNS account hosting the domain.
+  const candidates: DnsAccountRecord[] = [];
+  const seenIds = new Set<number>();
+  const pushById = async (accountId: number) => {
+    if (!accountId || seenIds.has(accountId)) return;
+    seenIds.add(accountId);
+    const acct = await repo.getDnsAccount(env, accountId, true);
+    if (acct) candidates.push(acct);
+  };
+  await pushById(cert.dns_account_id);
+  await pushById(cert.tencent_account_id);
+  if (hasExactMatch) {
+    const allAccounts = await repo.listDnsAccounts(env, { decryptSecret: true });
+    for (const acct of allAccounts) {
+      if (!seenIds.has(acct.id)) {
+        seenIds.add(acct.id);
+        candidates.push(acct);
+      }
+    }
+  }
+
+  let totalDeleted = 0;
+  let foundHostingAccount = false;
+  let clearedOnHost = false;
+
+  for (const account of candidates) {
+    const isPrimaryBound = cert.dns_account_id > 0 && account.id === cert.dns_account_id;
+    const res = await dnsProviders.deleteValidationRecord(
+      env,
+      account,
+      isPrimaryBound ? cert.dns_root_domain : "",
+      isPrimaryBound ? cert.dns_zone_id : "",
+      isPrimaryBound ? cert.dns_record_id : "",
+      match,
+    );
+    if (res.notHosted) continue;
+    foundHostingAccount = true;
+    totalDeleted += res.deletedCount;
+    if (res.cleared) {
+      clearedOnHost = true;
+      break;
+    }
+  }
+
+  // If no configured DNS account hosts this domain (e.g. external manual DNS) and we
+  // don't hold an orphaned tracked recordId, clear local tracking cleanly.
+  const cleared = clearedOnHost || (!foundHostingAccount && !hasRecordId);
+  if (cleared && clearDbState && cert.id > 0 && hasPendingValidationDnsCleanup(cert)) {
+    await repo.updateSslCertificate(env, cert.id, CLEAR_VALIDATION_DNS_PATCH);
+  }
+  return { cleared, deletedCount: totalDeleted };
 }
 
 /**
@@ -1124,6 +1212,16 @@ export async function refreshManagedCertificate(
           patch.last_error = msg;
         }
       }
+
+      // If still status 0/4 right after CompleteCertificate, check whether CA already issued it.
+      if (detail.status === 0 || detail.status === 4) {
+        const ver = await checkTencentDomainVerification(env, creds, activeCertId).catch(() => null);
+        if (ver?.issued) {
+          detail = await describeTencentCertificateDetail(env, creds, activeCertId);
+          patch.tencent_status = detail.status;
+          patch.status_name = detail.statusName;
+        }
+      }
     }
   }
 
@@ -1147,15 +1245,13 @@ export async function refreshManagedCertificate(
 
     await repo.updateSslCertificate(env, id, patch);
 
-    // Cleanup temporary validation DNS record once issued.
+    // Cleanup temporary validation DNS record(s) once domain verification & issuance complete.
+    let dnsCleanupNote = "";
     const latestWithSecrets = await repo.getSslCertificate(env, id, true);
-    if (latestWithSecrets && latestWithSecrets.dns_record_id) {
-      const cleaned = await cleanupValidationDnsIfConfigured(env, latestWithSecrets);
-      if (cleaned) {
-        await repo.updateSslCertificate(env, id, {
-          dns_record_id: "",
-          dns_record_written: false,
-        });
+    if (latestWithSecrets && (hasPendingValidationDnsCleanup(latestWithSecrets) || detail.dvAuth)) {
+      const dnsClean = await cleanupManagedValidationDns(env, latestWithSecrets, detail.dvAuth);
+      if (dnsClean.deletedCount > 0) {
+        dnsCleanupNote = "；已自动删除临时验证解析";
       }
     }
 
@@ -1187,7 +1283,7 @@ export async function refreshManagedCertificate(
       justIssued = true;
       const actionTitle = isRenewalFlow ? "SSL 证书自动续签已签发" : "SSL 证书已签发";
       await repo.addEvent(env, "ssl", messages.ev(actionTitle, messages.objServer(cert.domain)), {
-        detail: `域名 ${cert.domain} 证书（ID: ${activeCertId}）已签发，有效期至 ${detail.certEndTime || "未知"}${oldCleanupNote}${edgeOneSyncNote}`,
+        detail: `域名 ${cert.domain} 证书（ID: ${activeCertId}）已签发，有效期至 ${detail.certEndTime || "未知"}${dnsCleanupNote}${oldCleanupNote}${edgeOneSyncNote}`,
       });
       await notifyCertEvent(env, "ssl_issued", `✅ ${actionTitle}：${cert.domain}`, [
         `域名：${cert.domain}`,
@@ -1195,6 +1291,7 @@ export async function refreshManagedCertificate(
         `生效时间：${detail.certBeginTime || "-"}`,
         `到期时间：${detail.certEndTime || "-"}`,
         `下次自动续签：到期前 ${cert.renew_before_days} 天`,
+        ...(dnsCleanupNote ? [`验证解析：${dnsCleanupNote.replace(/^；/, "")}`] : []),
         ...(oldCleanupNote ? [`旧证清理：${oldCleanupNote.replace(/^；/, "")}`] : []),
         ...(edgeOneSyncNote ? [`EdgeOne 联动：${edgeOneSyncNote.replace(/^；/, "")}`] : []),
       ]);
@@ -1205,13 +1302,19 @@ export async function refreshManagedCertificate(
     if (isRenewalFlow) {
       // Preserve current issued cert; clear failed pending renewal so next window can retry.
       patch.pending_cert_id = "";
-      patch.dns_record_written = false;
       patch.status =
         cert.cert_end_ts > 0 && cert.cert_end_ts <= checkedAt ? "expired" : "issued";
     } else {
       patch.status = "failed";
     }
     await repo.updateSslCertificate(env, id, patch);
+
+    // Verification terminated/failed: remove any temporary DNS validation record occupation.
+    const latestWithSecrets = await repo.getSslCertificate(env, id, true);
+    if (latestWithSecrets && (hasPendingValidationDnsCleanup(latestWithSecrets) || detail.dvAuth)) {
+      await cleanupManagedValidationDns(env, latestWithSecrets, detail.dvAuth);
+    }
+
     await repo.addEvent(env, "ssl", messages.ev("SSL 证书审核失败", messages.objServer(cert.domain)), {
       level: "error",
       detail: `证书 ${activeCertId}：${reason}`,
@@ -1224,6 +1327,12 @@ export async function refreshManagedCertificate(
   } else if (detail.status === 3) {
     if (!isRenewalFlow) patch.status = "expired";
     await repo.updateSslCertificate(env, id, patch);
+    if (!isRenewalFlow) {
+      const latestWithSecrets = await repo.getSslCertificate(env, id, true);
+      if (latestWithSecrets && hasPendingValidationDnsCleanup(latestWithSecrets)) {
+        await cleanupManagedValidationDns(env, latestWithSecrets, detail.dvAuth);
+      }
+    }
   } else {
     // Still pending / verifying
     if (!isRenewalFlow) {
@@ -1257,6 +1366,11 @@ export async function renewManagedCertificate(
 }> {
   const cert = await repo.getSslCertificate(env, id, true);
   if (!cert) throw new Error("证书记录不存在");
+
+  // Clean up any leftover validation DNS record before overwriting tracking fields.
+  if (hasPendingValidationDnsCleanup(cert)) {
+    await cleanupManagedValidationDns(env, cert, null, { clearDbState: false });
+  }
 
   const creds = await resolveTencentCredsForCert(env, cert);
   const now = nowSeconds();
@@ -1380,6 +1494,9 @@ export async function syncAccountCertificates(
       if (!keepLocalForPendingRenew) {
         const delRes = await tryDeleteRemoteCert(env, creds, item.certificateId);
         if (existing) {
+          if (hasPendingValidationDnsCleanup(existing)) {
+            await cleanupManagedValidationDns(env, existing, null, { clearDbState: false });
+          }
           await repo.deleteSslCertificate(env, existing.id);
         }
         if (delRes.deleted || existing) {
@@ -1412,6 +1529,13 @@ export async function syncAccountCertificates(
         cert_end_ts: item.certEndTs,
         last_checked_at: now,
       });
+      if (
+        !existing.pending_cert_id &&
+        (mappedStatus === "issued" || mappedStatus === "failed") &&
+        hasPendingValidationDnsCleanup(existing)
+      ) {
+        await cleanupManagedValidationDns(env, existing);
+      }
       updated += 1;
       continue;
     }
@@ -1512,6 +1636,10 @@ async function cleanupObsoleteAndExpiredCertificates(
     const shouldDelete = isSupersededByNewer || (isExpired && !cert.auto_renew);
     if (!shouldDelete) continue;
 
+    if (hasPendingValidationDnsCleanup(cert)) {
+      await cleanupManagedValidationDns(env, cert, null, { clearDbState: false });
+    }
+
     let remoteDeleted = false;
     if (cert.cert_id) {
       try {
@@ -1580,14 +1708,37 @@ export async function reconcileCertificates(
     return summary;
   }
 
-  // Phase 1: Advance all in-flight applications & renewals.
+  // Phase 1: Advance all in-flight applications & renewals, and retry any lingering
+  // temporary DNS validation record cleanups for already-finished certificates.
   if (shouldPollPending) {
     for (const cert of certs) {
       const inFlight =
         Boolean(cert.pending_cert_id) ||
         cert.status === "pending_dns" ||
         cert.status === "verifying";
-      if (!inFlight) continue;
+      if (!inFlight) {
+        if (cert.clean_dns_after_issue && hasPendingValidationDnsCleanup(cert)) {
+          try {
+            const dnsClean = await cleanupManagedValidationDns(env, cert);
+            if (dnsClean.deletedCount > 0) {
+              summary.cleaned += dnsClean.deletedCount;
+              await repo.addEvent(
+                env,
+                "ssl",
+                messages.ev("SSL 临时验证解析已自动清理", messages.objServer(cert.domain)),
+                {
+                  detail: `证书验证已完成，已自动补删残留验证解析记录（${dnsClean.deletedCount} 条）`,
+                },
+              );
+            }
+          } catch (err) {
+            summary.errors.push(
+              `${cert.domain} 清理验证解析失败: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+        continue;
+      }
       summary.checked += 1;
       try {
         const res = await refreshManagedCertificate(env, cert.id, {
