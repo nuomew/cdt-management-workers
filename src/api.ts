@@ -59,6 +59,7 @@ import * as swas from "./swas";
 import * as analytics from "./analytics";
 import * as dnsProviders from "./dns_providers";
 import * as tencentSsl from "./tencent_ssl";
+import * as tencentEdgeOne from "./tencent_edgeone";
 import {
   BRAND,
   CSRF_COOKIE,
@@ -4374,6 +4375,416 @@ app.delete("/api/v1/certs/:id", async (c) => {
         : `已删除面板托管记录（腾讯云侧证书保留）`,
   });
   return c.json({ ok: true, remote_error: remoteError || undefined });
+});
+
+// -- Tencent Cloud EdgeOne (TEO) CDN Service ----------------------------------
+
+function parseEdgeOneAccountId(raw: string | number | undefined): number {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw invalid("请选择有效的腾讯云账号");
+  }
+  return n;
+}
+
+function parseEdgeOneZoneId(raw: string | undefined): string {
+  const z = (raw ?? "").trim();
+  if (!z || z.length > 128) throw invalid("无效的站点 ID");
+  return z;
+}
+
+app.get("/api/v1/edgeone/accounts", async (c) => {
+  await requireAdmin(c);
+  const tencentAccounts = (
+    await repo.listDnsAccounts(c.env, { provider: "tencent", decryptSecret: false })
+  ).map(sanitizeDnsAccount);
+  const certs = await repo.listSslCertificates(c.env, false);
+  const bindings = await repo.listEdgeOneCertBindings(c.env);
+  return c.json({
+    accounts: tencentAccounts,
+    managed_certs: certs.map((item) => ({
+      id: item.id,
+      domain: item.domain,
+      cert_id: item.cert_id,
+      status: item.status,
+      cert_end_time: item.cert_end_time,
+      cert_end_ts: item.cert_end_ts,
+      auto_renew: item.auto_renew,
+      tencent_account_id: item.tencent_account_id,
+    })),
+    bindings,
+  });
+});
+
+app.get("/api/v1/edgeone/zones", async (c) => {
+  await requireAdmin(c);
+  const accountId = parseEdgeOneAccountId(c.req.query("account_id"));
+  const site = tencentEdgeOne.normalizeSite(c.req.query("site"));
+  try {
+    const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
+    const items = await tencentEdgeOne.listZones(c.env, creds);
+    return c.json({ items, site });
+  } catch (err) {
+    throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.get("/api/v1/edgeone/zones/:zoneId/domains", async (c) => {
+  await requireAdmin(c);
+  const zoneId = parseEdgeOneZoneId(c.req.param("zoneId"));
+  const accountId = parseEdgeOneAccountId(c.req.query("account_id"));
+  const site = tencentEdgeOne.normalizeSite(c.req.query("site"));
+  try {
+    const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
+    const [domains, bindings, certs] = await Promise.all([
+      tencentEdgeOne.listAccelerationDomains(c.env, creds, zoneId),
+      repo.listEdgeOneCertBindings(c.env, { tencentAccountId: accountId, site, zoneId }),
+      repo.listSslCertificates(c.env, false),
+    ]);
+    const certById = new Map(certs.map((x) => [x.id, x]));
+    const bindingByDomain = new Map(bindings.map((b) => [b.domain.toLowerCase(), b]));
+    const items = domains.map((d) => {
+      const binding = bindingByDomain.get(d.domainName.toLowerCase()) ?? null;
+      const sslCert = binding ? certById.get(binding.ssl_cert_id) ?? null : null;
+      return {
+        ...d,
+        certBinding: binding
+          ? {
+              ...binding,
+              ssl_domain: sslCert?.domain ?? "",
+              ssl_cert_current_id: sslCert?.cert_id ?? "",
+              ssl_auto_renew: sslCert?.auto_renew ?? false,
+            }
+          : null,
+      };
+    });
+    return c.json({ items });
+  } catch (err) {
+    throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/edgeone/zones/:zoneId/domains", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const zoneId = parseEdgeOneZoneId(c.req.param("zoneId"));
+  const payload = await jsonBody(c);
+  const accountId = parseEdgeOneAccountId(payload["account_id"] as number | string | undefined);
+  const site = tencentEdgeOne.normalizeSite(strOf(payload["site"]));
+  const domainName = strOf(payload["domain_name"]).trim().toLowerCase();
+  const origin = strOf(payload["origin"]).trim();
+  if (!domainName || !domainName.includes(".")) throw invalid("请输入有效的加速域名");
+  if (!origin) throw invalid("请输入源站地址（公网 IP 或源站域名）");
+
+  const originProtocolRaw = strOf(payload["origin_protocol"]).trim().toUpperCase();
+  const originProtocol: "FOLLOW" | "HTTP" | "HTTPS" =
+    originProtocolRaw === "HTTP" || originProtocolRaw === "HTTPS" ? originProtocolRaw : "FOLLOW";
+  const ipv6Raw = strOf(payload["ipv6_status"]).trim().toLowerCase();
+  const ipv6Status: "follow" | "on" | "off" =
+    ipv6Raw === "on" || ipv6Raw === "off" ? ipv6Raw : "follow";
+
+  try {
+    const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
+    const res = await tencentEdgeOne.createAccelerationDomain(c.env, creds, zoneId, {
+      domainName,
+      origin,
+      originType: strOf(payload["origin_type"]).trim() || "IP_DOMAIN",
+      backupOrigin: strOf(payload["backup_origin"]).trim(),
+      hostHeader: strOf(payload["host_header"]).trim(),
+      originProtocol,
+      httpOriginPort: numOf(payload["http_origin_port"], 80),
+      httpsOriginPort: numOf(payload["https_origin_port"], 443),
+      ipv6Status,
+    });
+    await repo.addEvent(
+      c.env,
+      "dns",
+      messages.ev("EdgeOne 加速域名已创建", messages.objServer(domainName)),
+      { detail: `站点 ${zoneId} · 源站 ${origin} · 回源 ${originProtocol}` },
+    );
+    return c.json({ ok: true, ownership_verification: res.ownershipVerification });
+  } catch (err) {
+    throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.put("/api/v1/edgeone/zones/:zoneId/domains/:domain", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const zoneId = parseEdgeOneZoneId(c.req.param("zoneId"));
+  const domainName = decodeURIComponent(c.req.param("domain")).trim().toLowerCase();
+  const payload = await jsonBody(c);
+  const accountId = parseEdgeOneAccountId(payload["account_id"] as number | string | undefined);
+  const site = tencentEdgeOne.normalizeSite(strOf(payload["site"]));
+  const origin = strOf(payload["origin"]).trim();
+  if (!domainName) throw invalid("缺少加速域名");
+  if (!origin) throw invalid("请输入源站地址");
+
+  const originProtocolRaw = strOf(payload["origin_protocol"]).trim().toUpperCase();
+  const originProtocol: "FOLLOW" | "HTTP" | "HTTPS" =
+    originProtocolRaw === "HTTP" || originProtocolRaw === "HTTPS" ? originProtocolRaw : "FOLLOW";
+  const ipv6Raw = strOf(payload["ipv6_status"]).trim().toLowerCase();
+  const ipv6Status: "follow" | "on" | "off" =
+    ipv6Raw === "on" || ipv6Raw === "off" ? ipv6Raw : "follow";
+
+  try {
+    const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
+    await tencentEdgeOne.modifyAccelerationDomain(c.env, creds, zoneId, {
+      domainName,
+      origin,
+      originType: strOf(payload["origin_type"]).trim() || "IP_DOMAIN",
+      backupOrigin: strOf(payload["backup_origin"]).trim(),
+      hostHeader: strOf(payload["host_header"]).trim(),
+      originProtocol,
+      httpOriginPort: numOf(payload["http_origin_port"], 80),
+      httpsOriginPort: numOf(payload["https_origin_port"], 443),
+      ipv6Status,
+    });
+    await repo.addEvent(
+      c.env,
+      "dns",
+      messages.ev("EdgeOne 源站配置已更新", messages.objServer(domainName)),
+      { detail: `站点 ${zoneId} · 源站 ${origin} · 回源 ${originProtocol}` },
+    );
+    return c.json({ ok: true });
+  } catch (err) {
+    throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/edgeone/zones/:zoneId/domains/:domain/status", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const zoneId = parseEdgeOneZoneId(c.req.param("zoneId"));
+  const domainName = decodeURIComponent(c.req.param("domain")).trim().toLowerCase();
+  const payload = await jsonBody(c);
+  const accountId = parseEdgeOneAccountId(payload["account_id"] as number | string | undefined);
+  const site = tencentEdgeOne.normalizeSite(strOf(payload["site"]));
+  const statusRaw = strOf(payload["status"]).trim().toLowerCase();
+  if (statusRaw !== "online" && statusRaw !== "offline") {
+    throw invalid("状态仅支持 online 或 offline");
+  }
+  try {
+    const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
+    await tencentEdgeOne.setAccelerationDomainStatus(c.env, creds, zoneId, domainName, statusRaw);
+    await repo.addEvent(
+      c.env,
+      "dns",
+      messages.ev(
+        statusRaw === "online" ? "EdgeOne 加速域名已启用" : "EdgeOne 加速域名已停用",
+        messages.objServer(domainName),
+      ),
+      { detail: `站点 ${zoneId}` },
+    );
+    return c.json({ ok: true, status: statusRaw });
+  } catch (err) {
+    throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.delete("/api/v1/edgeone/zones/:zoneId/domains/:domain", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const zoneId = parseEdgeOneZoneId(c.req.param("zoneId"));
+  const domainName = decodeURIComponent(c.req.param("domain")).trim().toLowerCase();
+  const accountId = parseEdgeOneAccountId(c.req.query("account_id"));
+  const site = tencentEdgeOne.normalizeSite(c.req.query("site"));
+  try {
+    const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
+    await tencentEdgeOne.deleteAccelerationDomain(c.env, creds, zoneId, domainName, true);
+    await repo.deleteEdgeOneCertBindingByHost(c.env, accountId, site, zoneId, domainName);
+    await repo.addEvent(
+      c.env,
+      "dns",
+      messages.ev("EdgeOne 加速域名已删除", messages.objServer(domainName)),
+      { detail: `站点 ${zoneId}` },
+    );
+    return c.json({ ok: true });
+  } catch (err) {
+    throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/edgeone/zones/:zoneId/purge", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const zoneId = parseEdgeOneZoneId(c.req.param("zoneId"));
+  const payload = await jsonBody(c);
+  const accountId = parseEdgeOneAccountId(payload["account_id"] as number | string | undefined);
+  const site = tencentEdgeOne.normalizeSite(strOf(payload["site"]));
+  const typeRaw = strOf(payload["type"]).trim();
+  if (
+    typeRaw !== "purge_url" &&
+    typeRaw !== "purge_prefix" &&
+    typeRaw !== "purge_host" &&
+    typeRaw !== "purge_all"
+  ) {
+    throw invalid("刷新类型仅支持 purge_url、purge_prefix、purge_host 或 purge_all");
+  }
+  const methodRaw = strOf(payload["method"]).trim();
+  const method: "invalidate" | "delete" = methodRaw === "delete" ? "delete" : "invalidate";
+  const targets = Array.isArray(payload["targets"])
+    ? payload["targets"].map((v) => String(v ?? "").trim()).filter(Boolean)
+    : [];
+
+  try {
+    const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
+    const res = await tencentEdgeOne.createPurgeTask(c.env, creds, zoneId, {
+      type: typeRaw,
+      method,
+      targets,
+    });
+    await repo.addEvent(
+      c.env,
+      "dns",
+      messages.ev("EdgeOne 缓存清理已提交", messages.objServer(zoneId)),
+      {
+        detail: `类型 ${typeRaw}${typeRaw !== "purge_all" ? ` · 共 ${targets.length} 项` : ""} · 任务 ID ${res.jobId || "-"}`,
+      },
+    );
+    return c.json({ ok: true, job_id: res.jobId, failed_list: res.failedList });
+  } catch (err) {
+    throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/edgeone/zones/:zoneId/prefetch", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const zoneId = parseEdgeOneZoneId(c.req.param("zoneId"));
+  const payload = await jsonBody(c);
+  const accountId = parseEdgeOneAccountId(payload["account_id"] as number | string | undefined);
+  const site = tencentEdgeOne.normalizeSite(strOf(payload["site"]));
+  const targets = Array.isArray(payload["targets"])
+    ? payload["targets"].map((v) => String(v ?? "").trim()).filter(Boolean)
+    : [];
+
+  try {
+    const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
+    const res = await tencentEdgeOne.createPrefetchTask(c.env, creds, zoneId, targets);
+    await repo.addEvent(
+      c.env,
+      "dns",
+      messages.ev("EdgeOne 缓存预热已提交", messages.objServer(zoneId)),
+      { detail: `共 ${targets.length} 条 URL · 任务 ID ${res.jobId || "-"}` },
+    );
+    return c.json({ ok: true, job_id: res.jobId, failed_list: res.failedList });
+  } catch (err) {
+    throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.get("/api/v1/edgeone/zones/:zoneId/tasks", async (c) => {
+  await requireAdmin(c);
+  const zoneId = parseEdgeOneZoneId(c.req.param("zoneId"));
+  const accountId = parseEdgeOneAccountId(c.req.query("account_id"));
+  const site = tencentEdgeOne.normalizeSite(c.req.query("site"));
+  const kind = c.req.query("kind") === "prefetch" ? "prefetch" : "purge";
+  try {
+    const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
+    const res = await tencentEdgeOne.listCacheTasks(c.env, creds, zoneId, kind, 50);
+    return c.json({ ok: true, kind, total: res.total, items: res.items });
+  } catch (err) {
+    throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/edgeone/zones/:zoneId/cert", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const zoneId = parseEdgeOneZoneId(c.req.param("zoneId"));
+  const payload = await jsonBody(c);
+  const accountId = parseEdgeOneAccountId(payload["account_id"] as number | string | undefined);
+  const site = tencentEdgeOne.normalizeSite(strOf(payload["site"]));
+  const domain = strOf(payload["domain"]).trim().toLowerCase();
+  const zoneName = strOf(payload["zone_name"]).trim();
+  const modeRaw = strOf(payload["mode"]).trim().toLowerCase();
+  if (!domain) throw invalid("请选择需要配置证书的加速域名");
+  if (modeRaw !== "sslcert" && modeRaw !== "eofreecert" && modeRaw !== "none") {
+    throw invalid("证书模式仅支持 sslcert、eofreecert 或 none");
+  }
+
+  const sslCertRowId = Math.trunc(numOf(payload["ssl_cert_id"], 0));
+  const autoSync = payload["auto_sync"] !== false;
+  let certId = strOf(payload["cert_id"]).trim();
+
+  if (modeRaw === "sslcert" && sslCertRowId > 0) {
+    const managed = await repo.getSslCertificate(c.env, sslCertRowId, false);
+    if (!managed) throw invalid("所选面板托管证书不存在");
+    if (!managed.cert_id) throw invalid("所选证书尚未签发，请待签发后再部署");
+    certId = managed.cert_id;
+  }
+
+  try {
+    const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
+    await tencentEdgeOne.modifyHostsCertificate(c.env, creds, zoneId, [domain], modeRaw, certId);
+
+    let binding: repo.EdgeOneCertBindingRecord | null = null;
+    if (modeRaw === "sslcert" && sslCertRowId > 0 && autoSync) {
+      binding = await repo.upsertEdgeOneCertBinding(c.env, {
+        ssl_cert_id: sslCertRowId,
+        tencent_account_id: accountId,
+        site,
+        zone_id: zoneId,
+        zone_name: zoneName,
+        domain,
+        last_deployed_cert_id: certId,
+        last_deployed_at: Math.floor(Date.now() / 1000),
+        last_error: "",
+      });
+    } else {
+      await repo.deleteEdgeOneCertBindingByHost(c.env, accountId, site, zoneId, domain);
+    }
+
+    await repo.addEvent(
+      c.env,
+      "ssl",
+      messages.ev("EdgeOne HTTPS 证书已更新", messages.objServer(domain)),
+      {
+        detail:
+          modeRaw === "sslcert"
+            ? `已部署腾讯云证书 ${certId}${binding ? "，已开启续签自动同步" : ""}`
+            : modeRaw === "eofreecert"
+              ? "已切换为 EdgeOne 免费证书"
+              : "已关闭域名 HTTPS 证书",
+      },
+    );
+    return c.json({ ok: true, cert_id: certId, binding });
+  } catch (err) {
+    throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.delete("/api/v1/edgeone/bindings/:id", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const id = paramInt(c, "id");
+  const existing = await repo.getEdgeOneCertBinding(c.env, id);
+  if (!existing) throw httpErr(404, "not_found", "自动同步绑定不存在");
+  await repo.deleteEdgeOneCertBinding(c.env, id);
+  return c.json({ ok: true });
+});
+
+app.get("/api/v1/edgeone/zones/:zoneId/analytics", async (c) => {
+  await requireAdmin(c);
+  const zoneId = parseEdgeOneZoneId(c.req.param("zoneId"));
+  const accountId = parseEdgeOneAccountId(c.req.query("account_id"));
+  const site = tencentEdgeOne.normalizeSite(c.req.query("site"));
+  const range = c.req.query("range") === "7d" ? "7d" : "24h";
+  const domain = (c.req.query("domain") ?? "").trim().toLowerCase();
+  try {
+    const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
+    const data = await tencentEdgeOne.getZoneAnalytics(
+      c.env,
+      creds,
+      zoneId,
+      range,
+      domain || undefined,
+    );
+    return c.json({ ok: true, ...data });
+  } catch (err) {
+    throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
+  }
 });
 
 // -- Settings -----------------------------------------------------------------

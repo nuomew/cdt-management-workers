@@ -5990,4 +5990,234 @@ input[type='number']::-webkit-inner-spin-button {
   border-top: 0;
 }
 
+/* ----------------------------------------------------- Tencent Cloud EdgeOne */
+
+.eo-acct-select {
+  height: 29px;
+  min-width: 170px;
+  max-width: 240px;
+  font-size: 12px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+.eo-zone-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.eo-zone-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.eo-zone-title strong {
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.eo-subtabs {
+  padding: 0 2px;
+  background: transparent;
+}
+
+.eo-domain-search {
+  max-width: 300px;
+  flex: 1 1 200px;
+}
+
+.eo-domain-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.eo-domain-card {
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--ink) 1.5%, var(--panel-solid));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.eo-domain-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.eo-domain-name-wrap {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.eo-domain-name {
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.eo-domain-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.eo-domain-meta {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px 14px;
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  background: var(--panel-solid);
+  border: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
+}
+
+.eo-copy-row,
+.eo-binding-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.eo-cache-wrap,
+.eo-analytics-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.eo-cache-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--ink) 2%, var(--panel-solid));
+}
+
+.eo-cache-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.eo-target-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.eo-quick-chips {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.eo-task-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.eo-task-head,
+.eo-analytics-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.eo-analytics-bar {
+  justify-content: flex-start;
+}
+
+.eo-domain-filter {
+  height: 30px;
+  min-width: 180px;
+  max-width: 280px;
+  font-size: 12px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+.eo-task-target {
+  max-width: 340px;
+  word-break: break-all;
+}
+
+.eo-charts-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.eo-chart-card {
+  padding: 13px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.eo-chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12.5px;
+}
+
+.eo-chart-readout {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.eo-chart-readout b {
+  color: var(--ink);
+}
+
+.eo-chart-svg {
+  width: 100%;
+  height: 156px;
+  display: block;
+}
+
+@media (max-width: 1080px) {
+  .eo-domain-meta {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .eo-charts-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 600px) {
+  .eo-domain-meta {
+    grid-template-columns: 1fr;
+  }
+}
+
 

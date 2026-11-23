@@ -928,5 +928,115 @@ export type SslCertDetailResponse = {
   } | null
 }
 
+export type EdgeOneSite = 'cn' | 'intl'
+
+export type EdgeOneManagedCertOption = {
+  id: number
+  domain: string
+  cert_id: string
+  status: SslCertStatus
+  cert_end_time: string
+  cert_end_ts: number
+  auto_renew: boolean
+  tencent_account_id: number
+}
+
+export type EdgeOneCertBinding = {
+  id: number
+  ssl_cert_id: number
+  tencent_account_id: number
+  site: EdgeOneSite
+  zone_id: string
+  zone_name: string
+  domain: string
+  last_deployed_cert_id: string
+  last_deployed_at: number
+  last_error: string
+  ssl_domain?: string
+  ssl_cert_current_id?: string
+  ssl_auto_renew?: boolean
+}
+
+export type EdgeOneZone = {
+  zoneId: string
+  zoneName: string
+  area: string
+  type: string
+  status: string
+  activeStatus: string
+  paused: boolean
+  cnameStatus: string
+  cnameSpeedUp: string
+  planType: string
+  planStatus: string
+  createdOn: string
+  modifiedOn: string
+  nameServers: string[]
+}
+
+export type EdgeOneDomainCertInfo = {
+  certId: string
+  alias: string
+  type: string
+  expireTime: string
+  deployTime: string
+  signAlgo: string
+  commonName: string
+  status: string
+}
+
+export type EdgeOneDomain = {
+  zoneId: string
+  domainName: string
+  domainStatus: string
+  cname: string
+  identificationStatus: string
+  originType: string
+  origin: string
+  backupOrigin: string
+  hostHeader: string
+  originProtocol: 'FOLLOW' | 'HTTP' | 'HTTPS'
+  httpOriginPort: number
+  httpsOriginPort: number
+  ipv6Status: string
+  certMode: string
+  certificates: EdgeOneDomainCertInfo[]
+  createdOn: string
+  modifiedOn: string
+  certBinding?: EdgeOneCertBinding | null
+}
+
+export type EdgeOneTaskItem = {
+  jobId: string
+  status: string
+  target: string
+  type: string
+  createTime: string
+  updateTime: string
+}
+
+export type EdgeOneAnalyticsPoint = {
+  timestamp: number
+  flux: number
+  bandwidth: number
+  requests: number
+  avgResponseTime: number
+}
+
+export type EdgeOneAnalyticsResponse = {
+  ok: boolean
+  range: '24h' | '7d'
+  interval: string
+  startTime: string
+  endTime: string
+  summary: {
+    totalFluxBytes: number
+    peakBandwidthBps: number
+    totalRequests: number
+    avgResponseTimeMs: number
+  }
+  series: EdgeOneAnalyticsPoint[]
+}
+
 
 

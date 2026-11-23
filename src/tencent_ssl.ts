@@ -19,6 +19,7 @@ import type {
   SslVerifyMode,
 } from "./repo";
 import { signTencentV3 } from "./tencent_lighthouse";
+import { syncRenewedCertificateToEdgeOne } from "./tencent_edgeone";
 
 const SSL_HOST = "ssl.tencentcloudapi.com";
 const SSL_SERVICE = "ssl";
@@ -1158,11 +1159,20 @@ export async function refreshManagedCertificate(
       }
     }
 
+    // Automatically push the newly issued / renewed certificate to any bound EdgeOne hosts.
+    let edgeOneSyncNote = "";
+    if (!wasAlreadyIssuedSameCert || isRenewalFlow) {
+      const eoSync = await syncRenewedCertificateToEdgeOne(env, id, activeCertId);
+      if (eoSync.notes.length > 0) {
+        edgeOneSyncNote = `；${eoSync.notes.join("，")}`;
+      }
+    }
+
     if (!wasAlreadyIssuedSameCert) {
       justIssued = true;
       const actionTitle = isRenewalFlow ? "SSL 证书自动续签已签发" : "SSL 证书已签发";
       await repo.addEvent(env, "ssl", messages.ev(actionTitle, messages.objServer(cert.domain)), {
-        detail: `域名 ${cert.domain} 证书（ID: ${activeCertId}）已签发，有效期至 ${detail.certEndTime || "未知"}${oldCleanupNote}`,
+        detail: `域名 ${cert.domain} 证书（ID: ${activeCertId}）已签发，有效期至 ${detail.certEndTime || "未知"}${oldCleanupNote}${edgeOneSyncNote}`,
       });
       await notifyCertEvent(env, "ssl_issued", `✅ ${actionTitle}：${cert.domain}`, [
         `域名：${cert.domain}`,
@@ -1171,6 +1181,7 @@ export async function refreshManagedCertificate(
         `到期时间：${detail.certEndTime || "-"}`,
         `下次自动续签：到期前 ${cert.renew_before_days} 天`,
         ...(oldCleanupNote ? [`旧证清理：${oldCleanupNote.replace(/^；/, "")}`] : []),
+        ...(edgeOneSyncNote ? [`EdgeOne 联动：${edgeOneSyncNote.replace(/^；/, "")}`] : []),
       ]);
     }
   } else if (detail.status === 2 || detail.status === 7 || detail.status === 10) {

@@ -5,6 +5,7 @@ import {
   ArrowLeft,
   BarChart3,
   Cloud,
+  CloudLightning,
   ExternalLink,
   Globe2,
   HeartPulse,
@@ -58,12 +59,22 @@ import SettingsDrawer from './components/SettingsDrawer'
 import ConfirmDialog from './components/ConfirmDialog'
 import DNSView from './components/DNSView'
 import CertsView from './components/CertsView'
+import EdgeOneView from './components/EdgeOneView'
 import { Badge, Modal } from './components/ui'
 import { ownerLabel } from './owners'
 import { syncClock } from './time'
 
 type Phase = 'loading' | 'public' | 'setup' | 'login' | 'ready' | 'fatal'
-type View = 'telemetry' | 'keepalive' | 'shift' | 'servers' | 'swas' | 'dns' | 'certs' | 'settings'
+type View =
+  | 'telemetry'
+  | 'keepalive'
+  | 'shift'
+  | 'servers'
+  | 'swas'
+  | 'dns'
+  | 'certs'
+  | 'cdn'
+  | 'settings'
 type Toast = { id: number; tone: 'success' | 'error' | 'info'; message: string }
 
 function isAdminPath(pathname: string = window.location.pathname): boolean {
@@ -120,6 +131,7 @@ const NAV_SECTIONS: NavSection[] = [
     children: [
       { key: 'dns', label: '域名解析', icon: Globe2 },
       { key: 'certs', label: '证书服务', icon: ShieldCheck },
+      { key: 'cdn', label: 'CDN服务', icon: CloudLightning },
     ],
   },
 ]
@@ -1085,6 +1097,14 @@ export default function App() {
             onToast={toast}
             onChanged={() => void loadAll()}
             onGoDnsAccounts={() => setView('dns')}
+          />
+        )}
+
+        {view === 'cdn' && (
+          <EdgeOneView
+            onToast={toast}
+            onGoDnsAccounts={() => setView('dns')}
+            onGoCerts={() => setView('certs')}
           />
         )}
 

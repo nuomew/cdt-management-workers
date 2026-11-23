@@ -3183,7 +3183,197 @@ export async function updateSslCertificate(
 }
 
 export async function deleteSslCertificate(env: Env, id: number): Promise<void> {
+  await execute(env.DB, "DELETE FROM edgeone_cert_bindings WHERE ssl_cert_id=?", [id]);
   await execute(env.DB, "DELETE FROM ssl_certificates WHERE id=?", [id]);
 }
 
+// ---------------------------------------------------------------------------
+// Tencent Cloud EdgeOne (TEO) SSL Auto-Sync Bindings
+// ---------------------------------------------------------------------------
 
+export type EdgeOneSite = "cn" | "intl";
+
+export interface EdgeOneCertBindingRecord {
+  id: number;
+  ssl_cert_id: number;
+  tencent_account_id: number;
+  site: EdgeOneSite;
+  zone_id: string;
+  zone_name: string;
+  domain: string;
+  last_deployed_cert_id: string;
+  last_deployed_at: number;
+  last_error: string;
+  created_at: number;
+  updated_at: number;
+}
+
+function normalizeEdgeOneBindingRow(row: Row): EdgeOneCertBindingRecord {
+  const siteRaw = asStr(row["site"]).toLowerCase();
+  return {
+    id: asInt(row["id"]),
+    ssl_cert_id: asInt(row["ssl_cert_id"]),
+    tencent_account_id: asInt(row["tencent_account_id"]),
+    site: siteRaw === "intl" ? "intl" : "cn",
+    zone_id: asStr(row["zone_id"]),
+    zone_name: asStr(row["zone_name"]),
+    domain: asStr(row["domain"]),
+    last_deployed_cert_id: asStr(row["last_deployed_cert_id"]),
+    last_deployed_at: asInt(row["last_deployed_at"]),
+    last_error: asStr(row["last_error"]),
+    created_at: asInt(row["created_at"]),
+    updated_at: asInt(row["updated_at"]),
+  };
+}
+
+export async function listEdgeOneCertBindings(
+  env: Env,
+  filter?: { tencentAccountId?: number; site?: EdgeOneSite; zoneId?: string },
+): Promise<EdgeOneCertBindingRecord[]> {
+  const clauses: string[] = [];
+  const params: (string | number)[] = [];
+  if (filter?.tencentAccountId) {
+    clauses.push("tencent_account_id=?");
+    params.push(filter.tencentAccountId);
+  }
+  if (filter?.site) {
+    clauses.push("site=?");
+    params.push(filter.site);
+  }
+  if (filter?.zoneId) {
+    clauses.push("zone_id=?");
+    params.push(filter.zoneId);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const rows = await query<Row>(
+    env.DB,
+    `SELECT * FROM edgeone_cert_bindings ${where} ORDER BY id DESC`,
+    params,
+  );
+  return rows.map(normalizeEdgeOneBindingRow);
+}
+
+export async function listEdgeOneBindingsBySslCert(
+  env: Env,
+  sslCertId: number,
+): Promise<EdgeOneCertBindingRecord[]> {
+  const rows = await query<Row>(
+    env.DB,
+    "SELECT * FROM edgeone_cert_bindings WHERE ssl_cert_id=? ORDER BY id ASC",
+    [sslCertId],
+  );
+  return rows.map(normalizeEdgeOneBindingRow);
+}
+
+export async function getEdgeOneCertBinding(
+  env: Env,
+  id: number,
+): Promise<EdgeOneCertBindingRecord | null> {
+  const row = await queryOne<Row>(env.DB, "SELECT * FROM edgeone_cert_bindings WHERE id=?", [id]);
+  return row ? normalizeEdgeOneBindingRow(row) : null;
+}
+
+export async function upsertEdgeOneCertBinding(
+  env: Env,
+  input: {
+    ssl_cert_id: number;
+    tencent_account_id: number;
+    site: EdgeOneSite;
+    zone_id: string;
+    zone_name?: string;
+    domain: string;
+    last_deployed_cert_id?: string;
+    last_deployed_at?: number;
+    last_error?: string;
+  },
+): Promise<EdgeOneCertBindingRecord> {
+  const now = nowSeconds();
+  const site: EdgeOneSite = input.site === "intl" ? "intl" : "cn";
+  const domain = input.domain.trim().toLowerCase();
+  const zoneId = input.zone_id.trim();
+  const zoneName = (input.zone_name ?? "").trim();
+  const deployedCertId = (input.last_deployed_cert_id ?? "").trim();
+  const deployedAt = input.last_deployed_at ?? 0;
+  const lastError = input.last_error ?? "";
+
+  await execute(
+    env.DB,
+    `INSERT INTO edgeone_cert_bindings
+       (ssl_cert_id, tencent_account_id, site, zone_id, zone_name, domain,
+        last_deployed_cert_id, last_deployed_at, last_error, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(tencent_account_id, site, zone_id, domain) DO UPDATE SET
+       ssl_cert_id=excluded.ssl_cert_id,
+       zone_name=CASE WHEN excluded.zone_name != '' THEN excluded.zone_name ELSE edgeone_cert_bindings.zone_name END,
+       last_deployed_cert_id=excluded.last_deployed_cert_id,
+       last_deployed_at=excluded.last_deployed_at,
+       last_error=excluded.last_error,
+       updated_at=excluded.updated_at`,
+    [
+      input.ssl_cert_id,
+      input.tencent_account_id,
+      site,
+      zoneId,
+      zoneName,
+      domain,
+      deployedCertId,
+      deployedAt,
+      lastError,
+      now,
+      now,
+    ],
+  );
+  const row = await queryOne<Row>(
+    env.DB,
+    "SELECT * FROM edgeone_cert_bindings WHERE tencent_account_id=? AND site=? AND zone_id=? AND domain=?",
+    [input.tencent_account_id, site, zoneId, domain],
+  );
+  return normalizeEdgeOneBindingRow(row!);
+}
+
+export async function updateEdgeOneCertBindingStatus(
+  env: Env,
+  id: number,
+  patch: { last_deployed_cert_id?: string; last_deployed_at?: number; last_error?: string },
+): Promise<void> {
+  const sets: string[] = [];
+  const params: (string | number)[] = [];
+  if (patch.last_deployed_cert_id !== undefined) {
+    sets.push("last_deployed_cert_id=?");
+    params.push(patch.last_deployed_cert_id.trim());
+  }
+  if (patch.last_deployed_at !== undefined) {
+    sets.push("last_deployed_at=?");
+    params.push(patch.last_deployed_at);
+  }
+  if (patch.last_error !== undefined) {
+    sets.push("last_error=?");
+    params.push(patch.last_error);
+  }
+  if (sets.length === 0) return;
+  sets.push("updated_at=?");
+  params.push(nowSeconds(), id);
+  await execute(
+    env.DB,
+    `UPDATE edgeone_cert_bindings SET ${sets.join(", ")} WHERE id=?`,
+    params,
+  );
+}
+
+export async function deleteEdgeOneCertBinding(env: Env, id: number): Promise<void> {
+  await execute(env.DB, "DELETE FROM edgeone_cert_bindings WHERE id=?", [id]);
+}
+
+export async function deleteEdgeOneCertBindingByHost(
+  env: Env,
+  tencentAccountId: number,
+  site: EdgeOneSite,
+  zoneId: string,
+  domain: string,
+): Promise<void> {
+  await execute(
+    env.DB,
+    "DELETE FROM edgeone_cert_bindings WHERE tencent_account_id=? AND site=? AND zone_id=? AND domain=?",
+    [tencentAccountId, site, zoneId.trim(), domain.trim().toLowerCase()],
+  );
+}
