@@ -29,6 +29,10 @@ CDT_DUTY_START_TRIES = "3"
 CDT_DUTY_STALL_SECONDS = "180"
 CDT_EVENT_RETAIN_DAYS = "14"
 
+[define]
+__dirname = '""'
+__filename = '""'
+
 [alias]
 "cpu-features" = "./src/noop_native.ts"
 "./crypto/build/Release/sshcrypto.node" = "./src/noop_native.ts"
