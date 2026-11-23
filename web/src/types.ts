@@ -1262,6 +1262,11 @@ export type DdnsIpMonitorItem = {
   last_changed_at: number
   last_status: DdnsIpStatus
   last_error: string
+  latency_ct_ms: number | null
+  latency_cu_ms: number | null
+  latency_cm_ms: number | null
+  latency_updated_at: number
+  latency_source: string
   remark: string
   online: boolean
   install_cmd: string

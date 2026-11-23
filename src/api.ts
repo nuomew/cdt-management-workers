@@ -6152,6 +6152,11 @@ function serializeDdnsIpMonitor(
     last_changed_at: m.last_changed_at,
     last_status: m.last_status,
     last_error: m.last_error,
+    latency_ct_ms: m.latency_ct_ms,
+    latency_cu_ms: m.latency_cu_ms,
+    latency_cm_ms: m.latency_cm_ms,
+    latency_updated_at: m.latency_updated_at,
+    latency_source: m.latency_source,
     remark: m.remark,
     online,
     install_cmd: `curl -fsSL "${installUrl}" | sudo sh`,
@@ -6222,12 +6227,18 @@ async function handleDdnsIpReport(c: Ctx) {
   }
   const hostname = (c.req.query("host") ?? c.req.query("hostname") ?? strOf(body["hostname"])).trim();
   const force = boolOf(c.req.query("force") ?? body["force"]);
+  const ct = ddnsIp.parseLatencyMs(c.req.query("ct") ?? body["ct"] ?? body["latency_ct_ms"]);
+  const cu = ddnsIp.parseLatencyMs(c.req.query("cu") ?? body["cu"] ?? body["latency_cu_ms"]);
+  const cm = ddnsIp.parseLatencyMs(c.req.query("cm") ?? body["cm"] ?? body["latency_cm_ms"]);
+  const latency =
+    ct !== undefined || cu !== undefined || cm !== undefined ? { ct, cu, cm } : undefined;
 
   try {
     const result = await ddnsIp.syncDdnsIpMonitor(c.env, monitor, targetIp, {
       hostname,
       force,
       source: "agent",
+      latency,
     });
     return c.json(result);
   } catch (err) {
@@ -6459,6 +6470,29 @@ app.post("/api/v1/ddns-ip/monitors/:monitorId/sync", async (c) => {
     return c.json({ ok: true, result });
   } catch (err) {
     throw httpErr(400, "ddns_ip_error", err instanceof Error ? err.message : String(err));
+  }
+});
+
+app.post("/api/v1/ddns-ip/monitors/:monitorId/probe", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const monitorId = paramInt(c, "monitorId");
+  const monitor = await repo.getDdnsIpMonitor(c.env, monitorId, true);
+  if (!monitor) throw httpErr(404, "not_found", "DDNS IP 监控记录不存在");
+
+  try {
+    const probe = await ddnsIp.probeChinaThreeNetLatency(c.env, monitor);
+    const updated = (await repo.getDdnsIpMonitor(c.env, monitorId, true))!;
+    const account = await repo.getDnsAccount(c.env, updated.dns_account_id, false);
+    const accountMap = new Map(account ? [[account.id, account]] : []);
+    const origin = new URL(c.req.url).origin;
+    return c.json({
+      ok: true,
+      probe,
+      item: serializeDdnsIpMonitor(updated, origin, accountMap),
+    });
+  } catch (err) {
+    throw httpErr(400, "ddns_ip_probe_error", err instanceof Error ? err.message : String(err));
   }
 });
 

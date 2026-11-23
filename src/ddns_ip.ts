@@ -121,6 +121,52 @@ async function notifyDdnsIpChange(
   }
 }
 
+export interface DdnsIpLatencyInput {
+  ct?: number | null;
+  cu?: number | null;
+  cm?: number | null;
+}
+
+/**
+ * Parse a latency value in milliseconds from query/JSON input.
+ * Accepts `-1` (unreachable / timeout) or positive values up to 9999 ms.
+ * Returns `undefined` when omitted or invalid so existing DB values are kept.
+ */
+export function parseLatencyMs(raw: unknown): number | undefined {
+  if (raw === null || raw === undefined) return undefined;
+  const text = String(raw).trim();
+  if (!text) return undefined;
+  const num = Number(text);
+  if (!Number.isFinite(num)) return undefined;
+  if (num < 0) return -1;
+  if (num < 0.1 || num > 9999) return undefined;
+  return Math.round(num * 10) / 10;
+}
+
+function buildLatencyPatch(
+  latency: DdnsIpLatencyInput | undefined,
+  now: number,
+  source: "agent" | "probe",
+): {
+  latency_ct_ms?: number | null;
+  latency_cu_ms?: number | null;
+  latency_cm_ms?: number | null;
+  latency_updated_at?: number;
+  latency_source?: string;
+} {
+  if (!latency) return {};
+  const hasAny =
+    latency.ct !== undefined || latency.cu !== undefined || latency.cm !== undefined;
+  if (!hasAny) return {};
+  return {
+    ...(latency.ct !== undefined ? { latency_ct_ms: latency.ct } : {}),
+    ...(latency.cu !== undefined ? { latency_cu_ms: latency.cu } : {}),
+    ...(latency.cm !== undefined ? { latency_cm_ms: latency.cm } : {}),
+    latency_updated_at: now,
+    latency_source: source,
+  };
+}
+
 /**
  * Process a dynamic IPv4 report (from a remote host agent or manual panel sync).
  * In steady state (IP unchanged and already synced) this performs zero external
@@ -134,6 +180,7 @@ export async function syncDdnsIpMonitor(
     hostname?: string;
     force?: boolean;
     source?: "agent" | "manual";
+    latency?: DdnsIpLatencyInput;
   },
 ): Promise<DdnsIpSyncResult> {
   const ip = rawIp.trim().replace(/^::ffff:/i, "");
@@ -144,6 +191,7 @@ export async function syncDdnsIpMonitor(
   const hostname = (opts?.hostname ?? "").trim().slice(0, 128);
   const force = Boolean(opts?.force);
   const previousIp = monitor.resolved_ip;
+  const latencyPatch = buildLatencyPatch(opts?.latency, now, "agent");
 
   if (!monitor.enabled && !force) {
     await repo.updateDdnsIpMonitorRuntime(env, monitor.id, {
@@ -151,6 +199,7 @@ export async function syncDdnsIpMonitor(
       hostname: hostname || monitor.hostname,
       last_seen_at: opts?.source === "manual" ? monitor.last_seen_at : now,
       last_status: "disabled",
+      ...latencyPatch,
     });
     return {
       ok: true,
@@ -177,6 +226,7 @@ export async function syncDdnsIpMonitor(
       last_seen_at: opts?.source === "manual" ? monitor.last_seen_at : now,
       last_status: "unchanged",
       last_error: "",
+      ...latencyPatch,
     });
     return {
       ok: true,
@@ -199,6 +249,7 @@ export async function syncDdnsIpMonitor(
       last_seen_at: opts?.source === "manual" ? monitor.last_seen_at : now,
       last_status: "error",
       last_error: errMsg,
+      ...latencyPatch,
     });
     throw new Error(errMsg);
   }
@@ -284,6 +335,7 @@ export async function syncDdnsIpMonitor(
       last_changed_at: ipChanged ? now : monitor.last_changed_at,
       last_status: action === "unchanged" ? "unchanged" : "synced",
       last_error: "",
+      ...latencyPatch,
     });
 
     if (action === "created" || action === "updated") {
@@ -328,6 +380,7 @@ export async function syncDdnsIpMonitor(
       last_seen_at: opts?.source === "manual" ? monitor.last_seen_at : now,
       last_status: "error",
       last_error: msg,
+      ...latencyPatch,
     });
     await repo.addEvent(
       env,
@@ -339,11 +392,254 @@ export async function syncDdnsIpMonitor(
   }
 }
 
+export interface ThreeNetProbeCarrierResult {
+  key: "ct" | "cu" | "cm";
+  label: string;
+  ms: number | null;
+  city: string;
+  network: string;
+  note: string;
+}
+
+export interface ThreeNetProbeSummary {
+  target: string;
+  ct_ms: number | null;
+  cu_ms: number | null;
+  cm_ms: number | null;
+  updated_at: number;
+  source: "probe";
+  carriers: ThreeNetProbeCarrierResult[];
+  message: string;
+}
+
+const CHINA_THREE_NET_SPECS: Array<{
+  key: "ct" | "cu" | "cm";
+  label: string;
+  asn: number;
+  fallbackMagic: string;
+}> = [
+  { key: "ct", label: "电信", asn: 4134, fallbackMagic: "China Telecom" },
+  { key: "cu", label: "联通", asn: 4837, fallbackMagic: "China Unicom" },
+  { key: "cm", label: "移动", asn: 9808, fallbackMagic: "China Mobile" },
+];
+
+async function sleepMs(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runSingleGlobalpingCarrier(
+  target: string,
+  spec: (typeof CHINA_THREE_NET_SPECS)[number],
+): Promise<ThreeNetProbeCarrierResult> {
+  const headers = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    "User-Agent": "cdt-management-workers/ddns-ip-probe",
+  };
+  const locationCandidates: Array<Record<string, unknown>> = [
+    { country: "CN", asn: spec.asn, limit: 1 },
+    { magic: `CN+${spec.fallbackMagic}`, limit: 1 },
+  ];
+
+  let measurementId = "";
+  let lastFail = "暂缺在线国内探针";
+  for (const loc of locationCandidates) {
+    try {
+      const createRes = await fetch("https://api.globalping.io/v1/measurements", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          type: "ping",
+          target,
+          locations: [loc],
+          measurementOptions: { packets: 3 },
+        }),
+      });
+      if (createRes.ok) {
+        const body = (await createRes.json()) as { id?: string };
+        if (body.id) {
+          measurementId = body.id;
+          break;
+        }
+      } else if (createRes.status === 429) {
+        lastFail = "公共探测频率受限，请稍后再试";
+        break;
+      } else if (createRes.status !== 422) {
+        lastFail = `探测服务 HTTP ${createRes.status}`;
+      }
+    } catch {
+      lastFail = "探测服务连接失败";
+    }
+  }
+
+  if (!measurementId) {
+    return {
+      key: spec.key,
+      label: spec.label,
+      ms: null,
+      city: "",
+      network: "",
+      note: lastFail,
+    };
+  }
+
+  for (let attempt = 0; attempt < 9; attempt += 1) {
+    await sleepMs(attempt === 0 ? 500 : 650);
+    try {
+      const pollRes = await fetch(
+        `https://api.globalping.io/v1/measurements/${encodeURIComponent(measurementId)}`,
+        { headers: { Accept: "application/json", "User-Agent": headers["User-Agent"] } },
+      );
+      if (!pollRes.ok) continue;
+      const data = (await pollRes.json()) as {
+        status?: string;
+        results?: Array<{
+          probe?: { city?: string; network?: string };
+          result?: {
+            status?: string;
+            stats?: { avg?: number | null; loss?: number | null };
+          };
+        }>;
+      };
+      if (data.status === "in-progress") continue;
+      const first = data.results?.[0];
+      const city = first?.probe?.city ?? "";
+      const network = first?.probe?.network ?? "";
+      const avg = first?.result?.stats?.avg;
+      const loss = first?.result?.stats?.loss;
+      if (typeof avg === "number" && Number.isFinite(avg) && avg > 0) {
+        const rounded = Math.round(avg * 10) / 10;
+        return {
+          key: spec.key,
+          label: spec.label,
+          ms: rounded,
+          city,
+          network,
+          note: `${rounded}ms`,
+        };
+      }
+      if (loss === 100 || first?.result?.status === "finished") {
+        return {
+          key: spec.key,
+          label: spec.label,
+          ms: -1,
+          city,
+          network,
+          note: "超时/禁Ping",
+        };
+      }
+      break;
+    } catch {
+      // Retry next poll slot
+    }
+  }
+
+  return {
+    key: spec.key,
+    label: spec.label,
+    ms: null,
+    city: "",
+    network: "",
+    note: "等待结果超时",
+  };
+}
+
+/**
+ * Trigger an on-demand China 3-ISP (Telecom / Unicom / Mobile) latency probe
+ * against a DDNS IP monitor's public IPv4 (or bound FQDN) via Globalping's
+ * public measurement API and persist the results to D1.
+ */
+export async function probeChinaThreeNetLatency(
+  env: Env,
+  monitor: DdnsIpMonitorRecord,
+): Promise<ThreeNetProbeSummary> {
+  const target = (monitor.current_ip || monitor.resolved_ip || monitor.fqdn).trim();
+  if (!target) {
+    throw new Error("当前记录没有可探测的公网 IPv4 或域名");
+  }
+  const now = nowSeconds();
+
+  if (env.CDT_DRY_RUN === "1") {
+    const carriers: ThreeNetProbeCarrierResult[] = [
+      { key: "ct", label: "电信", ms: 36.4, city: "Guangzhou", network: "China Telecom", note: "36.4ms" },
+      { key: "cu", label: "联通", ms: 44.8, city: "Shanghai", network: "China Unicom", note: "44.8ms" },
+      { key: "cm", label: "移动", ms: 58.2, city: "Shenzhen", network: "China Mobile", note: "58.2ms" },
+    ];
+    await repo.updateDdnsIpMonitorRuntime(env, monitor.id, {
+      latency_ct_ms: 36.4,
+      latency_cu_ms: 44.8,
+      latency_cm_ms: 58.2,
+      latency_updated_at: now,
+      latency_source: "probe",
+    });
+    return {
+      target,
+      ct_ms: 36.4,
+      cu_ms: 44.8,
+      cm_ms: 58.2,
+      updated_at: now,
+      source: "probe",
+      carriers,
+      message: "三网测速完成：电信 36.4ms · 联通 44.8ms · 移动 58.2ms",
+    };
+  }
+
+  const carriers = await Promise.all(
+    CHINA_THREE_NET_SPECS.map((spec) => runSingleGlobalpingCarrier(target, spec)),
+  );
+  const byKey = new Map(carriers.map((c) => [c.key, c]));
+  const ctMs = byKey.get("ct")?.ms ?? null;
+  const cuMs = byKey.get("cu")?.ms ?? null;
+  const cmMs = byKey.get("cm")?.ms ?? null;
+
+  const patch: Parameters<typeof repo.updateDdnsIpMonitorRuntime>[2] = {};
+  if (ctMs !== null) patch.latency_ct_ms = ctMs;
+  if (cuMs !== null) patch.latency_cu_ms = cuMs;
+  if (cmMs !== null) patch.latency_cm_ms = cmMs;
+
+  const hasAny = ctMs !== null || cuMs !== null || cmMs !== null;
+  if (hasAny) {
+    patch.latency_updated_at = now;
+    patch.latency_source = "probe";
+    await repo.updateDdnsIpMonitorRuntime(env, monitor.id, patch);
+  }
+
+  const fmt = (c: ThreeNetProbeCarrierResult | undefined) => {
+    if (!c) return "--";
+    if (c.ms === null) return "无探针";
+    if (c.ms < 0) return "超时";
+    return `${c.ms}ms`;
+  };
+  const allTimedOut =
+    hasAny &&
+    [ctMs, cuMs, cmMs].filter((v) => v !== null).every((v) => v !== null && v < 0);
+
+  let message: string;
+  if (!hasAny) {
+    message = "当前公共国内三网探针暂不可用，请重新运行一键安装命令启用服务器主动三网回报";
+  } else if (allTimedOut) {
+    message = "国内三网 ICMP Ping 全部超时（目标可能禁 Ping），建议重新运行一键安装命令由服务器主动测速上报";
+  } else {
+    message = `三网测速完成：电信 ${fmt(byKey.get("ct"))} · 联通 ${fmt(byKey.get("cu"))} · 移动 ${fmt(byKey.get("cm"))}`;
+  }
+
+  return {
+    target,
+    ct_ms: ctMs,
+    cu_ms: cuMs,
+    cm_ms: cmMs,
+    updated_at: hasAny ? now : monitor.latency_updated_at,
+    source: "probe",
+    carriers,
+    message,
+  };
+}
+
 /**
  * Render a zero-dependency POSIX shell installer/uninstaller script that sets
- * up periodic dynamic IPv4 monitoring via systemd timer (preferred, exact
- * second-level interval) with automatic crontab fallback (Alpine / OpenWrt /
- * containers).
+ * up periodic dynamic IPv4 monitoring + China 3-ISP latency reporting via
+ * systemd timer (preferred, exact second-level interval) with automatic crontab
+ * fallback (Alpine / OpenWrt / containers).
  */
 export function renderLinuxInstallScript(
   originRaw: string,
@@ -412,7 +708,7 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> 正在安装 DDNS IP 动态公网 IPv4 监控: \${DDNS_FQDN} (每 \${INTERVAL_SEC} 秒)"
+echo "==> 正在安装 DDNS IP 动态公网 IPv4 + 国内三网延迟监控: \${DDNS_FQDN} (每 \${INTERVAL_SEC} 秒)"
 
 mkdir -p /usr/local/bin
 cat > "\${SCRIPT_PATH}" <<'CDT_DDNS_AGENT_EOF'
@@ -435,6 +731,30 @@ fetch_v4() {
   fi
 }
 
+# Measure TCP SYN->SYN-ACK RTT (ms) to China 3-ISP backbone nodes (curl first, ping fallback)
+probe_isp_ms() {
+  for host in "$@"; do
+    if command -v curl >/dev/null 2>&1; then
+      rc=0
+      raw="$(curl -4 -o /dev/null -s -w '%{time_namelookup} %{time_connect}' --connect-timeout 3 --max-time 4 "http://\${host}/" 2>/dev/null)" || rc=$?
+      if [ "$rc" -eq 0 ] || [ "$rc" -eq 52 ] || [ "$rc" -eq 56 ]; then
+        ms="$(printf '%s\n' "$raw" | awk '{ v = ($2 - $1) * 1000; if (v < 0.1 && $2 > 0) v = $2 * 1000; if (v >= 0.1 && v < 9999) printf "%.1f", v }' 2>/dev/null || true)"
+        if [ -n "$ms" ]; then
+          printf '%s' "$ms"
+          return 0
+        fi
+      fi
+    elif command -v ping >/dev/null 2>&1; then
+      ms="$(ping -4 -c 2 -W 2 "$host" 2>/dev/null | awk -F'[=/ ]+' '/time=/{for(i=1;i<=NF;i++) if($i=="time"){sum+=$(i+1);n++}} END{if(n>0) printf "%.1f", sum/n}' 2>/dev/null || true)"
+      if [ -n "$ms" ]; then
+        printf '%s' "$ms"
+        return 0
+      fi
+    fi
+  done
+  printf '%s' "-1"
+}
+
 # Detect public IPv4 (panel endpoint first via IPv4 socket, then public IPv4 fallbacks)
 PUB_IP=""
 for probe in \\
@@ -449,7 +769,12 @@ for probe in \\
   fi
 done
 
-REPORT_URL="\${PANEL_ORIGIN}/api/v1/ddns-ip/report?token=\${DDNS_TOKEN}&host=\${HOST_NAME}"
+# Probe China Telecom / Unicom / Mobile RTT (ms) with multi-province failover
+CT_MS="$(probe_isp_ms gd-ct-v4.ip.zstaticcdn.com sh-ct-v4.ip.zstaticcdn.com bj-ct-v4.ip.zstaticcdn.com)"
+CU_MS="$(probe_isp_ms gd-cu-v4.ip.zstaticcdn.com sh-cu-v4.ip.zstaticcdn.com bj-cu-v4.ip.zstaticcdn.com)"
+CM_MS="$(probe_isp_ms gd-cm-v4.ip.zstaticcdn.com sh-cm-v4.ip.zstaticcdn.com bj-cm-v4.ip.zstaticcdn.com)"
+
+REPORT_URL="\${PANEL_ORIGIN}/api/v1/ddns-ip/report?token=\${DDNS_TOKEN}&host=\${HOST_NAME}&ct=\${CT_MS}&cu=\${CU_MS}&cm=\${CM_MS}"
 if [ -n "$PUB_IP" ]; then
   REPORT_URL="\${REPORT_URL}&ip=\${PUB_IP}"
 fi
@@ -499,7 +824,7 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now "\${UNIT}.timer"
-  echo "✅ 已启用 systemd 定时任务: \${UNIT}.timer (每 \${INTERVAL_SEC} 秒检测并自动更新)"
+  echo "✅ 已启用 systemd 定时任务: \${UNIT}.timer (每 \${INTERVAL_SEC} 秒检测 IPv4 与三网延迟)"
 elif command -v crontab >/dev/null 2>&1; then
   (crontab -l 2>/dev/null | grep -v "# \${UNIT}" || true; echo "\${CRON_EXPR} \${SCRIPT_PATH} >/dev/null 2>&1 # \${UNIT}") | crontab -
   echo "✅ 已写入 crontab 定时任务: \${CRON_EXPR} (注释标记 # \${UNIT})"
@@ -507,7 +832,7 @@ else
   echo "⚠️ 未检测到 systemd 或 crontab，已安装脚本至 \${SCRIPT_PATH}，请手动加入计划任务"
 fi
 
-echo "==> 正在执行首次公网 IPv4 检测与解析上报..."
+echo "==> 正在执行首次公网 IPv4 及国内三网延迟检测..."
 "\${SCRIPT_PATH}" || true
 echo "✅ 安装完成！卸载命令: curl -fsSL \"\${PANEL_ORIGIN}/api/v1/ddns-ip/install.sh?token=\${DDNS_TOKEN}&action=uninstall\" | sudo sh"
 `;

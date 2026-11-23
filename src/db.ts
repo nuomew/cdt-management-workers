@@ -328,6 +328,11 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     last_changed_at   INTEGER NOT NULL DEFAULT 0,
     last_status       TEXT    NOT NULL DEFAULT 'waiting',
     last_error        TEXT    NOT NULL DEFAULT '',
+    latency_ct_ms     REAL,
+    latency_cu_ms     REAL,
+    latency_cm_ms     REAL,
+    latency_updated_at INTEGER NOT NULL DEFAULT 0,
+    latency_source    TEXT    NOT NULL DEFAULT '',
     remark            TEXT    NOT NULL DEFAULT '',
     created_at        INTEGER NOT NULL DEFAULT 0,
     updated_at        INTEGER NOT NULL DEFAULT 0,
@@ -410,6 +415,31 @@ export function ensureSchema(db: D1Database | undefined): Promise<void> {
           "ALTER TABLE ssl_certificates ADD COLUMN replaced_cert_id TEXT NOT NULL DEFAULT ''",
         )
         .run();
+    }
+
+    const ddnsCols = await db
+      .prepare("PRAGMA table_info(ddns_ip_monitors)")
+      .all<{ name?: string }>();
+    const ddnsColSet = new Set(
+      (ddnsCols.results ?? []).map((col) => col.name ?? ""),
+    );
+    const ddnsUpgrades: Array<[string, string]> = [
+      ["latency_ct_ms", "ALTER TABLE ddns_ip_monitors ADD COLUMN latency_ct_ms REAL"],
+      ["latency_cu_ms", "ALTER TABLE ddns_ip_monitors ADD COLUMN latency_cu_ms REAL"],
+      ["latency_cm_ms", "ALTER TABLE ddns_ip_monitors ADD COLUMN latency_cm_ms REAL"],
+      [
+        "latency_updated_at",
+        "ALTER TABLE ddns_ip_monitors ADD COLUMN latency_updated_at INTEGER NOT NULL DEFAULT 0",
+      ],
+      [
+        "latency_source",
+        "ALTER TABLE ddns_ip_monitors ADD COLUMN latency_source TEXT NOT NULL DEFAULT ''",
+      ],
+    ];
+    for (const [colName, ddl] of ddnsUpgrades) {
+      if (!ddnsColSet.has(colName)) {
+        await db.prepare(ddl).run();
+      }
     }
   })().catch((err) => {
     // Clear failed promise so a transient D1 error does not poison the isolate.

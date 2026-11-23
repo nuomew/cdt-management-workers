@@ -3772,6 +3772,11 @@ export interface DdnsIpMonitorRecord {
   last_changed_at: number;
   last_status: DdnsIpStatus;
   last_error: string;
+  latency_ct_ms: number | null;
+  latency_cu_ms: number | null;
+  latency_cm_ms: number | null;
+  latency_updated_at: number;
+  latency_source: string;
   remark: string;
   created_at: number;
   updated_at: number;
@@ -3790,6 +3795,14 @@ export interface DdnsIpMonitorInput {
   interval_seconds?: number;
   enabled?: boolean;
   remark?: string;
+}
+
+function asNullableLatency(v: unknown): number | null {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  if (n < 0) return -1;
+  return Math.round(n * 10) / 10;
 }
 
 export function generateDdnsIpToken(): string {
@@ -3841,6 +3854,11 @@ async function normalizeDdnsIpRow(
     last_changed_at: asInt(row["last_changed_at"]),
     last_status: status,
     last_error: asStr(row["last_error"]),
+    latency_ct_ms: asNullableLatency(row["latency_ct_ms"]),
+    latency_cu_ms: asNullableLatency(row["latency_cu_ms"]),
+    latency_cm_ms: asNullableLatency(row["latency_cm_ms"]),
+    latency_updated_at: asInt(row["latency_updated_at"]),
+    latency_source: asStr(row["latency_source"]),
     remark: asStr(row["remark"]),
     created_at: asInt(row["created_at"]),
     updated_at: asInt(row["updated_at"]),
@@ -4026,10 +4044,15 @@ export async function updateDdnsIpMonitorRuntime(
     last_changed_at?: number;
     last_status?: DdnsIpStatus;
     last_error?: string;
+    latency_ct_ms?: number | null;
+    latency_cu_ms?: number | null;
+    latency_cm_ms?: number | null;
+    latency_updated_at?: number;
+    latency_source?: string;
   },
 ): Promise<void> {
   const sets: string[] = [];
-  const params: (string | number)[] = [];
+  const params: (string | number | null)[] = [];
   if (patch.record_id !== undefined) {
     sets.push("record_id=?");
     params.push(patch.record_id);
@@ -4065,6 +4088,26 @@ export async function updateDdnsIpMonitorRuntime(
   if (patch.last_error !== undefined) {
     sets.push("last_error=?");
     params.push(patch.last_error.slice(0, 500));
+  }
+  if (patch.latency_ct_ms !== undefined) {
+    sets.push("latency_ct_ms=?");
+    params.push(patch.latency_ct_ms);
+  }
+  if (patch.latency_cu_ms !== undefined) {
+    sets.push("latency_cu_ms=?");
+    params.push(patch.latency_cu_ms);
+  }
+  if (patch.latency_cm_ms !== undefined) {
+    sets.push("latency_cm_ms=?");
+    params.push(patch.latency_cm_ms);
+  }
+  if (patch.latency_updated_at !== undefined) {
+    sets.push("latency_updated_at=?");
+    params.push(patch.latency_updated_at);
+  }
+  if (patch.latency_source !== undefined) {
+    sets.push("latency_source=?");
+    params.push(patch.latency_source.slice(0, 32));
   }
   if (sets.length === 0) return;
   sets.push("updated_at=?");

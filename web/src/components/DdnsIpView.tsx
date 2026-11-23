@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
+  Activity,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -114,13 +115,24 @@ function buildWindowsInstallCmd(item: DdnsIpMonitorItem): string {
   const taskName = `CDT-DDNS-IP-${item.id}`
   const psBody =
     `$ip=(Invoke-RestMethod -Uri 'https://api4.ipify.org' -TimeoutSec 10).Trim(); ` +
-    `Invoke-RestMethod -Uri ('${item.report_url}&host='+$env:COMPUTERNAME+'&ip='+$ip) -TimeoutSec 15`
+    `function m($h){try{$c=New-Object Net.Sockets.TcpClient;$sw=[Diagnostics.Stopwatch]::StartNew();if($c.BeginConnect($h,80,$null,$null).AsyncWaitHandle.WaitOne(2500,$false)){$c.EndConnect($null);$sw.Stop();$c.Close();return [math]::Round($sw.Elapsed.TotalMilliseconds,1)}$c.Close()}catch{}return -1}; ` +
+    `$ct=m 'gd-ct-v4.ip.zstaticcdn.com';$cu=m 'gd-cu-v4.ip.zstaticcdn.com';$cm=m 'gd-cm-v4.ip.zstaticcdn.com'; ` +
+    `Invoke-RestMethod -Uri ('${item.report_url}&host='+$env:COMPUTERNAME+'&ip='+$ip+'&ct='+$ct+'&cu='+$cu+'&cm='+$cm) -TimeoutSec 15`
   const actionArg = `-NoProfile -WindowStyle Hidden -Command "${psBody}"`
   return (
     `schtasks /Create /F /TN "${taskName}" /SC MINUTE /MO ${mins} ` +
     `/TR "powershell.exe ${actionArg.replace(/"/g, '\\"')}" && ` +
     `powershell.exe -NoProfile -Command "${psBody}"`
   )
+}
+
+function formatLatencyChip(ms: number | null): { text: string; tone: 'good' | 'mid' | 'bad' | 'idle' } {
+  if (ms === null || ms === undefined) return { text: '--', tone: 'idle' }
+  if (ms < 0) return { text: '超时', tone: 'bad' }
+  const val = ms >= 100 ? `${Math.round(ms)}ms` : `${Math.round(ms * 10) / 10}ms`
+  if (ms < 80) return { text: val, tone: 'good' }
+  if (ms < 180) return { text: val, tone: 'mid' }
+  return { text: val, tone: 'bad' }
 }
 
 function maskCommandToken(cmd: string, token: string): string {
@@ -251,6 +263,27 @@ export default function DdnsIpView({
       await loadList()
     } catch (err) {
       onToast(err instanceof Error ? err.message : '同步解析失败', 'error')
+    } finally {
+      setBusyKey('')
+    }
+  }
+
+  const probeLatency = async (it: DdnsIpMonitorItem) => {
+    const key = `probe-${it.id}`
+    setBusyKey(key)
+    try {
+      const res = await post<{
+        ok: true
+        probe: { message: string; ct_ms: number | null; cu_ms: number | null; cm_ms: number | null }
+        item: DdnsIpMonitorItem
+      }>(`/api/v1/ddns-ip/monitors/${it.id}/probe`, undefined, SLOW_TIMEOUT_MS)
+      setItems((prev) => prev.map((x) => (x.id === it.id ? res.item : x)))
+      const hasValid = [res.probe.ct_ms, res.probe.cu_ms, res.probe.cm_ms].some(
+        (v) => v !== null && v >= 0,
+      )
+      onToast(res.probe.message, hasValid ? 'success' : 'info')
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : '三网延迟探测失败', 'error')
     } finally {
       setBusyKey('')
     }
@@ -431,6 +464,13 @@ export default function DdnsIpView({
               {pagedItems.map((it) => {
                 const isToggling = busyKey === `toggle-${it.id}`
                 const isSyncing = busyKey === `sync-${it.id}`
+                const isProbing = busyKey === `probe-${it.id}`
+                const ct = formatLatencyChip(it.latency_ct_ms)
+                const cu = formatLatencyChip(it.latency_cu_ms)
+                const cm = formatLatencyChip(it.latency_cm_ms)
+                const latencyTip = it.latency_updated_at
+                  ? `国内三网延迟（${it.latency_source === 'probe' ? '国内探针测速' : '服务器自动回报'} · 更新于 ${formatTime(it.latency_updated_at)}）`
+                  : '尚未获取到国内三网延迟：可点击「测延迟」即时探测，或重新执行一键安装命令开启服务器自动回报'
                 return (
                   <div
                     key={it.id}
@@ -473,6 +513,39 @@ export default function DdnsIpView({
                           </Badge>
                         )}
                         {it.label && <span className="nps-host-remark">· {it.label}</span>}
+                      </div>
+
+                      {/* China 3-ISP (Telecom / Unicom / Mobile) latency badges */}
+                      <div className="ddns-ip-latency-bar" title={latencyTip}>
+                        <span className={`ddns-ip-lat-chip ${ct.tone}`}>
+                          <i className="ddns-ip-lat-dot" />
+                          <span className="ddns-ip-lat-isp">电信</span>
+                          <span className="ddns-ip-lat-val">{ct.text}</span>
+                        </span>
+                        <span className={`ddns-ip-lat-chip ${cu.tone}`}>
+                          <i className="ddns-ip-lat-dot" />
+                          <span className="ddns-ip-lat-isp">联通</span>
+                          <span className="ddns-ip-lat-val">{cu.text}</span>
+                        </span>
+                        <span className={`ddns-ip-lat-chip ${cm.tone}`}>
+                          <i className="ddns-ip-lat-dot" />
+                          <span className="ddns-ip-lat-isp">移动</span>
+                          <span className="ddns-ip-lat-val">{cm.text}</span>
+                        </span>
+                        <button
+                          type="button"
+                          className="btn ghost sm ddns-ip-probe-btn"
+                          disabled={isProbing}
+                          onClick={() => void probeLatency(it)}
+                          title="立即检测国内电信 / 联通 / 移动三网到该服务器的延迟"
+                        >
+                          {isProbing ? (
+                            <LoaderCircle size={11} className="spin" />
+                          ) : (
+                            <Activity size={11} />
+                          )}
+                          {isProbing ? '测速中' : '测延迟'}
+                        </button>
                       </div>
                     </div>
 
