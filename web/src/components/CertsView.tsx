@@ -466,9 +466,6 @@ export default function CertsView({ onToast, onChanged, onGoDnsAccounts }: Props
       <div className="page-head">
         <div>
           <h1>证书服务</h1>
-          <p>
-            申请腾讯云免费 443 HTTPS 证书（TrustAsia DV），自动完成 DNS 解析验证，并在到期前 7 天自动重新申请与解析验证。
-          </p>
         </div>
         <div className="page-actions">
           <button

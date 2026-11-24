@@ -135,11 +135,6 @@ export default function DNSView({
       <div className="page-head">
         <div>
           <h1>域名解析</h1>
-          <p>
-            {subTab === 'cloud'
-              ? '接入腾讯云 DNSPod 与 Cloudflare 域名解析服务，统一管理域名与解析记录，并为「证书服务」提供自动验证解析能力。'
-              : '一条域名只绑一台机器（或一个换班组），但一台机器、一个换班组都可以挂多条域名；机器开机时自动把对应域名同步到最新公网 IP。'}
-          </p>
         </div>
         {subTab === 'ddns' && (
           <div className="page-actions">

@@ -325,7 +325,6 @@ export default function DdnsIpView({
       <div className="page-head">
         <div>
           <h2>DDNS IP</h2>
-          <p>监控服务器动态公网 IPv4，选择云解析域名并输入前缀绑定，公网 IP 变动时自动解析到最新 IP</p>
         </div>
 
         <div className="page-actions nps-page-actions">

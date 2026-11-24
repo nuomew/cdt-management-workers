@@ -62,12 +62,6 @@ export default function ShiftView({
       <div className="page-head">
         <div>
           <h1>联合换班</h1>
-          <p>
-            把多台服务器编成一组，按排班周期轮流当班，同一时刻只保留一台在线，其余节省停机。
-            一天一轮按小时（也可以填固定时刻表）换，一月一轮按天换；
-            当班流量达标会自动切到下一台没超的成员；找不到可接班的成员（全部达标或状态读不到）
-            就全局熔断停机。DDNS 始终指向当班实例。
-          </p>
         </div>
         <div className="page-actions">
           <button className="btn primary" onClick={onAdd} disabled={serverCount < 2}>

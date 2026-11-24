@@ -50,11 +50,6 @@ export default function KeepaliveView({
       <div className="page-head">
         <div>
           <h1>单机保活</h1>
-          <p>
-            只做一件事：实例意外停机（或抢占被回收）就自动拉起来，不参与换班。
-            可以限定每天几点到几点、每月几号到几号运行，窗口外自动停机、不推通知。
-            同一台服务器如果已经加入换班组，这里会自动让位，避免两边互相拉扯。
-          </p>
         </div>
         <div className="page-actions">
           <button className="btn primary" onClick={onAdd} disabled={available <= 0}>

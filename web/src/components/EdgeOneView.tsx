@@ -1051,7 +1051,6 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
       <div className="page-head">
         <div>
           <h1>CDN服务</h1>
-          <p>管理腾讯云 EdgeOne 加速域名、回源源站、缓存与流量，证书到期自动申请替换。</p>
         </div>
         <div className="page-actions eo-page-actions">
           {accounts.length > 0 && (

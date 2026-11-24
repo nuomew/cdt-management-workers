@@ -133,10 +133,6 @@ export default function TelemetryDashboardView({
       <div className="page-head">
         <div>
           <h1>仪表盘</h1>
-          <p>
-            全网 ECS CDT 与轻量服务器流量全景分析、日/月环比、月底消耗预测与阈值触顶预警
-            {data ? ` · 更新于 ${data.updated_label}` : ''}
-          </p>
         </div>
         <div className="page-actions">
           <Segmented

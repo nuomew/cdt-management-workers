@@ -609,17 +609,12 @@ export default function NpsView({
   }
 
   const pageTitle = section === 'tunnels' ? 'NPS 端口映射' : 'NPS 域名解析'
-  const pageSubtitle =
-    section === 'tunnels'
-      ? '对接 yisier/nps 管理穿透客户端，添加、启停与删除 TCP / UDP 等端口转发规则'
-      : '管理 NPS 域名反向代理与 HTTPS 证书，联动腾讯云 SSL 自动申请、热替换、自动续期并同步 EdgeOne CDN'
 
   return (
     <div className="nps-root">
       <div className="page-head">
         <div>
           <h2>{pageTitle}</h2>
-          <p>{pageSubtitle}</p>
         </div>
 
         <div className="page-actions nps-page-actions">
