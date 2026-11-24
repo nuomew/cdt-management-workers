@@ -46,7 +46,7 @@ type Props = {
 type WorkTab = 'domains' | 'cache' | 'analytics'
 type CacheActionKind = 'purge_url' | 'purge_prefix' | 'purge_host' | 'purge_all' | 'prefetch'
 
-const DOMAINS_PAGE_SIZE = 10
+const DOMAINS_PAGE_SIZE = 5
 const SITE_STORAGE_KEY = 'cdt_edgeone_site'
 
 type DomainFormState = {
