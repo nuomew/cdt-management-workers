@@ -256,6 +256,7 @@ interface DryZoneState {
 }
 
 const dryStore = new Map<string, Map<string, DryZoneState>>();
+const dryOfflineReadyAt = new Map<string, number>();
 let dryJobSeq = 100;
 
 function getDryBucket(creds: EdgeOneCreds): Map<string, DryZoneState> {
@@ -449,7 +450,18 @@ export async function listAccelerationDomains(
 ): Promise<EdgeOneDomain[]> {
   if (isDryRun(env)) {
     const z = getDryBucket(creds).get(zoneId);
-    return z ? [...z.domains.values()] : [];
+    if (!z) return [];
+    const nowMs = Date.now();
+    for (const d of z.domains.values()) {
+      const readyKey = `${creds.accountId}:${creds.site}:${zoneId}:${d.domainName.toLowerCase()}`;
+      const readyAt = dryOfflineReadyAt.get(readyKey);
+      if (readyAt !== undefined && nowMs >= readyAt && d.domainStatus === "process") {
+        d.domainStatus = "offline";
+        d.modifiedOn = new Date(nowMs).toISOString();
+        dryOfflineReadyAt.delete(readyKey);
+      }
+    }
+    return [...z.domains.values()];
   }
 
   const all: EdgeOneDomain[] = [];
@@ -656,13 +668,21 @@ export async function setAccelerationDomainStatus(
   zoneId: string,
   domainName: string,
   status: "online" | "offline",
+  force = false,
 ): Promise<void> {
   const host = domainName.trim().toLowerCase();
   if (isDryRun(env)) {
     const z = getDryBucket(creds).get(zoneId);
     const existing = z?.domains.get(host);
     if (!existing) throw new Error(`加速域名 ${host} 不存在`);
-    existing.domainStatus = status;
+    if (status === "offline" && force && existing.domainStatus !== "offline") {
+      // Simulate real EdgeOne asynchronous pause deployment (`online` -> `process` -> `offline`).
+      existing.domainStatus = "process";
+      dryOfflineReadyAt.set(`${creds.accountId}:${creds.site}:${zoneId}:${host}`, Date.now() + 1200);
+    } else {
+      dryOfflineReadyAt.delete(`${creds.accountId}:${creds.site}:${zoneId}:${host}`);
+      existing.domainStatus = status;
+    }
     existing.modifiedOn = new Date().toISOString();
     return;
   }
@@ -670,7 +690,7 @@ export async function setAccelerationDomainStatus(
     ZoneId: zoneId,
     DomainNames: [host],
     Status: status,
-    Force: false,
+    Force: force,
   });
 }
 
@@ -684,9 +704,17 @@ export async function deleteAccelerationDomain(
   const host = domainName.trim().toLowerCase();
   if (isDryRun(env)) {
     const z = getDryBucket(creds).get(zoneId);
-    if (!z || !z.domains.delete(host)) {
+    const existing = z?.domains.get(host);
+    if (!z || !existing) {
       throw new Error(`加速域名 ${host} 不存在`);
     }
+    if (existing.domainStatus !== "offline") {
+      throw new Error(
+        `腾讯云 EdgeOne DeleteAccelerationDomains 失败 [OperationDenied]：域名 ${host} 当前状态为 ${existing.domainStatus}，请先停用后再删除`,
+      );
+    }
+    dryOfflineReadyAt.delete(`${creds.accountId}:${creds.site}:${zoneId}:${host}`);
+    z.domains.delete(host);
     return;
   }
   await teoRpc(creds, "DeleteAccelerationDomains", {
@@ -694,6 +722,298 @@ export async function deleteAccelerationDomain(
     DomainNames: [host],
     Force: force,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Background Pause-Then-Delete Orchestration
+// ---------------------------------------------------------------------------
+
+const PENDING_DELETE_TIMEOUT_SEC = 20 * 60;
+const BG_POLL_ROUNDS = 5;
+const BG_POLL_INTERVAL_MS = 5000;
+
+function isNotFoundError(err: unknown): boolean {
+  const tcCode =
+    err && typeof err === "object" && "tcCode" in err
+      ? String((err as { tcCode?: unknown }).tcCode ?? "")
+      : "";
+  if (tcCode.includes("ResourceNotFound")) return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return /ResourceNotFound|不存在|not found/i.test(msg);
+}
+
+async function finalizeDeletedDomain(
+  env: Env,
+  accountId: number,
+  site: EdgeOneSite,
+  zoneId: string,
+  domain: string,
+  eventTitle: string,
+): Promise<void> {
+  const key = repo.edgeOnePendingDeleteKey(accountId, site, zoneId, domain);
+  await Promise.all([
+    repo.deleteEdgeOneCertBindingByHost(env, accountId, site, zoneId, domain),
+    repo.removeEdgeOnePendingDelete(env, key),
+  ]);
+  await repo.addEvent(env, "dns", messages.ev(eventTitle, messages.objServer(domain)), {
+    detail: `站点 ${zoneId}`,
+  });
+}
+
+export interface EdgeOneEnqueueDeleteResult {
+  mode: "deleted" | "queued";
+  message: string;
+  task?: repo.EdgeOnePendingDeleteRecord;
+}
+
+/**
+ * Delete an EdgeOne acceleration domain safely:
+ * - If already `offline` (or already absent remotely), delete immediately.
+ * - Otherwise trigger an automatic `offline` status change and persist a
+ *   background deletion task processed by `waitUntil` + the 1-minute cron.
+ */
+export async function enqueueAndStartDeleteAccelerationDomain(
+  env: Env,
+  creds: EdgeOneCreds,
+  zoneId: string,
+  domainName: string,
+): Promise<EdgeOneEnqueueDeleteResult> {
+  const host = domainName.trim().toLowerCase();
+  const domains = await listAccelerationDomains(env, creds, zoneId);
+  const existing = domains.find((d) => d.domainName.toLowerCase() === host);
+
+  if (!existing) {
+    await finalizeDeletedDomain(
+      env,
+      creds.accountId,
+      creds.site,
+      zoneId,
+      host,
+      "EdgeOne 加速域名已删除",
+    );
+    return { mode: "deleted", message: `加速域名 ${host} 已不存在，已同步清理本地绑定` };
+  }
+
+  if (existing.domainStatus === "offline") {
+    await deleteAccelerationDomain(env, creds, zoneId, host, true);
+    await finalizeDeletedDomain(
+      env,
+      creds.accountId,
+      creds.site,
+      zoneId,
+      host,
+      "EdgeOne 加速域名已删除",
+    );
+    return { mode: "deleted", message: `加速域名 ${host} 已删除` };
+  }
+
+  // Trigger automatic pause if domain is online (or any non-process, non-offline state).
+  if (existing.domainStatus !== "process") {
+    await setAccelerationDomainStatus(env, creds, zoneId, host, "offline", true);
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const key = repo.edgeOnePendingDeleteKey(creds.accountId, creds.site, zoneId, host);
+  const prev = await repo.getEdgeOnePendingDelete(env, key);
+  const task: repo.EdgeOnePendingDeleteRecord = {
+    key,
+    account_id: creds.accountId,
+    site: creds.site,
+    zone_id: zoneId,
+    domain: host,
+    state: "pausing",
+    attempts: prev ? prev.attempts : 0,
+    last_error: "",
+    created_at: prev ? prev.created_at : now,
+    updated_at: now,
+  };
+  await repo.upsertEdgeOnePendingDelete(env, task);
+
+  if (!prev) {
+    await repo.addEvent(
+      env,
+      "dns",
+      messages.ev("EdgeOne 加速域名后台删除中", messages.objServer(host)),
+      {
+        detail: `站点 ${zoneId} · 已自动触发停用，待 EdgeOne 停用部署完成后自动删除`,
+      },
+    );
+  }
+
+  return {
+    mode: "queued",
+    task,
+    message: `已提交后台处理：正在自动停用 ${host}，停用完成后将自动删除`,
+  };
+}
+
+/**
+ * Advance a single pending-delete task by one step using an already fetched
+ * domain list (or fetching it on demand). Returns `true` when the task has
+ * completed (or timed out and was removed from the queue).
+ */
+export async function advanceEdgeOnePendingDelete(
+  env: Env,
+  task: repo.EdgeOnePendingDeleteRecord,
+  prefetchedDomains?: EdgeOneDomain[],
+  prefetchedCreds?: EdgeOneCreds,
+): Promise<{ done: boolean }> {
+  // Confirm the task was not cancelled before touching Tencent Cloud API.
+  const current = await repo.getEdgeOnePendingDelete(env, task.key);
+  if (!current) return { done: true };
+
+  const now = Math.floor(Date.now() / 1000);
+  if (now - current.created_at > PENDING_DELETE_TIMEOUT_SEC) {
+    await repo.removeEdgeOnePendingDelete(env, current.key);
+    await repo.addEvent(
+      env,
+      "dns",
+      messages.ev("EdgeOne 加速域名后台删除超时", messages.objServer(current.domain)),
+      {
+        level: "error",
+        detail: `站点 ${current.zone_id} · 超过 20 分钟仍未完成停用并删除${current.last_error ? `：${current.last_error}` : ""}`,
+      },
+    );
+    return { done: true };
+  }
+
+  let creds = prefetchedCreds;
+  if (!creds) {
+    try {
+      creds = await resolveEdgeOneCreds(env, current.account_id, current.site);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await repo.removeEdgeOnePendingDelete(env, current.key);
+      await repo.addEvent(
+        env,
+        "dns",
+        messages.ev("EdgeOne 加速域名后台删除中止", messages.objServer(current.domain)),
+        { level: "error", detail: `账号凭据不可用：${msg}` },
+      );
+      return { done: true };
+    }
+  }
+
+  try {
+    const domains = prefetchedDomains ?? (await listAccelerationDomains(env, creds, current.zone_id));
+    const found = domains.find((d) => d.domainName.toLowerCase() === current.domain);
+
+    if (!found) {
+      await finalizeDeletedDomain(
+        env,
+        current.account_id,
+        current.site,
+        current.zone_id,
+        current.domain,
+        "EdgeOne 加速域名已自动停用并删除",
+      );
+      return { done: true };
+    }
+
+    if (found.domainStatus === "offline") {
+      await repo.upsertEdgeOnePendingDelete(env, {
+        ...current,
+        state: "deleting",
+        attempts: current.attempts + 1,
+        last_error: "",
+        updated_at: now,
+      });
+      try {
+        await deleteAccelerationDomain(env, creds, current.zone_id, current.domain, true);
+      } catch (err) {
+        if (!isNotFoundError(err)) throw err;
+      }
+      await finalizeDeletedDomain(
+        env,
+        current.account_id,
+        current.site,
+        current.zone_id,
+        current.domain,
+        "EdgeOne 加速域名已自动停用并删除",
+      );
+      return { done: true };
+    }
+
+    if (found.domainStatus === "online") {
+      // Previous pause was not applied or reverted; issue offline again.
+      await setAccelerationDomainStatus(env, creds, current.zone_id, current.domain, "offline", true);
+    }
+
+    // Still in `process` (or just re-paused): keep in queue for the next check.
+    await repo.upsertEdgeOnePendingDelete(env, {
+      ...current,
+      state: "pausing",
+      attempts: current.attempts + 1,
+      last_error: "",
+      updated_at: now,
+    });
+    return { done: false };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await repo.upsertEdgeOnePendingDelete(env, {
+      ...current,
+      attempts: current.attempts + 1,
+      last_error: msg,
+      updated_at: now,
+    });
+    return { done: false };
+  }
+}
+
+/**
+ * Reconcile all persisted pending EdgeOne domain deletions (called by the
+ * 1-minute cron scheduler and opportunistic zone refreshes). Groups tasks by
+ * `(account_id, site, zone_id)` so each zone is queried at most once per tick.
+ */
+export async function reconcileEdgeOnePendingDeletes(
+  env: Env,
+  filter?: { accountId?: number; site?: EdgeOneSite; zoneId?: string },
+): Promise<{ checked: number; completed: number }> {
+  const tasks = await repo.listEdgeOnePendingDeletes(env, filter);
+  if (tasks.length === 0) return { checked: 0, completed: 0 };
+
+  const groups = new Map<string, repo.EdgeOnePendingDeleteRecord[]>();
+  for (const t of tasks) {
+    const gKey = `${t.account_id}:${t.site}:${t.zone_id}`;
+    const list = groups.get(gKey) ?? [];
+    list.push(t);
+    groups.set(gKey, list);
+  }
+
+  let completed = 0;
+  for (const group of groups.values()) {
+    const head = group[0]!;
+    let creds: EdgeOneCreds | undefined;
+    let domains: EdgeOneDomain[] | undefined;
+    try {
+      creds = await resolveEdgeOneCreds(env, head.account_id, head.site);
+      domains = await listAccelerationDomains(env, creds, head.zone_id);
+    } catch {
+      // Fall through so each task records its own error/cleanup cleanly.
+    }
+    for (const task of group) {
+      const res = await advanceEdgeOnePendingDelete(env, task, domains, creds);
+      if (res.done) completed += 1;
+    }
+  }
+  return { checked: tasks.length, completed };
+}
+
+/**
+ * Short background polling loop attached to `ctx.waitUntil(...)` right after
+ * enqueuing a deletion so fast EdgeOne pauses finish within seconds instead of
+ * waiting for the next 1-minute cron tick.
+ */
+export async function waitAndAdvanceEdgeOneDeleteInBackground(
+  env: Env,
+  task: repo.EdgeOnePendingDeleteRecord,
+): Promise<void> {
+  const intervalMs = isDryRun(env) ? 700 : BG_POLL_INTERVAL_MS;
+  for (let i = 0; i < BG_POLL_ROUNDS; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    const res = await advanceEdgeOnePendingDelete(env, task);
+    if (res.done) return;
+  }
 }
 
 // ---------------------------------------------------------------------------

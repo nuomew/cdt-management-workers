@@ -4465,16 +4465,42 @@ app.get("/api/v1/edgeone/zones/:zoneId/domains", async (c) => {
   const site = tencentEdgeOne.normalizeSite(c.req.query("site"));
   try {
     const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
-    const [domains, bindings, certs] = await Promise.all([
+    const [domains, bindings, certs, pendingDeletes] = await Promise.all([
       tencentEdgeOne.listAccelerationDomains(c.env, creds, zoneId),
       repo.listEdgeOneCertBindings(c.env, { tencentAccountId: accountId, site, zoneId }),
       repo.listSslCertificates(c.env, false),
+      repo.listEdgeOnePendingDeletes(c.env, { accountId, site, zoneId }),
     ]);
+
+    // If any queued deletion is already offline or gone remotely, advance it in the background now.
+    if (pendingDeletes.length > 0) {
+      const domainStatusMap = new Map(
+        domains.map((d) => [d.domainName.toLowerCase(), d.domainStatus]),
+      );
+      const readyToAdvance = pendingDeletes.some((t) => {
+        const st = domainStatusMap.get(t.domain);
+        return st === undefined || st === "offline" || st === "online";
+      });
+      if (readyToAdvance) {
+        const bg = tencentEdgeOne
+          .reconcileEdgeOnePendingDeletes(c.env, { accountId, site, zoneId })
+          .catch(() => {});
+        try {
+          c.executionCtx.waitUntil(bg);
+        } catch {
+          void bg;
+        }
+      }
+    }
+
     const certById = new Map(certs.map((x) => [x.id, x]));
     const bindingByDomain = new Map(bindings.map((b) => [b.domain.toLowerCase(), b]));
+    const pendingByDomain = new Map(pendingDeletes.map((p) => [p.domain.toLowerCase(), p]));
     const items = domains.map((d) => {
-      const binding = bindingByDomain.get(d.domainName.toLowerCase()) ?? null;
+      const key = d.domainName.toLowerCase();
+      const binding = bindingByDomain.get(key) ?? null;
       const sslCert = binding ? certById.get(binding.ssl_cert_id) ?? null : null;
+      const pending = pendingByDomain.get(key) ?? null;
       return {
         ...d,
         certBinding: binding
@@ -4485,6 +4511,15 @@ app.get("/api/v1/edgeone/zones/:zoneId/domains", async (c) => {
               ssl_status: sslCert?.status ?? "",
               ssl_pending_cert_id: sslCert?.pending_cert_id ?? "",
               ssl_auto_renew: sslCert?.auto_renew ?? false,
+            }
+          : null,
+        pendingDelete: pending
+          ? {
+              state: pending.state,
+              attempts: pending.attempts,
+              last_error: pending.last_error,
+              created_at: pending.created_at,
+              updated_at: pending.updated_at,
             }
           : null,
       };
@@ -4622,18 +4657,57 @@ app.delete("/api/v1/edgeone/zones/:zoneId/domains/:domain", async (c) => {
   const site = tencentEdgeOne.normalizeSite(c.req.query("site"));
   try {
     const creds = await tencentEdgeOne.resolveEdgeOneCreds(c.env, accountId, site);
-    await tencentEdgeOne.deleteAccelerationDomain(c.env, creds, zoneId, domainName, true);
-    await repo.deleteEdgeOneCertBindingByHost(c.env, accountId, site, zoneId, domainName);
-    await repo.addEvent(
+    const result = await tencentEdgeOne.enqueueAndStartDeleteAccelerationDomain(
       c.env,
-      "dns",
-      messages.ev("EdgeOne 加速域名已删除", messages.objServer(domainName)),
-      { detail: `站点 ${zoneId}` },
+      creds,
+      zoneId,
+      domainName,
     );
-    return c.json({ ok: true });
+    if (result.mode === "queued" && result.task) {
+      const bg = tencentEdgeOne
+        .waitAndAdvanceEdgeOneDeleteInBackground(c.env, result.task)
+        .catch(() => {});
+      try {
+        c.executionCtx.waitUntil(bg);
+      } catch {
+        void bg;
+      }
+    }
+    return c.json({
+      ok: true,
+      mode: result.mode,
+      message: result.message,
+      task: result.task
+        ? {
+            state: result.task.state,
+            attempts: result.task.attempts,
+            last_error: result.task.last_error,
+            created_at: result.task.created_at,
+            updated_at: result.task.updated_at,
+          }
+        : null,
+    });
   } catch (err) {
     throw httpErr(400, "edgeone_error", err instanceof Error ? err.message : String(err));
   }
+});
+
+app.delete("/api/v1/edgeone/zones/:zoneId/domains/:domain/pending-delete", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  const zoneId = parseEdgeOneZoneId(c.req.param("zoneId"));
+  const domainName = decodeURIComponent(c.req.param("domain")).trim().toLowerCase();
+  const accountId = parseEdgeOneAccountId(c.req.query("account_id"));
+  const site = tencentEdgeOne.normalizeSite(c.req.query("site"));
+  const key = repo.edgeOnePendingDeleteKey(accountId, site, zoneId, domainName);
+  await repo.removeEdgeOnePendingDelete(c.env, key);
+  await repo.addEvent(
+    c.env,
+    "dns",
+    messages.ev("已取消 EdgeOne 域名后台删除", messages.objServer(domainName)),
+    { detail: `站点 ${zoneId}` },
+  );
+  return c.json({ ok: true });
 });
 
 app.post("/api/v1/edgeone/zones/:zoneId/purge", async (c) => {

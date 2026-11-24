@@ -43,6 +43,7 @@ import * as repo from "./repo";
 import * as dns from "./dns";
 import * as billing from "./billing";
 import * as swas from "./swas";
+import * as tencentEdgeOne from "./tencent_edgeone";
 import * as tencentSsl from "./tencent_ssl";
 import { dailyReport, reconcileAll } from "./shift";
 import { resolveSettings } from "./settings";
@@ -125,6 +126,14 @@ export async function runReconcile(env: Env): Promise<void> {
     await tencentSsl.reconcileEdgeOneCertificates(runtimeEnv);
   } catch (e) {
     console.error("EdgeOne certificate reconcile failed", e);
+  }
+
+  // Tencent Cloud EdgeOne CDN background pause-then-delete queue: O(1) no-op
+  // when empty; advances any domain waiting for `offline` status to finish deletion.
+  try {
+    await tencentEdgeOne.reconcileEdgeOnePendingDeletes(runtimeEnv);
+  } catch (e) {
+    console.error("EdgeOne pending domain delete reconcile failed", e);
   }
 
   // NPS Host certificates: retry any pending/failed inline PEM pushes (~5 min)

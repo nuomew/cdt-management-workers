@@ -1018,6 +1018,14 @@ export type EdgeOneDomainCertInfo = {
   status: string
 }
 
+export type EdgeOnePendingDeleteInfo = {
+  state: 'pausing' | 'deleting'
+  attempts: number
+  last_error: string
+  created_at: number
+  updated_at: number
+}
+
 export type EdgeOneDomain = {
   zoneId: string
   domainName: string
@@ -1037,6 +1045,7 @@ export type EdgeOneDomain = {
   createdOn: string
   modifiedOn: string
   certBinding?: EdgeOneCertBinding | null
+  pendingDelete?: EdgeOnePendingDeleteInfo | null
 }
 
 export type EdgeOneTaskItem = {

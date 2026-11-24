@@ -3380,6 +3380,123 @@ export async function deleteEdgeOneCertBindingByHost(
   );
 }
 
+const EO_PENDING_DELETE_PREFIX = "_internal_eo_del:";
+
+export type EdgeOnePendingDeleteState = "pausing" | "deleting";
+
+export interface EdgeOnePendingDeleteRecord {
+  key: string;
+  account_id: number;
+  site: EdgeOneSite;
+  zone_id: string;
+  domain: string;
+  state: EdgeOnePendingDeleteState;
+  attempts: number;
+  last_error: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export function edgeOnePendingDeleteKey(
+  accountId: number,
+  site: EdgeOneSite,
+  zoneId: string,
+  domain: string,
+): string {
+  return `${EO_PENDING_DELETE_PREFIX}${accountId}:${site}:${zoneId.trim()}:${domain.trim().toLowerCase()}`;
+}
+
+function parseEdgeOnePendingDelete(
+  key: string,
+  raw: string,
+): EdgeOnePendingDeleteRecord | null {
+  try {
+    const obj = JSON.parse(raw) as Record<string, unknown>;
+    const accountId = asInt(obj["account_id"]);
+    const zoneId = asStr(obj["zone_id"]).trim();
+    const domain = asStr(obj["domain"]).trim().toLowerCase();
+    if (!accountId || !zoneId || !domain) return null;
+    const site: EdgeOneSite = asStr(obj["site"]) === "intl" ? "intl" : "cn";
+    const state: EdgeOnePendingDeleteState =
+      asStr(obj["state"]) === "deleting" ? "deleting" : "pausing";
+    return {
+      key,
+      account_id: accountId,
+      site,
+      zone_id: zoneId,
+      domain,
+      state,
+      attempts: Math.max(0, asInt(obj["attempts"])),
+      last_error: asStr(obj["last_error"]),
+      created_at: asInt(obj["created_at"]),
+      updated_at: asInt(obj["updated_at"]),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function getEdgeOnePendingDelete(
+  env: Env,
+  key: string,
+): Promise<EdgeOnePendingDeleteRecord | null> {
+  const row = await queryOne<Row>(
+    env.DB,
+    "SELECT key, value FROM settings WHERE key=?",
+    [key],
+  );
+  if (!row) return null;
+  return parseEdgeOnePendingDelete(asStr(row["key"]), asStr(row["value"]));
+}
+
+export async function listEdgeOnePendingDeletes(
+  env: Env,
+  filter?: { accountId?: number; site?: EdgeOneSite; zoneId?: string },
+): Promise<EdgeOnePendingDeleteRecord[]> {
+  const rows = await query<Row>(
+    env.DB,
+    "SELECT key, value FROM settings WHERE key LIKE ?",
+    [`${EO_PENDING_DELETE_PREFIX}%`],
+  );
+  const items: EdgeOnePendingDeleteRecord[] = [];
+  for (const row of rows) {
+    const parsed = parseEdgeOnePendingDelete(asStr(row["key"]), asStr(row["value"]));
+    if (!parsed) continue;
+    if (filter?.accountId !== undefined && parsed.account_id !== filter.accountId) continue;
+    if (filter?.site !== undefined && parsed.site !== filter.site) continue;
+    if (filter?.zoneId !== undefined && parsed.zone_id !== filter.zoneId) continue;
+    items.push(parsed);
+  }
+  items.sort((a, b) => a.created_at - b.created_at);
+  return items;
+}
+
+export async function upsertEdgeOnePendingDelete(
+  env: Env,
+  rec: EdgeOnePendingDeleteRecord,
+): Promise<void> {
+  const payload = JSON.stringify({
+    account_id: rec.account_id,
+    site: rec.site,
+    zone_id: rec.zone_id,
+    domain: rec.domain,
+    state: rec.state,
+    attempts: rec.attempts,
+    last_error: rec.last_error,
+    created_at: rec.created_at,
+    updated_at: rec.updated_at,
+  });
+  await execute(
+    env.DB,
+    "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    [rec.key, payload],
+  );
+}
+
+export async function removeEdgeOnePendingDelete(env: Env, key: string): Promise<void> {
+  await execute(env.DB, "DELETE FROM settings WHERE key=?", [key]);
+}
+
 // ---------------------------------------------------------------------------
 // NPS (https://github.com/yisier/nps) Servers & SSL Auto-Sync Bindings
 // ---------------------------------------------------------------------------

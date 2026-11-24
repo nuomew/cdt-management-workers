@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   ChevronLeft,
@@ -17,6 +17,7 @@ import {
   Sparkles,
   Trash2,
   Unlink,
+  X,
 } from 'lucide-react'
 import { SLOW_TIMEOUT_MS, api, del, post, put } from '../api'
 import { timeAgo } from '../time'
@@ -464,32 +465,69 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
     void loadZones()
   }, [loadZones])
 
-  const loadDomains = useCallback(async () => {
-    if (!selectedAccountId || !selectedZoneId) {
-      setDomains([])
-      return
-    }
-    setLoadingDomains(true)
-    setDomainsError('')
-    try {
-      const res = await api<{ items: EdgeOneDomain[] }>(
-        `/api/v1/edgeone/zones/${encodeURIComponent(selectedZoneId)}/domains?account_id=${selectedAccountId}&site=${site}`,
-        { timeoutMs: SLOW_TIMEOUT_MS },
-      )
-      setDomains(res.items ?? [])
-    } catch (err) {
-      setDomains([])
-      setDomainsError(err instanceof Error ? err.message : '加载加速域名失败')
-    } finally {
-      setLoadingDomains(false)
-    }
-  }, [selectedAccountId, selectedZoneId, site])
+  const pendingDeletesRef = useRef<Set<string>>(new Set())
+
+  const loadDomains = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      const silent = Boolean(opts?.silent)
+      if (!selectedAccountId || !selectedZoneId) {
+        setDomains([])
+        pendingDeletesRef.current = new Set()
+        return
+      }
+      if (!silent) {
+        setLoadingDomains(true)
+        setDomainsError('')
+      }
+      try {
+        const res = await api<{ items: EdgeOneDomain[] }>(
+          `/api/v1/edgeone/zones/${encodeURIComponent(selectedZoneId)}/domains?account_id=${selectedAccountId}&site=${site}`,
+          { timeoutMs: SLOW_TIMEOUT_MS },
+        )
+        const nextItems = res.items ?? []
+        const presentNames = new Set(nextItems.map((d) => d.domainName.toLowerCase()))
+        if (silent && pendingDeletesRef.current.size > 0) {
+          for (const prevDomain of pendingDeletesRef.current) {
+            if (!presentNames.has(prevDomain)) {
+              onToast(`加速域名 ${prevDomain} 已在后台完成停用并删除`, 'success')
+            }
+          }
+        }
+        pendingDeletesRef.current = new Set(
+          nextItems.filter((d) => Boolean(d.pendingDelete)).map((d) => d.domainName.toLowerCase()),
+        )
+        setDomains(nextItems)
+      } catch (err) {
+        if (!silent) {
+          setDomains([])
+          setDomainsError(err instanceof Error ? err.message : '加载加速域名失败')
+        }
+      } finally {
+        if (!silent) setLoadingDomains(false)
+      }
+    },
+    [onToast, selectedAccountId, selectedZoneId, site],
+  )
 
   useEffect(() => {
     setDomainPage(1)
     setAnalyticsDomain('')
+    pendingDeletesRef.current = new Set()
     void loadDomains()
   }, [loadDomains])
+
+  const hasPendingDelete = useMemo(
+    () => domains.some((d) => Boolean(d.pendingDelete)),
+    [domains],
+  )
+
+  useEffect(() => {
+    if (!hasPendingDelete) return
+    const timer = window.setInterval(() => {
+      void loadDomains({ silent: true })
+    }, 5_000)
+    return () => window.clearInterval(timer)
+  }, [hasPendingDelete, loadDomains])
 
   const loadTasks = useCallback(async () => {
     if (!selectedAccountId || !selectedZoneId) {
@@ -692,17 +730,40 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
     if (!deleteTarget || !selectedAccountId || !selectedZoneId) return
     setDeletingDomain(true)
     try {
-      await del(
+      const res = await del<{ ok: boolean; mode?: 'deleted' | 'queued'; message?: string }>(
         `/api/v1/edgeone/zones/${encodeURIComponent(selectedZoneId)}/domains/${encodeURIComponent(deleteTarget.domainName)}?account_id=${selectedAccountId}&site=${site}`,
         SLOW_TIMEOUT_MS,
       )
-      onToast(`加速域名 ${deleteTarget.domainName} 已删除`, 'success')
+      if (res?.mode === 'queued') {
+        onToast(
+          res.message || `已提交后台处理：正在自动停用 ${deleteTarget.domainName}，完成后将自动删除`,
+          'info',
+        )
+      } else {
+        onToast(res?.message || `加速域名 ${deleteTarget.domainName} 已删除`, 'success')
+      }
       setDeleteTarget(null)
-      await loadDomains()
+      await loadDomains({ silent: res?.mode === 'queued' })
     } catch (err) {
       onToast(err instanceof Error ? err.message : '删除加速域名失败', 'error')
     } finally {
       setDeletingDomain(false)
+    }
+  }
+
+  async function cancelPendingDelete(domainName: string) {
+    if (!selectedAccountId || !selectedZoneId) return
+    setBusyDomain(domainName)
+    try {
+      await del(
+        `/api/v1/edgeone/zones/${encodeURIComponent(selectedZoneId)}/domains/${encodeURIComponent(domainName)}/pending-delete?account_id=${selectedAccountId}&site=${site}`,
+      )
+      onToast(`已取消 ${domainName} 的后台删除任务`, 'info')
+      await loadDomains({ silent: true })
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : '取消后台删除失败', 'error')
+    } finally {
+      setBusyDomain('')
     }
   }
 
@@ -1220,7 +1281,10 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                         <div className="eo-domain-list">
                           {pagedDomains.map((d) => {
                             const st = domainStatusBadge(d.domainStatus)
+                            const pendingDel = d.pendingDelete ?? null
+                            const isPendingDelete = Boolean(pendingDel)
                             const isBusy = busyDomain === d.domainName
+                            const isLocked = isBusy || isPendingDelete
                             const exp = parseCertExpireDays(d)
                             const isWildcard = d.domainName.startsWith('*.')
                             const isExpired = exp.daysLeft !== null && exp.daysLeft <= 0
@@ -1233,6 +1297,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                                   d.certBinding.ssl_status === 'verifying'),
                             )
                             const showQuickReplace =
+                              !isPendingDelete &&
                               !isWildcard &&
                               (isExpired || isExpiringSoon || (d.certMode === 'sslcert' && !exp.certId))
                             return (
@@ -1243,6 +1308,21 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                                     <Badge tone={st.tone} pulse={st.pulse}>
                                       {st.text}
                                     </Badge>
+                                    {pendingDel && (
+                                      <span
+                                        title={
+                                          pendingDel.last_error
+                                            ? `后台自动重试中（上次提示：${pendingDel.last_error}）`
+                                            : '正在后台自动停用，待 EdgeOne 停用完成后将自动删除'
+                                        }
+                                      >
+                                        <Badge tone="amber" pulse>
+                                          {pendingDel.state === 'deleting'
+                                            ? '后台删除中…'
+                                            : '后台停用中 · 完成后自动删除'}
+                                        </Badge>
+                                      </span>
+                                    )}
                                     {d.certMode === 'sslcert' ? (
                                       <Badge tone="green" dot={false}>
                                         <ShieldCheck size={11} style={{ marginRight: 3 }} />
@@ -1329,7 +1409,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                                             type="button"
                                             className="btn ghost icon sm"
                                             title="取消续签自动同步"
-                                            disabled={isBusy}
+                                            disabled={isLocked}
                                             onClick={() => void unbindAutoSync(d.certBinding!.id, d.domainName)}
                                           >
                                             <Unlink size={11} />
@@ -1352,13 +1432,17 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
 
                                 <div className="eo-domain-foot">
                                   <span className="muted-xs">
-                                    {d.certBinding
-                                      ? `已绑定托管证书，到期前 ${autoCert.days} 天自动续签同步`
-                                      : autoCert.enabled && !isWildcard && d.certMode !== 'none'
-                                        ? `巡检保护中：到期 ≤ ${autoCert.days} 天自动申请替换`
-                                        : isWildcard
-                                          ? '泛域名需手动配置或使用 EdgeOne 免费证书'
-                                          : '点击「证书」可一键自动申请并开启续签同步'}
+                                    {pendingDel
+                                      ? pendingDel.last_error
+                                        ? `后台删除自动重试中（${pendingDel.last_error}）`
+                                        : '后台自动停用中：待 EdgeOne 停用部署完成后将自动删除（可离开页面，无需等待）'
+                                      : d.certBinding
+                                        ? `已绑定托管证书，到期前 ${autoCert.days} 天自动续签同步`
+                                        : autoCert.enabled && !isWildcard && d.certMode !== 'none'
+                                          ? `巡检保护中：到期 ≤ ${autoCert.days} 天自动申请替换`
+                                          : isWildcard
+                                            ? '泛域名需手动配置或使用 EdgeOne 免费证书'
+                                            : '点击「证书」可一键自动申请并开启续签同步'}
                                   </span>
 
                                   <div className="eo-domain-actions">
@@ -1366,7 +1450,7 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                                       <button
                                         type="button"
                                         className="btn primary sm"
-                                        disabled={isBusy}
+                                        disabled={isLocked}
                                         onClick={() => void quickAutoApplyCert(d)}
                                       >
                                         {isBusy ? (
@@ -1377,47 +1461,66 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                                         自动申请替换
                                       </button>
                                     )}
-                                    <button
-                                      type="button"
-                                      className="btn ghost sm"
-                                      disabled={isBusy}
-                                      onClick={() => void toggleDomainStatus(d)}
-                                    >
-                                      <Power size={12} /> {d.domainStatus === 'online' ? '停用' : '启用'}
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="btn ghost sm"
-                                      disabled={isBusy}
-                                      onClick={() => openEditDomainModal(d)}
-                                    >
-                                      <Pencil size={12} /> 源站
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="btn ghost sm"
-                                      disabled={isBusy}
-                                      onClick={() => openCertModal(d)}
-                                    >
-                                      <ShieldCheck size={12} /> 证书
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="btn ghost sm"
-                                      disabled={isBusy}
-                                      onClick={() => void quickPurgeHost(d.domainName)}
-                                    >
-                                      <Flame size={12} /> 刷新缓存
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="btn ghost icon sm"
-                                      title="删除加速域名"
-                                      disabled={isBusy}
-                                      onClick={() => setDeleteTarget(d)}
-                                    >
-                                      <Trash2 size={13} />
-                                    </button>
+                                    {pendingDel ? (
+                                      <button
+                                        type="button"
+                                        className="btn ghost sm"
+                                        disabled={isBusy}
+                                        onClick={() => void cancelPendingDelete(d.domainName)}
+                                        title="取消后台自动删除任务"
+                                      >
+                                        {isBusy ? (
+                                          <LoaderCircle size={12} className="spin" />
+                                        ) : (
+                                          <X size={12} />
+                                        )}{' '}
+                                        取消删除
+                                      </button>
+                                    ) : (
+                                      <>
+                                        <button
+                                          type="button"
+                                          className="btn ghost sm"
+                                          disabled={isLocked}
+                                          onClick={() => void toggleDomainStatus(d)}
+                                        >
+                                          <Power size={12} /> {d.domainStatus === 'online' ? '停用' : '启用'}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="btn ghost sm"
+                                          disabled={isLocked}
+                                          onClick={() => openEditDomainModal(d)}
+                                        >
+                                          <Pencil size={12} /> 源站
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="btn ghost sm"
+                                          disabled={isLocked}
+                                          onClick={() => openCertModal(d)}
+                                        >
+                                          <ShieldCheck size={12} /> 证书
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="btn ghost sm"
+                                          disabled={isLocked}
+                                          onClick={() => void quickPurgeHost(d.domainName)}
+                                        >
+                                          <Flame size={12} /> 刷新缓存
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="btn ghost icon sm"
+                                          title="删除加速域名"
+                                          disabled={isLocked}
+                                          onClick={() => setDeleteTarget(d)}
+                                        >
+                                          <Trash2 size={13} />
+                                        </button>
+                                      </>
+                                    )}
                                   </div>
                                 </div>
                               </div>
@@ -2086,14 +2189,18 @@ export default function EdgeOneView({ onToast, onGoDnsAccounts, onGoCerts }: Pro
                 disabled={deletingDomain}
                 onClick={() => void confirmDeleteDomain()}
               >
-                {deletingDomain && <LoaderCircle size={13} className="spin" />} 确认删除
+                {deletingDomain && <LoaderCircle size={13} className="spin" />}{' '}
+                {deleteTarget.domainStatus === 'offline' ? '确认删除' : '后台停用并删除'}
               </button>
             </>
           }
         >
           <p>
             确定要从腾讯云 EdgeOne 站点 <b>{selectedZone?.zoneName}</b> 中删除加速域名{' '}
-            <code className="mono">{deleteTarget.domainName}</code> 吗？删除后该域名的边缘加速服务会立即停止。
+            <code className="mono">{deleteTarget.domainName}</code> 吗？
+            {deleteTarget.domainStatus === 'offline'
+              ? '该域名已处于停用状态，确认后将立即删除。'
+              : '该域名当前尚未停用，确认后系统将在后台自动停用，待停用部署完成后自动删除（提交后无需停留在当前页面等待）。'}
           </p>
         </Modal>
       )}
